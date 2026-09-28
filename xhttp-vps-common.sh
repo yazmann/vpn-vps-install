@@ -357,6 +357,56 @@ EOF
   fail2ban-client status sshd >/dev/null
 }
 
+xhttp_render_panel_fail2ban_filter() {
+  cat <<'EOF'
+[Definition]
+failregex = ^.*failed login: username=.*IP="<HOST>".*$
+ignoreregex =
+EOF
+}
+
+xhttp_render_panel_fail2ban_jail() {
+  [[ "${PANEL_PORT:-}" =~ ^[0-9]+$ ]] && (( PANEL_PORT >= 1 && PANEL_PORT <= 65535 )) || return 1
+  cat <<EOF
+[xhttp-vps-panel]
+enabled = true
+filter = xhttp-vps-panel
+backend = systemd
+journalmatch = _SYSTEMD_UNIT=x-ui.service
+port = ${PANEL_PORT}
+protocol = tcp
+maxretry = 5
+findtime = 10m
+bantime = 1h
+bantime.increment = true
+banaction = ufw
+EOF
+}
+
+xhttp_configure_panel_fail2ban() {
+  if [[ "${PANEL_ACCESS_MODE:-}" != public ]]; then
+    fail2ban-client stop xhttp-vps-panel >/dev/null 2>&1 || true
+    rm -f /etc/fail2ban/filter.d/xhttp-vps-panel.conf /etc/fail2ban/jail.d/xhttp-vps-panel.local
+    systemctl enable --now fail2ban
+    fail2ban-client reload >/dev/null
+    return 0
+  fi
+  xhttp_render_panel_fail2ban_filter > /etc/fail2ban/filter.d/xhttp-vps-panel.conf
+  xhttp_render_panel_fail2ban_jail > /etc/fail2ban/jail.d/xhttp-vps-panel.local
+  systemctl enable --now fail2ban
+  fail2ban-client reload >/dev/null
+  fail2ban-client status xhttp-vps-panel >/dev/null
+}
+
+xhttp_maintenance_label() {
+  case "${1:-}" in
+    security) printf '%s' 'daily Ubuntu security updates; no automatic reboot' ;;
+    weekly) printf 'weekly Ubuntu updates on Sunday 05:00 %s; reboot only when required; 3x-ui and Xray are NOT updated automatically' "${MAINTENANCE_TIMEZONE:-Europe/Moscow}" ;;
+    none) printf '%s' 'no automatic updates or reboot' ;;
+    *) return 1 ;;
+  esac
+}
+
 xhttp_render_maintenance_timer() {
   cat <<EOF
 [Unit]
@@ -421,6 +471,51 @@ EOF
   systemd-analyze calendar "Sun *-*-* 05:00:00 ${MAINTENANCE_TIMEZONE}" >/dev/null
   systemctl daemon-reload
   systemctl enable --now xhttp-vps-maintenance.timer
+}
+
+xhttp_disable_maintenance() {
+  systemctl disable --now xhttp-vps-maintenance.timer 2>/dev/null || true
+  rm -f /usr/local/sbin/xhttp-vps-maintenance \
+    /etc/systemd/system/xhttp-vps-maintenance.service \
+    /etc/systemd/system/xhttp-vps-maintenance.timer
+  systemctl daemon-reload
+}
+
+xhttp_configure_automatic_updates() {
+  case "${MAINTENANCE_MODE:-}" in
+    security|weekly)
+      cat > /etc/apt/apt.conf.d/52xhttp-vps-auto-upgrades <<'EOF'
+APT::Periodic::Enable "1";
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+      cat > /etc/apt/apt.conf.d/53xhttp-vps-unattended-upgrades <<'EOF'
+// Managed by VLESS VPS Setup. Official Ubuntu security updates only.
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
+EOF
+      systemctl enable --now apt-daily.timer apt-daily-upgrade.timer
+      if [[ "$MAINTENANCE_MODE" == weekly ]]; then
+        xhttp_install_maintenance
+      else
+        xhttp_disable_maintenance
+      fi
+      ;;
+    none)
+      cat > /etc/apt/apt.conf.d/52xhttp-vps-auto-upgrades <<'EOF'
+APT::Periodic::Enable "0";
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Unattended-Upgrade "0";
+EOF
+      cat > /etc/apt/apt.conf.d/53xhttp-vps-unattended-upgrades <<'EOF'
+// Managed by VLESS VPS Setup. Automatic package installation is disabled.
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
+EOF
+      xhttp_disable_maintenance
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 xhttp_download_verified() {
@@ -672,6 +767,7 @@ xhttp_managed_paths() {
     /etc/modules-load.d/bbr.conf /etc/sysctl.d/99-xhttp-vps-network.conf \
     /etc/apt/apt.conf.d/52xhttp-vps-auto-upgrades /etc/apt/apt.conf.d/53xhttp-vps-unattended-upgrades \
     /etc/fail2ban/jail.d/xhttp-vps-sshd.local \
+    /etc/fail2ban/filter.d/xhttp-vps-panel.conf /etc/fail2ban/jail.d/xhttp-vps-panel.local \
     /usr/local/sbin/xhttp-vps-maintenance /etc/systemd/system/xhttp-vps-maintenance.service \
     /etc/systemd/system/xhttp-vps-maintenance.timer \
     "/root/cert/$DOMAIN" "$RESULT_FILE"
@@ -706,7 +802,19 @@ xhttp_validate_state() {
   [[ "${MANAGED_BACKUP:-}" =~ ^/root/xhttp-managed\.[A-Za-z0-9]+$ ]] || return 1
   [[ -d "$MANAGED_BACKUP" && ! -L "$MANAGED_BACKUP" ]] || return 1
   case "${TRANSPORT:-xhttp}" in vision|xhttp) ;; *) return 1 ;; esac
+  case "${MAINTENANCE_MODE:-weekly}" in security|weekly|none) ;; *) return 1 ;; esac
+  case "${TWO_FACTOR_GUIDE:-0}" in 0|1) ;; *) return 1 ;; esac
   xhttp_validate_ssh_access_state
+}
+
+xhttp_validate_ownership_journal() {
+  [[ -f "$MANAGED_BACKUP/ready" && -s "$MANAGED_BACKUP/paths" ]] || return 1
+  awk -F '\t' '$1!=NR || NF!=2 {exit 1}' "$MANAGED_BACKUP/paths" || return 1
+  [[ "$(cut -f2- "$MANAGED_BACKUP/paths" | sort | uniq -d | wc -l)" == 0 ]] || return 1
+  local path
+  while IFS=$'\t' read -r _ path; do
+    grep -Fxq -- "$path" < <(xhttp_managed_paths) || return 1
+  done < "$MANAGED_BACKUP/paths"
 }
 
 xhttp_record_ownership() (
@@ -714,8 +822,20 @@ xhttp_record_ownership() (
   umask 077
   xhttp_validate_state || return 1
   local path index=0
-  # Create the journal only once. A failed initial snapshot is never trusted.
-  [[ ! -e "$MANAGED_BACKUP/ready" ]] || return 0
+  if [[ -e "$MANAGED_BACKUP/ready" ]]; then
+    xhttp_validate_ownership_journal || return 1
+    index="$(wc -l < "$MANAGED_BACKUP/paths")"
+    while IFS= read -r path; do
+      grep -Fxq -- "$path" < <(cut -f2- "$MANAGED_BACKUP/paths") && continue
+      index=$((index+1))
+      if [[ -e "$path" || -L "$path" ]]; then
+        cp -a -- "$path" "$MANAGED_BACKUP/original-$index"
+      fi
+      printf '%s\t%s\n' "$index" "$path" >> "$MANAGED_BACKUP/paths"
+    done < <(xhttp_managed_paths)
+    return 0
+  fi
+  # A failed initial snapshot is never trusted.
   : > "$MANAGED_BACKUP/paths.new"
   while IFS= read -r path; do
     index=$((index+1))
@@ -733,22 +853,21 @@ xhttp_restore_owned_files() (
   umask 077
   xhttp_validate_state || return 1
   [[ -f "$MANAGED_BACKUP/ready" ]] || return 1
-  local index path current_dir
-  # Validate the entire journal against the exact allowlist before any moving.
-  diff -u <(xhttp_managed_paths) <(cut -f2- "$MANAGED_BACKUP/paths") >/dev/null || return 1
-  awk -F '\t' '$1!=NR {exit 1}' "$MANAGED_BACKUP/paths" || return 1
-  current_dir="$(mktemp -d "$MANAGED_BACKUP/removed.XXXXXXXX")"
+  local index path
+  # Validate every recorded target against the allowlist before deleting anything.
+  xhttp_validate_ownership_journal || return 1
   while IFS=$'\t' read -r index path; do
     [[ "$index" =~ ^[0-9]+$ ]] || return 1
     if [[ -e "$path" || -L "$path" ]]; then
-      mv -- "$path" "$current_dir/$index"
+      rm -rf -- "$path"
     fi
     if [[ -e "$MANAGED_BACKUP/original-$index" || -L "$MANAGED_BACKUP/original-$index" ]]; then
       mkdir -p -- "$(dirname "$path")"
-      cp -a -- "$MANAGED_BACKUP/original-$index" "$path"
+      mv -- "$MANAGED_BACKUP/original-$index" "$path"
     fi
   done < "$MANAGED_BACKUP/paths"
-  printf 'Removed files were archived in %s; original files restored.\n' "$current_dir"
+  rm -rf -- "$MANAGED_BACKUP"
+  printf '%s\n' 'Managed VPN files were permanently deleted; pre-existing files were restored.'
 )
 
 xhttp_probe_config() {

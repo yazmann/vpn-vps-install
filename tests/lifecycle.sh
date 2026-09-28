@@ -58,6 +58,14 @@ export MAINTENANCE_TIMEZONE=Europe/Moscow
 timer="$(xhttp_render_maintenance_timer)"
 grep -Fq 'OnCalendar=Sun *-*-* 05:00:00 Europe/Moscow' <<<"$timer"
 grep -Fq 'Persistent=false' <<<"$timer"
+[[ "$(xhttp_maintenance_label security)" == 'daily Ubuntu security updates; no automatic reboot' ]]
+[[ "$(xhttp_maintenance_label none)" == 'no automatic updates or reboot' ]]
+export PANEL_PORT=54321
+panel_jail="$(xhttp_render_panel_fail2ban_jail)"
+grep -Fq '[xhttp-vps-panel]' <<<"$panel_jail"
+grep -Fq 'port = 54321' <<<"$panel_jail"
+grep -Fq '_SYSTEMD_UNIT=x-ui.service' <<<"$panel_jail"
+grep -Fq 'failed login: username=.*IP="<HOST>"' <<<"$(xhttp_render_panel_fail2ban_filter)"
 
 warp='{"tag":"warp","protocol":"wireguard","settings":{}}'
 base='{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"blocked","protocol":"blackhole"}],"routing":{"rules":[{"inboundTag":["api"],"outboundTag":"api"},{"protocol":["bittorrent"],"outboundTag":"blocked"},{"ip":["geoip:private"],"outboundTag":"blocked"},{"outboundTag":"direct","network":"tcp,udp"}]}}'
@@ -104,23 +112,33 @@ printf 'user data\n' > "$test_dir/unrelated/keep"
 printf 'original directory\n' > "$test_dir/owned/prior"
 # These two test doubles confine all filesystem changes to the fixture.
 xhttp_validate_state() { [[ "$MANAGED_BACKUP" == "$test_dir/journal" ]]; }
-xhttp_managed_paths() { printf '%s\n' "$test_dir/config" "$test_dir/owned" "$test_dir/new"; }
+xhttp_managed_paths() {
+  printf '%s\n' "$test_dir/config" "$test_dir/owned" "$test_dir/new"
+  [[ "${ADD_MANAGED_PATH:-0}" == 1 ]] && printf '%s\n' "$test_dir/newer"
+}
 xhttp_record_ownership
+printf 'pre-existing newer path\n' > "$test_dir/newer"
+ADD_MANAGED_PATH=1
+xhttp_record_ownership # Safely extend a legacy journal before managing a new path.
 printf 'generated\n' > "$test_dir/config"
 printf 'later user file\n' > "$test_dir/owned/later"
 printf 'new generated file\n' > "$test_dir/new"
+printf 'changed newer path\n' > "$test_dir/newer"
 xhttp_record_ownership # Must not replace original backup with generated values.
-xhttp_restore_owned_files
+# Reject a corrupted journal before deleting even the first target.
+cp "$MANAGED_BACKUP/paths" "$MANAGED_BACKUP/paths.good"
+printf '99\t%s\n' "$test_dir/config" > "$MANAGED_BACKUP/paths"
+if xhttp_restore_owned_files >/dev/null 2>&1; then exit 1; fi
+grep -qx generated "$test_dir/config"
+mv "$MANAGED_BACKUP/paths.good" "$MANAGED_BACKUP/paths"
+xhttp_restore_owned_files >/dev/null
 grep -qx original "$test_dir/config"
 grep -qx 'original directory' "$test_dir/owned/prior"
 grep -qx 'user data' "$test_dir/unrelated/keep"
 [[ ! -e "$test_dir/new" ]]
-find "$MANAGED_BACKUP" -name later -exec grep -qx 'later user file' {} \;
-[[ "$(find "$MANAGED_BACKUP" -name later | wc -l)" == 1 ]]
-# Reject a corrupted journal before moving even the first target.
-printf '99\t%s\n' "$test_dir/config" > "$MANAGED_BACKUP/paths"
-if xhttp_restore_owned_files >/dev/null 2>&1; then exit 1; fi
-grep -qx original "$test_dir/config"
+grep -qx 'pre-existing newer path' "$test_dir/newer"
+[[ ! -e "$test_dir/owned/later" ]]
+[[ ! -e "$MANAGED_BACKUP" ]]
 
 export DOMAIN=example.com FALLBACK_PORT=12345 SUB_PORT=12346 SUB_PATH=sub
 export SUB_JSON_PATH=json-restored SUB_CLASH_PATH=clash-restored CERT_DIR=/root/cert/example.com

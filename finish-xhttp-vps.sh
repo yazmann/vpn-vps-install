@@ -55,6 +55,8 @@ fi
 : "${TRANSPORT:=xhttp}"
 : "${INBOUND_TAG:=$(xhttp_inbound_tag_for "$TRANSPORT")}"
 : "${MAINTENANCE_TIMEZONE:=Europe/Moscow}"
+: "${MAINTENANCE_MODE:=weekly}"
+: "${TWO_FACTOR_GUIDE:=0}"
 : "${SSH_HARDENING:=0}"
 if [[ -z "${SSH_ACCESS_MODE:-}" ]]; then
   if [[ "$SSH_HARDENING" == 1 ]]; then SSH_ACCESS_MODE='admin'; else SSH_ACCESS_MODE='existing'; fi
@@ -92,6 +94,8 @@ if [[ "$SSH_HARDENING" == 1 ]]; then
   : "${ADMIN_KEY_FINGERPRINTS:=$(xhttp_authorized_key_fingerprints "$ADMIN_KEYS_B64")}"
 fi
 [[ -n "${PANEL_API_TOKEN:-}" ]] || die "State/install-result does not contain the 3x-ui API token."
+xhttp_validate_state && xhttp_record_ownership \
+  || die "State or managed-file ownership journal is invalid; repair stopped before changing files."
 REPAIR_BACKUP="$(mktemp -d /root/xhttp-repair-backup.XXXXXXXX)"
 chmod 700 "$REPAIR_BACKUP"
 sqlite3 /etc/x-ui/x-ui.db ".timeout 5000" ".backup '$REPAIR_BACKUP/x-ui.db'"
@@ -423,10 +427,11 @@ else
   if ufw status numbered | grep -Fq "# xhttp-vps:${SAFE_INSTANCE} panel"; then PANEL_FIREWALL_OK=1; fi
 fi
 
-CURRENT_STEP='repairing Fail2ban and weekly maintenance'
-FAIL2BAN_OK=0; MAINTENANCE_OK=0; SSH_ACCESS_OK=0
+CURRENT_STEP='repairing Fail2ban and automatic maintenance'
+FAIL2BAN_OK=0; PANEL_FAIL2BAN_OK=0; MAINTENANCE_OK=0; SSH_ACCESS_OK=0
 if command -v fail2ban-client >/dev/null && xhttp_install_fail2ban_sshd; then FAIL2BAN_OK=1; fi
-if xhttp_install_maintenance; then MAINTENANCE_OK=1; fi
+if xhttp_configure_panel_fail2ban; then PANEL_FAIL2BAN_OK=1; fi
+if xhttp_configure_automatic_updates; then MAINTENANCE_OK=1; fi
 if [[ "$SSH_HARDENING" == 1 ]]; then
   CURRENT_STEP='repairing the key-only administrative SSH policy'
   xhttp_install_ssh_access || die "Could not repair the selected SSH key access. Root SSH policy was not changed by this attempt."
@@ -457,7 +462,15 @@ else
   fi
 fi
 if apt-get check >/dev/null 2>&1 && [[ -z "$(dpkg --audit)" ]]; then report "Package update/install" OK; else report "Package update/install" ERROR; fi
-if [[ "$MAINTENANCE_OK" -eq 1 ]] && systemctl is-enabled --quiet xhttp-vps-maintenance.timer; then report "Weekly conditional reboot" OK; else report "Weekly conditional reboot" ERROR; fi
+if [[ "$MAINTENANCE_OK" -eq 1 ]]; then
+  case "$MAINTENANCE_MODE" in
+    security) if apt-config dump | grep -F 'APT::Periodic::Unattended-Upgrade "1"' >/dev/null && ! systemctl is-enabled --quiet xhttp-vps-maintenance.timer 2>/dev/null; then report "Security updates only" OK; else report "Security updates only" ERROR; fi ;;
+    weekly) if systemctl is-enabled --quiet xhttp-vps-maintenance.timer; then report "Weekly conditional reboot" OK; else report "Weekly conditional reboot" ERROR; fi ;;
+    none) if apt-config dump | grep -F 'APT::Periodic::Enable "0"' >/dev/null; then report "Automatic updates disabled" OK; else report "Automatic updates disabled" ERROR; fi ;;
+  esac
+else
+  report "Automatic maintenance" ERROR
+fi
 if [[ "$SSH_HARDENING" == 1 ]]; then
   if [[ "$SSH_ACCESS_OK" -eq 1 ]] && xhttp_verify_ssh_access; then report "Key-only SSH administration" OK; else report "Key-only SSH administration" ERROR; fi
 else
@@ -493,6 +506,11 @@ else
   report "Mihomo subscription" SKIP
 fi
 if [[ "$FAIL2BAN_OK" -eq 1 ]] && systemctl is-active --quiet fail2ban && fail2ban-client status sshd >/dev/null 2>&1; then report "Fail2ban sshd jail" OK; else report "Fail2ban sshd jail" ERROR; fi
+if [[ "$PANEL_ACCESS_MODE" == public ]]; then
+  if [[ "$PANEL_FAIL2BAN_OK" -eq 1 ]] && fail2ban-client status xhttp-vps-panel >/dev/null 2>&1; then report "Fail2ban panel jail" OK; else report "Fail2ban panel jail" ERROR; fi
+else
+  report "Fail2ban panel jail" SKIP
+fi
 if [[ "${ENABLE_WARP:-0}" -eq 1 ]]; then
   if [[ "$WARP_CONFIGURED" -eq 1 ]]; then report "WARP RU routing" OK; else report "WARP RU routing" ERROR; fi
 else
@@ -530,7 +548,7 @@ case "$PANEL_ACCESS_MODE" in
     ;;
   public)
     PANEL_DISPLAY_URL="https://${DOMAIN}:${PANEL_PORT}/${PANEL_PATH}/"
-    PANEL_ACCESS_DETAILS="public Internet; enable panel 2FA immediately"
+    PANEL_ACCESS_DETAILS="public Internet; 2FA is recommended as additional protection"
     ;;
 esac
 {
@@ -557,9 +575,12 @@ if [[ "$PANEL_ACCESS_MODE" == "private" ]]; then
 fi
 printf '%bVPN transport:%b %s\n' "$blue" "$plain" "$(xhttp_transport_label "$TRANSPORT")"
 printf '%bSSH:%b %s\n' "$blue" "$plain" "$(xhttp_ssh_access_label "$SSH_ACCESS_MODE")"
-printf '%bMaintenance:%b Sunday 05:00 %s; reboot only when required\n' "$blue" "$plain" "$MAINTENANCE_TIMEZONE"
+printf '%bMaintenance:%b %s\n' "$blue" "$plain" "$(xhttp_maintenance_label "$MAINTENANCE_MODE")"
 if [[ "$PANEL_ACCESS_MODE" == public ]]; then
-  printf '%bSecurity:%b public panel selected; enable 2FA and store recovery codes offline.\n' "$yellow" "$plain"
+  printf '%bSecurity:%b public panel selected; 2FA is recommended as additional protection. Store its recovery codes offline.\n' "$yellow" "$plain"
+fi
+if [[ "$TWO_FACTOR_GUIDE" == 1 ]]; then
+  printf '%b2FA setup:%b open Panel Settings, enable 2FA, scan the QR code and store recovery codes offline.\n' "$cyan" "$plain"
 fi
 if [[ "$SSH_HARDENING" == 0 ]]; then
   printf '%bSecurity:%b current SSH policy retained; root/password login may still be enabled.\n' "$red" "$plain"

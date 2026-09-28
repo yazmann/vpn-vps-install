@@ -57,36 +57,25 @@ COMMON_SCRIPT="$(dirname "$(readlink -f "$0")")/xhttp-vps-common.sh"
 source "$COMMON_SCRIPT"
 
 remove_installation() {
-  local keep_script="${1:-0}" skip_confirmation="${2:-0}" script_path answer shown_answer
+  local script_path answer expected
   script_path="$(readlink -f "$0")"
   mapfile -t states < <(find /root -maxdepth 1 -type f \( -name '3xui-vps-*.env' -o -name '3xui-node-*.env' \) -print)
   [[ ${#states[@]} -eq 1 ]] || die "Expected one 3x-ui installer state file in /root; found ${#states[@]}."
   # shellcheck disable=SC1090
   source "${states[0]}"
-  printf '%bThis removes the 3x-ui installation for %s and its generated data.%b\n' "$yellow" "$DOMAIN" "$plain"
-  if [[ "$skip_confirmation" != 1 ]]; then
-    if ! read -r -p "Continue? [yes/NO]: " answer; then
-      die "Removal cancelled: no confirmation was received from the terminal. Re-run the script and enter yes."
-    fi
-    # Strip a possible carriage return from an SSH terminal and normalise case.
-    # Bash is required by this installer, and Ubuntu ships Bash 4+.
-    answer="${answer//$'\r'/}"
-    answer="${answer,,}"
-    if [[ "$answer" != "yes" && "$answer" != "y" ]]; then
-      if [[ -z "$answer" ]]; then
-        die "Removal cancelled: an empty answer was entered. Type yes (or y) to continue."
-      fi
-      printf -v shown_answer '%q' "$answer"
-      die "Removal cancelled: expected yes or y, but received ${shown_answer}."
-    fi
+  printf '%bThis permanently deletes the managed VPN installation for %s. No archive will be created.%b\n' "$yellow" "$DOMAIN" "$plain"
+  expected="DELETE ${DOMAIN}"
+  if ! read -r -p "Type '${expected}' to continue: " answer; then
+    die "Removal cancelled: no confirmation was received."
   fi
+  answer="${answer//$'\r'/}"
+  [[ "$answer" == "$expected" ]] || die "Removal cancelled: confirmation did not match."
   xhttp_validate_state && [[ -f "$MANAGED_BACKUP/ready" ]] \
     || die "This installation has no valid ownership journal. Automatic removal is disabled; preserve the state and remove legacy components manually."
-  diff -u <(xhttp_managed_paths) <(cut -f2- "$MANAGED_BACKUP/paths") >/dev/null \
-    || die "Ownership journal does not match this installation."
-  awk -F '\t' '$1!=NR {exit 1}' "$MANAGED_BACKUP/paths" || die "Ownership journal indexes are invalid."
+  xhttp_validate_ownership_journal || die "Ownership journal contains an invalid managed path or index."
   systemctl disable --now x-ui 2>/dev/null || true
   systemctl disable --now xhttp-vps-maintenance.timer 2>/dev/null || true
+  if command -v fail2ban-client >/dev/null; then fail2ban-client stop xhttp-vps-panel >/dev/null 2>&1 || true; fi
   xhttp_restore_owned_files
   systemctl daemon-reload
   # Shared services, ACME accounts, SSH access, packages and swap are retained.
@@ -111,16 +100,9 @@ remove_installation() {
   [[ "$(sysctl -n net.ipv6.conf.default.disable_ipv6)" != 1 ]] || sysctl -w "net.ipv6.conf.default.disable_ipv6=${PREV_IPV6_DEFAULT:-0}" >/dev/null
   [[ "$(sysctl -n net.ipv6.conf.lo.disable_ipv6)" != 1 ]] || sysctl -w "net.ipv6.conf.lo.disable_ipv6=${PREV_IPV6_LO:-0}" >/dev/null
   sysctl --system >/dev/null || true
-  mv -- "${states[0]}" "$MANAGED_BACKUP/removed-state.env"
-  printf 'Removal completed. Archives: %s\nPackages, swap, SSH rules and the shared ACME client were retained.\n' "$MANAGED_BACKUP"
-
-  [[ "$keep_script" == 1 ]] || rm -f "$script_path"
-}
-
-prepare_vps() {
-  remove_installation 1 0
-  printf 'Managed installation archived. Shared packages remain; use a fresh VPS for a new installation.\n'
-  exit 0
+  rm -f -- "${states[0]}" /root/finish-xhttp-vps.sh /root/xhttp-vps-common.sh /root/optimize-xhttp-memory.sh
+  printf '%s\n' 'Removal completed without an archive. Packages, swap, the current SSH policy, the SSH firewall rule and the shared ACME client were retained.'
+  [[ "$script_path" != /root/install-xhttp-vps.sh ]] || rm -f -- "$script_path"
 }
 
 show_current_settings() {
@@ -159,6 +141,8 @@ if [[ "${1:-}" == --resume ]]; then
   : "${TRANSPORT:=xhttp}"
   : "${INBOUND_TAG:=$(xhttp_inbound_tag_for "$TRANSPORT")}"
   : "${MAINTENANCE_TIMEZONE:=Europe/Moscow}"
+  : "${MAINTENANCE_MODE:=weekly}"
+  : "${TWO_FACTOR_GUIDE:=0}"
   : "${SSH_HARDENING:=0}"
   if [[ -z "${SSH_ACCESS_MODE:-}" ]]; then
     if [[ "$SSH_HARDENING" == 1 ]]; then SSH_ACCESS_MODE='admin'; else SSH_ACCESS_MODE='existing'; fi
@@ -176,27 +160,51 @@ if [[ "${1:-}" == --resume ]]; then
 else
 HAS_CURRENT_SETTINGS=0
 mapfile -t MENU_STATE_FILES < <(find /root -maxdepth 1 -type f \( -name '3xui-vps-*.env' -o -name '3xui-node-*.env' \) -print)
-mapfile -t MENU_RESULT_FILES < <(find /root -maxdepth 1 -type f -name 'xhttp-vps-result-*.txt' -print)
-if [[ ${#MENU_STATE_FILES[@]} -eq 1 && ${#MENU_RESULT_FILES[@]} -eq 1 ]]; then
-  HAS_CURRENT_SETTINGS=1
+if [[ ${#MENU_STATE_FILES[@]} -eq 1 ]]; then
+  # shellcheck disable=SC1090
+  source "${MENU_STATE_FILES[0]}"
+  if [[ "${INSTALL_PHASE:-}" == complete && -n "${RESULT_FILE:-}" && -r "$RESULT_FILE" ]]; then
+    HAS_CURRENT_SETTINGS=1
+  fi
 fi
 
-printf '\nInstallation mode:\n1) Standalone VPN server\n2) Node for an existing 3x-ui panel\n3) Remove every change made by this script\n4) Archive installation and keep this installer\n'
-if [[ "$HAS_CURRENT_SETTINGS" -eq 1 ]]; then
-  printf '5) Show current server settings\n'
+printf '\nVLESS VPS Setup\n\n'
+if [[ ${#MENU_STATE_FILES[@]} -eq 1 ]]; then
+  if [[ "$HAS_CURRENT_SETTINGS" -eq 1 ]]; then
+    printf 'Existing installation:\n1) Show current settings (default)\n2) Verify and repair\n3) Permanently remove VPN (no archive)\n0) Exit\n'
+    read -rp "Select [1]: " ACTION
+    ACTION="${ACTION:-1}"
+    case "$ACTION" in
+      1) show_current_settings ;;
+      2) [[ -x "$RECOVERY_SCRIPT" ]] || die "Recovery script is missing: ${RECOVERY_SCRIPT}"; exec "$RECOVERY_SCRIPT" ;;
+      3) remove_installation; exit 0 ;;
+      0) exit 0 ;;
+      *) die "Unknown menu item: $ACTION" ;;
+    esac
+  else
+    printf 'Interrupted installation:\n1) Continue and repair (default)\n2) Permanently remove VPN (no archive)\n0) Exit\n'
+    read -rp "Select [1]: " ACTION
+    ACTION="${ACTION:-1}"
+    case "$ACTION" in
+      1) exec "$(readlink -f "$0")" --resume ;;
+      2) remove_installation; exit 0 ;;
+      0) exit 0 ;;
+      *) die "Unknown menu item: $ACTION" ;;
+    esac
+  fi
+elif [[ ${#MENU_STATE_FILES[@]} -gt 1 ]]; then
+  die "Multiple installer state files were found in /root. Resolve them manually before continuing."
+else
+  printf 'New VPS:\n1) Install standalone VPN (default)\n2) Install remote node\n0) Exit\n'
+  read -rp "Select [1]: " ACTION
+  ACTION="${ACTION:-1}"
+  case "$ACTION" in
+    1) INSTALL_MODE="standalone" ;;
+    2) INSTALL_MODE="node" ;;
+    0) exit 0 ;;
+    *) die "Unknown menu item: $ACTION" ;;
+  esac
 fi
-printf '0) Exit\n'
-read -rp "Select [1]: " ACTION
-ACTION="${ACTION:-1}"
-case "$ACTION" in
-  1) INSTALL_MODE="standalone" ;;
-  2) INSTALL_MODE="node" ;;
-  3) remove_installation; exit 0 ;;
-  4) prepare_vps ;;
-  5) [[ "$HAS_CURRENT_SETTINGS" -eq 1 ]] || die "Current server settings are available only after a completed installation."; show_current_settings ;;
-  0) exit 0 ;;
-  *) die "Unknown menu item: $ACTION" ;;
-esac
 
 TLS_MODE="production"
 printf '%bTLS:%b production Lets Encrypt certificate (required).\n' "$cyan" "$plain"
@@ -284,45 +292,51 @@ VPN_NAME="${VPN_NAME:-$DEFAULT_VPN_NAME}"
 if LC_ALL=C grep -q '[[:cntrl:]]' <<<"$VPN_NAME"; then die "${NAME_LABEL} contains control characters."; fi
 
 cat <<'EOF'
-Security configuration
-The recommended option is selected when you press Enter. Less safe choices remain
-available for compatibility and are marked with their consequences.
-
-Panel network access:
-  1) Private localhost — use an SSH tunnel or private Tailscale Serve
-     RECOMMENDED for standalone: the panel port is not exposed to the Internet.
-  2) Allow one trusted public IPv4
-     RECOMMENDED for a remote node: only the main panel IP can reach its API.
-  3) Public Internet
-     HIGH RISK: exposes the login/API; requires panel 2FA and an additional provider firewall.
+Panel access:
+  1) Public Internet (default)
+     Open the panel from any device.
+  2) Trusted IPv4 only
+     For a fixed administrator or main-panel IP.
+  3) Localhost only
+     Connect through an SSH tunnel or Tailscale.
 EOF
-if [[ "$INSTALL_MODE" == "node" ]]; then
-  PANEL_ACCESS_DEFAULT=2
-  printf '%s\n' 'A remote node normally needs option 2 so the main panel can reach its API.'
-else
-  PANEL_ACCESS_DEFAULT=1
-fi
-read -rp "Select panel access [${PANEL_ACCESS_DEFAULT}]: " PANEL_ACCESS_CHOICE
-PANEL_ACCESS_CHOICE="${PANEL_ACCESS_CHOICE:-$PANEL_ACCESS_DEFAULT}"
+read -rp "Select panel access [1]: " PANEL_ACCESS_CHOICE
+PANEL_ACCESS_CHOICE="${PANEL_ACCESS_CHOICE:-1}"
 PANEL_ALLOWED_IP=""
 case "$PANEL_ACCESS_CHOICE" in
-  1) PANEL_ACCESS_MODE="private" ;;
+  1)
+    PANEL_ACCESS_MODE="public"
+    warn "Public access selected. Keep the full panel URL private; 2FA is recommended for public access."
+    ;;
   2)
     PANEL_ACCESS_MODE="allowlist"
     read -rp "Trusted public IPv4 allowed to reach the panel: " PANEL_ALLOWED_IP
     xhttp_valid_ipv4 "$PANEL_ALLOWED_IP" || die "Invalid trusted IPv4: ${PANEL_ALLOWED_IP}."
     ;;
-  3)
-    PANEL_ACCESS_MODE="public"
-    warn "The 3x-ui login page and API will be reachable from the entire Internet. Enable 2FA immediately and restrict the port at the VPS provider whenever possible."
-    ;;
+  3) PANEL_ACCESS_MODE="private" ;;
   *) die "Unknown panel access choice: ${PANEL_ACCESS_CHOICE}" ;;
 esac
 
 cat <<'EOF'
+Two-factor authentication:
+  1) Not now (default)
+  2) Show setup steps after installation
+     Recommended as extra protection for public access.
+EOF
+read -rp "Select 2FA guidance [1]: " TWO_FACTOR_CHOICE
+TWO_FACTOR_CHOICE="${TWO_FACTOR_CHOICE:-1}"
+case "$TWO_FACTOR_CHOICE" in
+  1) TWO_FACTOR_GUIDE=0 ;;
+  2) TWO_FACTOR_GUIDE=1 ;;
+  *) die "Unknown 2FA choice: ${TWO_FACTOR_CHOICE}" ;;
+esac
+
+cat <<'EOF'
 VPN transport on TCP/443:
-  1) VLESS + TCP + XTLS Vision + REALITY (recommended: fastest and mature)
-  2) VLESS + XHTTP + REALITY (HTTP transport and XMUX)
+  1) Vision (default)
+     Fast and mature TCP transport.
+  2) XHTTP
+     Alternative HTTP transport with XMUX.
 EOF
 read -rp "Select transport [1]: " TRANSPORT_CHOICE
 TRANSPORT_CHOICE="${TRANSPORT_CHOICE:-1}"
@@ -392,25 +406,22 @@ fi
 [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || SSH_PORT=22
 
 cat <<'EOF'
-SSH administration policy:
-  1) New sudo administrator + SSH key; disable direct root and all password login
-     RECOMMENDED (default): separates routine login from the root account.
-  2) Keep root login, but only by SSH key; disable every password login
-     COMPATIBILITY: simpler, but a stolen key immediately has unrestricted root access.
-  3) Keep the current SSH policy unchanged
-     NOT RECOMMENDED: the installer cannot guarantee that root/password login is disabled.
+SSH access:
+  1) Keep current access (default)
+     Existing root and login settings stay unchanged.
+  2) Root with SSH key only
+     Password login is disabled.
+  3) New sudo user with SSH key
+     Root and password login are disabled.
 EOF
 read -rp "Select SSH policy [1]: " SSH_ACCESS_CHOICE
 SSH_ACCESS_CHOICE="${SSH_ACCESS_CHOICE:-1}"
 case "$SSH_ACCESS_CHOICE" in
   1)
-    SSH_ACCESS_MODE='admin'
-    SSH_HARDENING=1
-    read -rp "New administrative SSH user [vpnadmin]: " ADMIN_USER
-    ADMIN_USER="${ADMIN_USER:-vpnadmin}"
-    [[ "$ADMIN_USER" =~ ^[a-z_][a-z0-9_-]{0,30}$ && "$ADMIN_USER" != root ]] \
-      || die "Administrative user must be a non-root Linux name up to 31 characters."
-    getent passwd "$ADMIN_USER" >/dev/null && die "User ${ADMIN_USER} already exists; use a fresh name."
+    SSH_ACCESS_MODE=existing
+    SSH_HARDENING=0
+    ADMIN_USER=root
+    warn "The installer will preserve the current root and SSH authentication policy. Fail2ban reduces brute-force attempts but does not make weak credentials safe."
     ;;
   2)
     SSH_ACCESS_MODE=root-key
@@ -419,10 +430,13 @@ case "$SSH_ACCESS_CHOICE" in
     warn "Root will remain reachable by its SSH key. Password login is disabled, but this is less safe than a separate administrator."
     ;;
   3)
-    SSH_ACCESS_MODE=existing
-    SSH_HARDENING=0
-    ADMIN_USER=root
-    warn "The installer will not disable root or password authentication. Fail2ban still reduces brute-force attempts but does not fix weak credentials. Review sshd manually after installation."
+    SSH_ACCESS_MODE='admin'
+    SSH_HARDENING=1
+    read -rp "New administrative SSH user [vpnadmin]: " ADMIN_USER
+    ADMIN_USER="${ADMIN_USER:-vpnadmin}"
+    [[ "$ADMIN_USER" =~ ^[a-z_][a-z0-9_-]{0,30}$ && "$ADMIN_USER" != root ]] \
+      || die "Administrative user must be a non-root Linux name up to 31 characters."
+    getent passwd "$ADMIN_USER" >/dev/null && die "User ${ADMIN_USER} already exists; use a fresh name."
     ;;
   *) die "Unknown SSH policy choice: ${SSH_ACCESS_CHOICE}" ;;
 esac
@@ -450,16 +464,37 @@ if [[ "$SSH_HARDENING" == 1 ]]; then
   ADMIN_KEY_FINGERPRINTS="$(xhttp_authorized_key_fingerprints "$ADMIN_KEYS_B64")"
 fi
 
-read -rp "Timezone for Sunday 05:00 maintenance [Europe/Moscow]: " MAINTENANCE_TIMEZONE
-MAINTENANCE_TIMEZONE="${MAINTENANCE_TIMEZONE:-Europe/Moscow}"
-[[ "$MAINTENANCE_TIMEZONE" =~ ^([A-Za-z0-9_+-]+/)*[A-Za-z0-9_+-]+$ && -f "/usr/share/zoneinfo/$MAINTENANCE_TIMEZONE" ]] \
-  || die "Unknown IANA timezone: ${MAINTENANCE_TIMEZONE}. Example: Europe/Moscow or Etc/UTC."
+cat <<'EOF'
+Automatic maintenance:
+  1) Security updates only (default)
+     Installed daily without automatic reboot.
+  2) Weekly Ubuntu maintenance
+     Updates Sunday at 05:00; reboot only when required.
+     3x-ui and Xray are NOT updated automatically.
+  3) No automatic updates
+     Updates and reboot are performed manually.
+EOF
+read -rp "Select maintenance [1]: " MAINTENANCE_CHOICE
+MAINTENANCE_CHOICE="${MAINTENANCE_CHOICE:-1}"
+MAINTENANCE_TIMEZONE=Europe/Moscow
+case "$MAINTENANCE_CHOICE" in
+  1) MAINTENANCE_MODE=security ;;
+  2)
+    MAINTENANCE_MODE=weekly
+    read -rp "Timezone for Sunday 05:00 maintenance [Europe/Moscow]: " MAINTENANCE_TIMEZONE
+    MAINTENANCE_TIMEZONE="${MAINTENANCE_TIMEZONE:-Europe/Moscow}"
+    [[ "$MAINTENANCE_TIMEZONE" =~ ^([A-Za-z0-9_+-]+/)*[A-Za-z0-9_+-]+$ && -f "/usr/share/zoneinfo/$MAINTENANCE_TIMEZONE" ]] \
+      || die "Unknown IANA timezone: ${MAINTENANCE_TIMEZONE}. Example: Europe/Moscow or Etc/UTC."
+    ;;
+  3) MAINTENANCE_MODE=none ;;
+  *) die "Unknown maintenance choice: ${MAINTENANCE_CHOICE}" ;;
+esac
 
 
 PANEL_PORT="$(random_port)"
 while :; do SUB_PORT="$(random_port)"; [[ "$SUB_PORT" != "$PANEL_PORT" ]] && break; done
 while :; do FALLBACK_PORT="$(random_port)"; [[ "$FALLBACK_PORT" != "$PANEL_PORT" && "$FALLBACK_PORT" != "$SUB_PORT" ]] && break; done
-PANEL_PATH="panel-$(random_hex 10)"
+PANEL_PATH="panel-$(random_hex 16)"
 SUB_PATH="feed-$(random_hex 10)"
 SUB_JSON_PATH=""
 SUB_CLASH_PATH=""
@@ -595,6 +630,7 @@ PANEL_PORT=${PANEL_PORT}
 PANEL_PATH=${PANEL_PATH}
 PANEL_ACCESS_MODE=${PANEL_ACCESS_MODE}
 PANEL_ALLOWED_IP=${PANEL_ALLOWED_IP}
+TWO_FACTOR_GUIDE=${TWO_FACTOR_GUIDE}
 TRANSPORT=${TRANSPORT}
 INBOUND_TAG=${INBOUND_TAG}
 ADMIN_USER=${ADMIN_USER}
@@ -603,6 +639,7 @@ ADMIN_KEY_FINGERPRINTS=${ADMIN_KEY_FINGERPRINTS}
 SSH_HARDENING=${SSH_HARDENING}
 SSH_ACCESS_MODE=${SSH_ACCESS_MODE}
 MAINTENANCE_TIMEZONE=$(printf '%q' "$MAINTENANCE_TIMEZONE")
+MAINTENANCE_MODE=${MAINTENANCE_MODE}
 SUB_PORT=${SUB_PORT}
 SUB_PATH=${SUB_PATH}
 SUB_JSON_PATH=${SUB_JSON_PATH}
@@ -661,7 +698,7 @@ Configuration summary
   Self-steal:    127.0.0.1:${FALLBACK_PORT}
   Cover site:    ${COVER_LABEL}
   WARP for RU:   $([[ "$ENABLE_WARP" -eq 1 ]] && echo yes || echo no)
-  Maintenance:   Sunday 05:00 ${MAINTENANCE_TIMEZONE}; reboot only when required
+  Maintenance:   $(xhttp_maintenance_label "$MAINTENANCE_MODE")
 EOF
 read -rp "Start installation? [y/N]: " CONFIRM
 [[ "$CONFIRM" =~ ^[Yy]$ ]] || die "Cancelled."
@@ -672,12 +709,17 @@ xhttp_record_ownership
 INSTALL_PHASE=bootstrap
 write_state
 fi
+xhttp_record_ownership || die "Could not validate or extend the managed-file ownership journal."
 
-log "Refreshing Ubuntu repositories and upgrading installed packages"
+log "Repairing package state and fully upgrading the fresh Ubuntu system"
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
+dpkg --configure -a
+apt-get -o DPkg::Lock::Timeout=300 -y -f install
 apt-get -o DPkg::Lock::Timeout=300 update
-apt-get -o DPkg::Lock::Timeout=300 -y -o Dpkg::Options::="--force-confold" upgrade
+apt-get -o DPkg::Lock::Timeout=300 -y -o Dpkg::Options::="--force-confold" dist-upgrade
+apt-get check
+[[ -z "$(dpkg --audit)" ]] || die "Ubuntu package database is not clean after the full upgrade. Review 'dpkg --audit' before retrying."
 UBUNTU_UPGRADE_OK=1
 
 log "Checking availability and installing required packages"
@@ -733,17 +775,8 @@ else
   warn "Keeping the current SSH authentication policy by explicit user choice."
 fi
 xhttp_install_ssh_access || die "Could not prepare the selected SSH access policy. The current root SSH access has not been disabled."
-log "Enabling daily Ubuntu security updates without automatic reboot"
-cat > /etc/apt/apt.conf.d/52xhttp-vps-auto-upgrades <<'EOF'
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-EOF
-cat > /etc/apt/apt.conf.d/53xhttp-vps-unattended-upgrades <<'EOF'
-// Managed by the XHTTP VPS installer. Official Ubuntu security updates only.
-Unattended-Upgrade::Automatic-Reboot "false";
-Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
-EOF
-systemctl enable --now apt-daily.timer apt-daily-upgrade.timer
+log "Configuring automatic Ubuntu maintenance"
+xhttp_configure_automatic_updates || die "Could not apply the selected automatic-update policy."
 log "Enabling BBR and disabling IPv6"
 cat > /etc/modules-load.d/bbr.conf <<'EOF'
 tcp_bbr
@@ -752,7 +785,7 @@ modprobe tcp_bbr 2>/dev/null || true
 grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control \
   || die "The VPS kernel does not provide BBR. Available algorithms: $(cat /proc/sys/net/ipv4/tcp_available_congestion_control)"
 cat > /etc/sysctl.d/99-xhttp-vps-network.conf <<'EOF'
-# Managed by the XHTTP VPS installer
+# Managed by VLESS VPS Setup
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 net.ipv6.conf.all.disable_ipv6=1
@@ -1279,11 +1312,9 @@ else
   if ufw status numbered | grep -Fq "# xhttp-vps:${SAFE_INSTANCE} panel"; then PANEL_FIREWALL_VERIFIED=1; fi
 fi
 
-log "Configuring Fail2ban for SSH"
+log "Configuring Fail2ban"
 xhttp_install_fail2ban_sshd || die "Fail2ban could not enable and load the sshd jail."
-
-log "Scheduling weekly Ubuntu maintenance"
-xhttp_install_maintenance || die "The Sunday 05:00 maintenance timer could not be installed."
+xhttp_configure_panel_fail2ban || die "Fail2ban could not apply the selected panel-access policy."
 
 if [[ "$SSH_HARDENING" == 1 ]]; then
   log "Applying the selected key-only SSH policy"
@@ -1319,8 +1350,17 @@ else
 fi
 if [[ "${UBUNTU_UPGRADE_OK:-0}" -eq 1 ]] && apt-get check >/dev/null 2>&1 && [[ -z "$(dpkg --audit)" ]]; then status_line "Ubuntu package upgrade" OK "Ubuntu $UBUNTU_VERSION"; else status_line "Ubuntu package upgrade" ERROR; fi
 if apt-get check >/dev/null 2>&1 && [[ -z "$(dpkg --audit)" ]]; then status_line "Required packages" OK; else status_line "Required packages" ERROR; fi
-if systemctl is-enabled --quiet apt-daily.timer && systemctl is-enabled --quiet apt-daily-upgrade.timer && [[ -r /etc/apt/apt.conf.d/52xhttp-vps-auto-upgrades ]]; then status_line "Daily security updates" OK "automatic reboot disabled"; else status_line "Daily security updates" ERROR; fi
-if systemctl is-enabled --quiet xhttp-vps-maintenance.timer && systemd-analyze calendar "Sun *-*-* 05:00:00 ${MAINTENANCE_TIMEZONE}" >/dev/null 2>&1; then status_line "Weekly maintenance" OK "Sunday 05:00 ${MAINTENANCE_TIMEZONE}; conditional reboot"; else status_line "Weekly maintenance" ERROR; fi
+case "$MAINTENANCE_MODE" in
+  security)
+    if apt-config dump | grep -F 'APT::Periodic::Unattended-Upgrade "1"' >/dev/null && ! systemctl is-enabled --quiet xhttp-vps-maintenance.timer 2>/dev/null; then status_line "Automatic maintenance" OK "security updates only; no automatic reboot"; else status_line "Automatic maintenance" ERROR; fi
+    ;;
+  weekly)
+    if apt-config dump | grep -F 'APT::Periodic::Unattended-Upgrade "1"' >/dev/null && systemctl is-enabled --quiet xhttp-vps-maintenance.timer && systemd-analyze calendar "Sun *-*-* 05:00:00 ${MAINTENANCE_TIMEZONE}" >/dev/null 2>&1; then status_line "Automatic maintenance" OK "Sunday 05:00 ${MAINTENANCE_TIMEZONE}; conditional reboot; panel/Xray excluded"; else status_line "Automatic maintenance" ERROR; fi
+    ;;
+  none)
+    if apt-config dump | grep -F 'APT::Periodic::Enable "0"' >/dev/null && ! systemctl is-enabled --quiet xhttp-vps-maintenance.timer 2>/dev/null; then status_line "Automatic maintenance" OK "disabled by user"; else status_line "Automatic maintenance" ERROR; fi
+    ;;
+esac
 if [[ "$SSH_HARDENING" == 1 ]] && xhttp_verify_ssh_access; then
   status_line "Key-only SSH administration" OK "$(xhttp_ssh_access_label "$SSH_ACCESS_MODE")"
 elif [[ "$SSH_HARDENING" == 0 && "$SSH_ACCESS_MODE" == existing ]]; then
@@ -1377,6 +1417,11 @@ else
   status_line "Mihomo subscription" SKIP "managed by the main panel"
 fi
 if systemctl is-active --quiet fail2ban && fail2ban-client status sshd >/dev/null 2>&1; then status_line "Fail2ban sshd jail" OK; else status_line "Fail2ban sshd jail" ERROR; fi
+if [[ "$PANEL_ACCESS_MODE" == public ]]; then
+  if fail2ban-client status xhttp-vps-panel >/dev/null 2>&1; then status_line "Fail2ban panel jail" OK; else status_line "Fail2ban panel jail" ERROR; fi
+else
+  status_line "Fail2ban panel jail" SKIP "panel is not public"
+fi
 if [[ "$ENABLE_WARP" -eq 1 ]]; then
   if [[ "${WARP_CONFIGURED:-0}" -eq 1 ]]; then status_line "WARP RU routing" OK; else status_line "WARP RU routing" ERROR; fi
 else
@@ -1422,7 +1467,7 @@ case "$PANEL_ACCESS_MODE" in
     ;;
   public)
     PANEL_DISPLAY_URL="https://${DOMAIN}:${PANEL_PORT}/${PANEL_PATH}/"
-    PANEL_ACCESS_DETAILS="public Internet; enable panel 2FA immediately"
+    PANEL_ACCESS_DETAILS="public Internet; 2FA is recommended as additional protection"
     ;;
 esac
 
@@ -1438,7 +1483,7 @@ umask 077
   printf 'SSH LOGIN: ssh -p %s %s@%s\n' "$SSH_PORT" "$ADMIN_USER" "$DOMAIN"
   printf 'SSH POLICY: %s\n' "$(xhttp_ssh_access_label "$SSH_ACCESS_MODE")"
   if [[ -n "$ADMIN_KEY_FINGERPRINTS" ]]; then printf 'SSH KEY: %s\n' "$ADMIN_KEY_FINGERPRINTS"; fi
-  printf 'MAINTENANCE: Sunday 05:00 %s; reboot only when required\n' "$MAINTENANCE_TIMEZONE"
+  printf 'MAINTENANCE: %s\n' "$(xhttp_maintenance_label "$MAINTENANCE_MODE")"
   printf '%s\n' "$MODE_DETAILS"
   if [[ "$INSTALL_MODE" == "standalone" ]]; then
     printf '\nMAIN SERVER — COPY OR SAVE\n'
@@ -1528,7 +1573,7 @@ if [[ "$PANEL_ACCESS_MODE" == "private" ]]; then
 fi
 printf '%bVPN inbound:%b %s on TCP/443\n' "$blue" "$plain" "$(xhttp_transport_label "$TRANSPORT")"
 printf '%bSSH:%b %s\n' "$blue" "$plain" "$(xhttp_ssh_access_label "$SSH_ACCESS_MODE")"
-printf '%bMaintenance:%b Sunday 05:00 %s; reboot only when required\n' "$blue" "$plain" "$MAINTENANCE_TIMEZONE"
+printf '%bMaintenance:%b %s\n' "$blue" "$plain" "$(xhttp_maintenance_label "$MAINTENANCE_MODE")"
 printf '%bWARP routing:%b %s\n' "$blue" "$plain" "$([[ "$ENABLE_WARP" -eq 1 ]] && echo ENABLED || echo DISABLED)"
 printf '%bSaved result:%b %s\n' "$blue" "$plain" "$RESULT_FILE"
 printf '%bSaved state:%b  %s\n' "$blue" "$plain" "$STATE_FILE"
@@ -1542,7 +1587,10 @@ else
   printf '%bWARNING: the current SSH policy was retained and may still permit password/root login.%b\n' "$red" "$plain"
 fi
 if [[ "$PANEL_ACCESS_MODE" == public ]]; then
-  printf '%bPublic panel selected: enable panel 2FA now and store recovery codes offline.%b\n' "$yellow" "$plain"
+  printf '%bPublic panel selected: 2FA is recommended as additional protection; store its recovery codes offline.%b\n' "$yellow" "$plain"
+fi
+if [[ "$TWO_FACTOR_GUIDE" == 1 ]]; then
+  printf '%b2FA setup:%b open Panel Settings, enable 2FA, scan the QR code and store recovery codes offline.\n' "$cyan" "$plain"
 fi
 if [[ "$INSTALL_MODE" == node ]]; then
   printf 'Node traffic is not verified until a client is provisioned by the main panel.\n'
