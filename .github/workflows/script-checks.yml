@@ -96,15 +96,18 @@ jobs:
 
   supported-ubuntu:
     name: Ubuntu ${{ matrix.ubuntu }}
-    runs-on: ubuntu-latest
-    container: ubuntu:${{ matrix.ubuntu }}
+    runs-on: ubuntu-${{ matrix.ubuntu }}
     strategy:
       fail-fast: false
       matrix:
         ubuntu: ['22.04', '24.04']
     steps:
-      - name: Install test dependencies
-        run: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y bash ca-certificates coreutils findutils git grep jq nodejs openssh-client sed sqlite3
+      - name: Ensure test dependencies are available
+        run: |
+          if ! command -v jq || ! command -v node || ! command -v sqlite3; then
+            sudo apt-get update
+            sudo apt-get install -y jq nodejs sqlite3
+          fi
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Check scripts and compatibility helpers
         shell: bash
