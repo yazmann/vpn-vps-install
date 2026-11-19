@@ -1009,7 +1009,8 @@ xhttp_restart_vpn_service() {
 
 xhttp_download_verified() {
   local url="$1" expected="$2" output="$3" actual
-  curl -q -fL --proto '=https' --proto-redir '=https' --retry 3 --retry-all-errors --connect-timeout 10 --max-time 120 "$url" -o "$output" || {
+  curl -q -fL --proto '=https' --proto-redir '=https' --retry 3 --retry-all-errors \
+    --connect-timeout 10 --speed-limit 1024 --speed-time 30 --max-time 600 "$url" -o "$output" || {
     rm -f -- "$output"
     return 1
   }

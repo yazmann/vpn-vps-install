@@ -87,6 +87,7 @@ curl() {
       ;;
     *https://github.com/example/project/releases/download/current/asset*)
       [[ "${*: -2:1}" == '-o' ]]
+      [[ "$*" == *' --speed-limit 1024 --speed-time 30 --max-time 600 '* ]] || return 1
       printf %s "${PAYLOAD:-release payload}" > "${*: -1}"
       ;;
     *api.github.com/repos/hydraponique/roscomvpn-routing/contents/HAPP/DEFAULT.DEEPLINK*)
