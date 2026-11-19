@@ -135,4 +135,20 @@ awk '/^INCY subscription: /{print $3}' <<<"$encrypted" | node -e '
   if (body.url !== process.argv[1] || body.v !== 1) process.exit(1);
 ' "$subscription_url"
 if SUB_ENCRYPT_LINKS=true xhttp_subscription_links "$subscription_url" missing@example.com; then exit 1; fi
+
+# A real SQLite snapshot and OpenPGP round trip using fixture files only.
+fixture="$test_dir/backup-fixture"
+mkdir -p "$fixture/etc/x-ui" "$fixture/etc/nginx/sites-available" "$fixture/var/www/3xui-cover" "$test_dir/readback"
+printf 'domain test\n' > "$fixture/installer.env"
+printf 'test config\n' > "$fixture/etc/nginx/sites-available/3xui-self-steal.conf"
+printf 'test site\n' > "$fixture/var/www/3xui-cover/index.html"
+sqlite3 "$fixture/etc/x-ui/x-ui.db" 'CREATE TABLE users(name TEXT); INSERT INTO users VALUES ("client");'
+RECOVERY_PASSPHRASE='fixture archive passphrase'
+backup="$(TRANSPORT=xhttp DOMAIN=example.com xhttp_write_recovery_backup "$fixture/installer.env" "$test_dir" "$fixture")"
+[[ "$(stat -c '%a' "$backup")" == 600 ]]
+mkdir -m 700 "$test_dir/backup-reader"
+gpg --homedir "$test_dir/backup-reader" --batch --quiet --pinentry-mode loopback --passphrase-fd 3 \
+  --decrypt "$backup" 3<<<"$RECOVERY_PASSPHRASE" | tar -xzf - -C "$test_dir/readback"
+cmp "$fixture/installer.env" "$test_dir/readback/installer.env"
+[[ "$(sqlite3 "$test_dir/readback/etc/x-ui/x-ui.db" 'SELECT name FROM users;')" == client ]]
 printf 'Transport and download tests passed.\n'

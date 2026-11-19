@@ -24,12 +24,21 @@ if xhttp_validate_single_dns_ipv4 203.0.113.7 <<<$'origin.example.\n203.0.113.7'
 [[ "$(xhttp_ssh_access_label existing)" == *'not recommended'* ]]
 admin_sshd="$(xhttp_render_sshd_hardening admin vpnadmin)"
 grep -Fxq 'PermitRootLogin no' <<<"$admin_sshd"
+grep -Fxq 'PasswordAuthentication no' <<<"$admin_sshd"
 grep -Fxq 'AllowUsers vpnadmin' <<<"$admin_sshd"
 grep -Fxq 'AuthenticationMethods publickey' <<<"$admin_sshd"
 root_sshd="$(xhttp_render_sshd_hardening root-key root)"
 grep -Fxq 'PermitRootLogin prohibit-password' <<<"$root_sshd"
 grep -Fxq 'AllowUsers root' <<<"$root_sshd"
 if xhttp_render_sshd_hardening admin root >/dev/null; then exit 1; fi
+cert_sshd="$(xhttp_render_sshd_hardening admin-cert vpnadmin)"
+grep -Fxq 'PermitRootLogin no' <<<"$cert_sshd"
+grep -Fxq 'PasswordAuthentication no' <<<"$cert_sshd"
+grep -Fxq 'PubkeyAcceptedAlgorithms *-cert-v01@openssh.com' <<<"$cert_sshd"
+password_sshd="$(xhttp_render_sshd_hardening root-password root)"
+grep -Fxq 'PermitRootLogin yes' <<<"$password_sshd"
+grep -Fxq 'PasswordAuthentication yes' <<<"$password_sshd"
+grep -Fxq 'AuthenticationMethods password' <<<"$password_sshd"
 vision_stream="$(xhttp_build_stream_settings vision example.com 127.0.0.1:9443 private public abcd)"
 jq -e '.network=="tcp" and .security=="reality" and .tcpSettings.header.type=="none" and .realitySettings.target=="127.0.0.1:9443" and .realitySettings.serverNames==["example.com"]' <<<"$vision_stream" >/dev/null
 xhttp_stream="$(xhttp_build_stream_settings xhttp example.com 127.0.0.1:9443 private public abcd)"
@@ -98,6 +107,19 @@ trap 'rm -rf "$test_dir"' EXIT
 ssh-keygen -q -t ed25519 -N '' -f "$test_dir/key"
 key_b64="$(base64 -w0 "$test_dir/key.pub")"
 xhttp_validate_authorized_keys_b64 "$key_b64"
+ca_b64="$(printf '%s' "$(<"$test_dir/key.pub")" | base64 -w0)"
+xhttp_validate_ssh_ca_b64 "$ca_b64"
+if xhttp_validate_ssh_ca_b64 "$(cat "$test_dir/key.pub" "$test_dir/key.pub" | base64 -w0)"; then exit 1; fi
+if [[ "${XHTTP_TEST_SSHD:-0}" == 1 ]]; then
+  sudo install -d -m 755 /run/sshd
+  printf '%s\n' "$cert_sshd" > "$test_dir/sshd_config"
+  (
+    export SSH_ACCESS_MODE=admin-cert ADMIN_USER=vpnadmin SSH_CONNECTION=''
+    sshd() { /usr/sbin/sshd -f "$test_dir/sshd_config" -h "$test_dir/key" "$@"; }
+    sshd -t
+    xhttp_verify_managed_sshd_config
+  )
+fi
 if xhttp_validate_authorized_keys_b64 "$(printf 'no-port-forwarding %s\n' "$(cat "$test_dir/key.pub")" | base64 -w0)"; then exit 1; fi
 MANAGED_BACKUP="$test_dir/journal"
 mkdir "$MANAGED_BACKUP" "$test_dir/owned" "$test_dir/unrelated"
@@ -105,6 +127,13 @@ export SSH_ACCESS_MODE=root-key SSH_HARDENING=1 ADMIN_USER=root ADMIN_KEYS_B64="
 xhttp_validate_ssh_access_state
 export SSH_ACCESS_MODE=admin ADMIN_USER=root
 if xhttp_validate_ssh_access_state; then exit 1; fi
+export SSH_ACCESS_MODE=admin-cert ADMIN_USER=vpnadmin ADMIN_KEYS_B64="$ca_b64" SSH_PORT=22
+xhttp_validate_ssh_access_state
+ssh_info="$(xhttp_print_ssh_connection)"
+grep -Eq 'Username:[[:space:]]+vpnadmin' <<<"$ssh_info"
+grep -Fq 'CertificateFile=' <<<"$ssh_info"
+export SSH_ACCESS_MODE=root-password ADMIN_USER=root ADMIN_KEYS_B64=''
+xhttp_validate_ssh_access_state
 export SSH_ACCESS_MODE=existing SSH_HARDENING=0 ADMIN_USER=root ADMIN_KEYS_B64=''
 xhttp_validate_ssh_access_state
 printf 'original\n' > "$test_dir/config"
@@ -152,6 +181,17 @@ grep -Fq 'access_log off;' <<<"$nginx"
 grep -Fq 'listen 127.0.0.1:12345 ssl http2;' <<<"$nginx"
 grep -Fq 'location ^~ /.well-known/acme-challenge/' <<<"$nginx"
 grep -Fq 'return 301 https://example.com$request_uri;' <<<"$nginx"
+if grep -Fq 'Referrer-Policy' <<<"$nginx"; then exit 1; fi
+protected_nginx="$(SUB_PRIVACY_HEADERS=true xhttp_render_nginx)"
+grep -Fq "add_header Cache-Control 'private, no-store' always;" <<<"$protected_nginx"
+grep -Fq "add_header Referrer-Policy 'no-referrer' always;" <<<"$protected_nginx"
+profile='{"subProfileMode":"custom","subProfileUrl":"https://old.example/"}'
+[[ "$(xhttp_subscription_profile_settings <<<"$profile")" == "$profile" ]]
+SUB_PROFILE_MODE=none xhttp_subscription_profile_settings <<<"$profile" | jq -e '.subProfileMode=="none" and .subProfileUrl==""' >/dev/null
+SUB_PROFILE_MODE=builtin xhttp_subscription_profile_settings <<<"$profile" | jq -e '.subProfileMode=="builtin" and .subProfileUrl==""' >/dev/null
+headers=$'HTTP/2 200\r\ncache-control: private, no-store\r\nreferrer-policy: no-referrer\r\n'
+SUB_PROFILE_MODE=none SUB_PRIVACY_HEADERS=true xhttp_verify_subscription_protection "$headers"
+if SUB_PROFILE_MODE=none xhttp_verify_subscription_protection "${headers}"$'profile-web-page-url: https://example.com/page\r\n'; then exit 1; fi
 export XHTTP_NGINX_VERSION_OVERRIDE=1.26.0
 nginx="$(xhttp_render_nginx)"
 grep -Fq 'listen 127.0.0.1:12345 ssl;' <<<"$nginx"

@@ -68,7 +68,6 @@ jobs:
           fi
           grep -Fq 'permit_root=no' xhttp-vps-common.sh
           grep -Fq 'permit_root=prohibit-password' xhttp-vps-common.sh
-          grep -Fq 'PasswordAuthentication no' xhttp-vps-common.sh
           grep -Fq 'AllowTcpForwarding local' xhttp-vps-common.sh
           grep -Fq "SSH_ACCESS_MODE='admin'" install-xhttp-vps.sh
           grep -Fq 'SSH_ACCESS_MODE=root-key' install-xhttp-vps.sh
@@ -104,9 +103,9 @@ jobs:
     steps:
       - name: Ensure test dependencies are available
         run: |
-          if ! command -v jq || ! command -v node || ! command -v sqlite3; then
+          if ! command -v jq || ! command -v node || ! command -v sqlite3 || ! command -v gpg || ! test -x /usr/sbin/sshd; then
             sudo apt-get update
-            sudo apt-get install -y jq nodejs sqlite3
+            sudo apt-get install -y jq nodejs sqlite3 gnupg openssh-server
           fi
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Check scripts and compatibility helpers
@@ -114,7 +113,7 @@ jobs:
         run: |
           for script in *.sh tests/*.sh; do bash -n "$script"; done
           bash tests/memory-profile.sh
-          bash tests/lifecycle.sh
+          XHTTP_TEST_SSHD=1 bash tests/lifecycle.sh
           bash tests/api-tokens.sh
           bash tests/transports.sh
           bash tests/migration.sh

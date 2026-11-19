@@ -345,9 +345,11 @@ xhttp_udp_finish() {
   ufw allow "$UDP_PORT"/udp comment "xhttp-vps:${SAFE_INSTANCE} UDP"
   local report
   report="$(mktemp "${RESULT_FILE}.XXXXXXXX")"
-  printf 'VPN NAME: %s\nTRANSPORT: %s\nENDPOINT: %s:%s/UDP\nCLIENT PROFILE: %s\nSSH PORT: %s\nSSH POLICY: %s\n' \
-    "$VPN_NAME" "$(xhttp_transport_label "$TRANSPORT")" "$DOMAIN" "$UDP_PORT" "$profile" \
-    "$SSH_PORT" "$(xhttp_ssh_access_label "$SSH_ACCESS_MODE")" > "$report"
+  {
+    printf 'VPN NAME: %s\nTRANSPORT: %s\nENDPOINT: %s:%s/UDP\nCLIENT PROFILE: %s\n' \
+      "$VPN_NAME" "$(xhttp_transport_label "$TRANSPORT")" "$DOMAIN" "$UDP_PORT" "$profile"
+    xhttp_print_ssh_connection
+  } > "$report"
   mv -T "$report" "$RESULT_FILE"
   cat "$RESULT_FILE"
 }

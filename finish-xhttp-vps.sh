@@ -39,6 +39,7 @@ mapfile -t STATE_FILES < <(find /root -maxdepth 1 -type f \( -name '3xui-vps-*.e
 [[ ${#STATE_FILES[@]} -eq 1 ]] || die "Expected exactly one 3x-ui installer state file in /root; found ${#STATE_FILES[@]}."
 # shellcheck disable=SC1090
 source "${STATE_FILES[0]}"
+INITIAL_INSTALL_PHASE="${INSTALL_PHASE:-}"
 if [[ "${INSTALL_PHASE:-}" == bootstrap ]] || ! xhttp_uses_panel; then
   exec "$(dirname "$(readlink -f "$0")")/install-xhttp-vps.sh" --resume
 fi
@@ -228,6 +229,7 @@ S="$(jq -c --arg d "$DOMAIN" --arg title "$VPN_NAME" --argjson p "$SUB_PORT" --a
   --arg cert "/root/cert/${DOMAIN}/fullchain.pem" --arg key "/root/cert/${DOMAIN}/privkey.pem" '
   .subEnable=true|.subEncrypt=true|.subListen="127.0.0.1"|.subDomain=$d|.subPort=$p|.subPath=$path
   |.subCertFile=$cert|.subKeyFile=$key|.subURI=("https://"+$d+$path)|.subTitle=$title' <<<"$S")"
+S="$(xhttp_subscription_profile_settings <<<"$S")"
 ROUTING_CONFIGURED=0; MIHOMO_CONFIGURED=0
 if [[ "$INSTALL_MODE" == "standalone" ]]; then
   if [[ -n "$SUB_ENCRYPT_LINKS" ]]; then
@@ -372,7 +374,7 @@ if [[ "$INSTALL_MODE" == "node" && -z "${NODE_API_TOKEN:-}" ]]; then
     || die "Could not create the restricted node-sync API token. The local administrator token was not exported."
   printf '\nNODE_API_TOKEN=%q\n' "$NODE_API_TOKEN" >> "${STATE_FILES[0]}"
 fi
-INBOUND_OK=0; CLIENT_OK=0; SUB_OK=0; SELF_STEAL_OK=0; ROUTING_OK=0; MIHOMO_OK=0
+INBOUND_OK=0; CLIENT_OK=0; SUB_OK=0; SUB_PROTECTION_OK=0; SELF_STEAL_OK=0; ROUTING_OK=0; MIHOMO_OK=0
 R="$(curl -q -fsS "${API_AUTH[@]}" "$API_BASE/panel/api/inbounds/list" || true)"
 if jq -e --arg d "$DOMAIN" --arg t "127.0.0.1:${FALLBACK_PORT}" --arg transport "$TRANSPORT" --arg tag "$INBOUND_TAG" '
   .success==true and ((.obj|if type=="string" then fromjson else . end)|any(
@@ -396,8 +398,11 @@ if [[ "$INSTALL_MODE" == "standalone" ]]; then
     [[ -n "$SUB_DATA" ]] && { SUB_OK=1; break; }
     sleep 1
   done
-  if [[ "$ROUTING_CONFIGURED" -eq 1 && "$SUB_OK" -eq 1 ]]; then
+  if [[ "$SUB_OK" -eq 1 ]]; then
     SUB_HEADERS="$(curl -kfsS --resolve "${DOMAIN}:443:127.0.0.1" --max-time 5 -D - -o /dev/null "https://${DOMAIN}/${SUB_PATH}/${CLIENT_SUB_ID}" 2>/dev/null || true)"
+    if [[ -n "$SUB_HEADERS" ]] && xhttp_verify_subscription_protection "$SUB_HEADERS"; then SUB_PROTECTION_OK=1; fi
+  fi
+  if [[ "$ROUTING_CONFIGURED" -eq 1 && "$SUB_OK" -eq 1 ]]; then
     SUB_DECODED="$(printf '%s' "$SUB_DATA" | base64 -d 2>/dev/null || true)"
     if grep -qi '^Routing-Enable:[[:space:]]*true' <<<"$SUB_HEADERS" && grep -qi '^Routing:[[:space:]]*happ://routing/onadd/' <<<"$SUB_HEADERS" && grep -q 'incy://routing/onadd/' <<<"$SUB_DECODED"; then ROUTING_OK=1; fi
   fi
@@ -408,6 +413,9 @@ if [[ "$INSTALL_MODE" == "standalone" ]]; then
 fi
 
 CURRENT_STEP='restoring panel network access policy'
+if [[ -n "${SSH_ALLOWED_IP:-}" ]]; then
+  xhttp_configure_ssh_source || die 'Could not restore the selected SSH source policy.'
+fi
 while IFS= read -r rule_number; do
   ufw --force delete "$rule_number"
 done < <(ufw status numbered | awk -v marker="# xhttp-vps:${SAFE_INSTANCE} panel" '
@@ -451,7 +459,7 @@ if command -v fail2ban-client >/dev/null && xhttp_install_fail2ban_sshd; then FA
 if xhttp_configure_panel_fail2ban; then PANEL_FAIL2BAN_OK=1; fi
 if xhttp_configure_automatic_updates; then MAINTENANCE_OK=1; fi
 if [[ "$SSH_HARDENING" == 1 ]]; then
-  CURRENT_STEP='repairing the key-only administrative SSH policy'
+  CURRENT_STEP='repairing the administrative SSH policy'
   xhttp_install_ssh_access || die "Could not repair the selected SSH key access. Root SSH policy was not changed by this attempt."
   xhttp_harden_sshd || die "OpenSSH hardening failed validation. Keep the current session open and repair sshd before disconnecting."
   SSH_ACCESS_OK=1
@@ -486,9 +494,9 @@ else
   report "Automatic maintenance" ERROR
 fi
 if [[ "$SSH_HARDENING" == 1 ]]; then
-  if [[ "$SSH_ACCESS_OK" -eq 1 ]] && xhttp_verify_ssh_access; then report "Key-only SSH administration" OK; else report "Key-only SSH administration" ERROR; fi
+  if [[ "$SSH_ACCESS_OK" -eq 1 ]] && xhttp_verify_ssh_access; then report "SSH access policy" OK; else report "SSH access policy" ERROR; fi
 else
-  report "Key-only SSH administration" SKIP
+  report "SSH access policy" SKIP
 fi
 if systemctl is-active --quiet x-ui; then report "3x-ui panel" OK; else report "3x-ui panel" ERROR; fi
 if systemctl is-active --quiet nginx && nginx -t >/dev/null 2>&1; then report "nginx self-steal" OK; else report "nginx self-steal" ERROR; fi
@@ -510,6 +518,7 @@ if [[ "$INBOUND_OK" -eq 1 ]] && ss -H -ltn 'sport = :443' | grep -q .; then repo
 if [[ "$INSTALL_MODE" == "standalone" ]]; then
   if [[ "$CLIENT_OK" -eq 1 ]]; then report "First VLESS client" OK; else report "First VLESS client" ERROR; fi
   if [[ "$SUB_OK" -eq 1 ]]; then report "Client subscription URL" OK; else report "Client subscription URL" ERROR; fi
+  if [[ "$SUB_PROTECTION_OK" -eq 1 ]]; then report "Subscription privacy policy" OK; else report "Subscription privacy policy" ERROR; fi
   if [[ "$ROUTING_OK" -eq 1 ]]; then report "HAPP + INCY routing" OK; else report "HAPP + INCY routing" ERROR; fi
   if [[ "$MIHOMO_OK" -eq 1 ]]; then report "Mihomo subscription" OK; else report "Mihomo subscription" ERROR; fi
 else
@@ -593,7 +602,7 @@ if [[ "$PANEL_ACCESS_MODE" == "private" ]]; then
   printf '%bMobile:%b create the same local-port forwarding in Termius, or use private Tailscale Serve.\n\n' "$cyan" "$plain"
 fi
 printf '%bVPN transport:%b %s\n' "$blue" "$plain" "$(xhttp_transport_label "$TRANSPORT")"
-printf '%bSSH:%b %s\n' "$blue" "$plain" "$(xhttp_ssh_access_label "$SSH_ACCESS_MODE")"
+xhttp_print_ssh_connection
 printf '%bMaintenance:%b %s\n' "$blue" "$plain" "$(xhttp_maintenance_label "$MAINTENANCE_MODE")"
 if [[ "$PANEL_ACCESS_MODE" == public ]]; then
   printf '%bSecurity:%b public panel selected; 2FA is recommended as additional protection. Store its recovery codes offline.\n' "$yellow" "$plain"
@@ -616,3 +625,7 @@ mv -f "$RESULT_TEMP" "$RESULT_FILE"
   printf 'SSH_ACCESS_MODE=%q\n' "$SSH_ACCESS_MODE"
   printf 'INSTALL_PHASE=complete\n'
 } >> "${STATE_FILES[0]}"
+printf '%s\n' 'From another network, open the website, refresh subscriptions in your VPN apps, and test that the panel follows the chosen access policy.'
+if [[ "$INITIAL_INSTALL_PHASE" != complete && "${CREATE_RECOVERY_BACKUP:-0}" == 1 ]]; then
+  xhttp_export_recovery_backup "${STATE_FILES[0]}" || printf '%s\n' 'Backup skipped. You can retry using menu item 5.' >&2
+fi
