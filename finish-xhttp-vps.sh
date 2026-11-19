@@ -455,14 +455,23 @@ fi
 
 CURRENT_STEP='repairing Fail2ban and automatic maintenance'
 FAIL2BAN_OK=0; PANEL_FAIL2BAN_OK=0; MAINTENANCE_OK=0; SSH_ACCESS_OK=0
-if command -v fail2ban-client >/dev/null && xhttp_install_fail2ban_sshd; then FAIL2BAN_OK=1; fi
 if xhttp_configure_panel_fail2ban; then PANEL_FAIL2BAN_OK=1; fi
 if xhttp_configure_automatic_updates; then MAINTENANCE_OK=1; fi
+xhttp_apply_ping_policy || die 'Could not restore the selected IPv4 ping policy.'
 if [[ "$SSH_HARDENING" == 1 ]]; then
   CURRENT_STEP='repairing the administrative SSH policy'
   xhttp_install_ssh_access || die "Could not repair the selected SSH key access. Root SSH policy was not changed by this attempt."
   xhttp_harden_sshd || die "OpenSSH hardening failed validation. Keep the current session open and repair sshd before disconnecting."
   SSH_ACCESS_OK=1
+fi
+xhttp_finalize_ssh_port || die 'SSH port migration did not complete. Keep this session open.'
+{
+  printf 'SSH_PORT=%q\n' "$SSH_PORT"
+  printf 'SSH_TARGET_PORT=%q\n' "${SSH_TARGET_PORT:-}"
+} >> "${STATE_FILES[0]}"
+if command -v fail2ban-client >/dev/null && xhttp_install_fail2ban_sshd; then FAIL2BAN_OK=1; fi
+if [[ "$INITIAL_INSTALL_PHASE" != complete ]]; then
+  xhttp_enroll_panel_2fa || die '3x-ui has not confirmed two-factor authentication. Resume setup to finish enrollment.'
 fi
 
 CURRENT_STEP='running completion audit'
