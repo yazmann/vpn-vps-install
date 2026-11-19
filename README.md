@@ -35,21 +35,40 @@
 - Свободные и доступные извне TCP/80, TCP/443 и текущий порт SSH.
 - Для Hysteria 2 откройте UDP/443 в firewall провайдера. Для AmneziaWG откройте UDP-порт, указанный в итоговых настройках. Ядро VPS должно поддерживать загрузку модуля DKMS AmneziaWG и иметь доступные заголовки.
 - Отсутствие установленных 3x-ui, Nginx, ACME и настроенного UFW.
-- Git для получения исходников установщика.
 
 Для режима SSH по умолчанию подготовьте открытый Ed25519-ключ CA и подписанный пользовательский сертификат. Белые списки SSH и панели, WARP и Tailscale настраиваются по выбору.
 
 ## Установка
 
-Клонируйте репозиторий и проверьте загруженный коммит. Затем запустите установщик от `root`.
+Вставьте весь блок в SSH-терминал от `root`. Он подходит для минимальных образов Ubuntu: при необходимости сам установит `curl` и корневые сертификаты, скачает архив проекта и запустит мастер. Git для этого не нужен. Для воспроизводимого теста можно заменить `main` на полный SHA коммита.
 
 ```bash
-set -euo pipefail
-cd /root
-git clone https://github.com/yazmann/xhttp-vps-setup.git
-cd xhttp-vps-setup
-git log -1 --oneline
-bash ./install-xhttp-vps.sh
+(
+  set -e
+  if [ "$(id -u)" -ne 0 ]; then
+    printf '%s\n' 'Запустите этот блок от root.' >&2
+    exit 1
+  fi
+
+  if ! command -v curl >/dev/null || [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then
+    apt-get -o DPkg::Lock::Timeout=300 update
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 \
+      install -y --no-install-recommends curl ca-certificates
+  fi
+
+  revision=main
+  workdir=$(mktemp -d)
+  trap 'rm -rf -- "$workdir"' EXIT
+  curl -q --fail --silent --show-error --location --retry 3 --connect-timeout 10 \
+    --proto '=https' --proto-redir '=https' \
+    "https://codeload.github.com/yazmann/xhttp-vps-setup/tar.gz/$revision" \
+    --output "$workdir/source.tar.gz"
+  tar -xzf "$workdir/source.tar.gz" -C "$workdir" --strip-components=1 \
+    --no-same-owner --no-same-permissions
+  cd "$workdir"
+  chmod u+x ./install-xhttp-vps.sh
+  bash ./install-xhttp-vps.sh
+)
 ```
 
 ## Команды
