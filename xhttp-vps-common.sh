@@ -106,18 +106,170 @@ xhttp_delete_firewall_rules() {
 }
 
 xhttp_configure_ssh_source() {
-  local marker="xhttp-vps-ssh:${SAFE_INSTANCE}" rules
+  local marker="xhttp-vps-ssh:${SAFE_INSTANCE} ${SSH_PORT}" rules
   if [[ -z "${SSH_ALLOWED_IP:-}" ]]; then
-    ufw allow "$SSH_PORT"/tcp comment 'SSH - preserve remote access'
+    ufw allow "$SSH_PORT"/tcp comment "$marker allow"
     return
   fi
   xhttp_valid_ipv4 "$SSH_ALLOWED_IP" || return 1
+  if [[ "${1:-}" != keep-legacy ]]; then
+    xhttp_delete_firewall_rules "xhttp-vps-ssh:${SAFE_INSTANCE} allow" &&
+      xhttp_delete_firewall_rules "xhttp-vps-ssh:${SAFE_INSTANCE} deny" || return 1
+  fi
   xhttp_delete_firewall_rules "$marker" || return 1
   # Insert the allow first so a failed operation never leaves only a deny.
   ufw insert 1 allow in from "$SSH_ALLOWED_IP" to any port "$SSH_PORT" proto tcp comment "$marker allow" || return 1
   rules="$(ufw show added)" || return 1
   [[ "$rules" == *"$marker allow"* ]] || return 1
   ufw insert 2 deny in from 0.0.0.0/0 to any port "$SSH_PORT" proto tcp comment "$marker deny"
+}
+
+xhttp_render_ssh_ports() {
+  local kind="$1" port
+  shift
+  case "$kind" in
+    socket) printf '[Socket]\nListenStream=\n' ;;
+    daemon) ;;
+    *) return 1 ;;
+  esac
+  for port in "$@"; do
+    if [[ "$kind" == socket ]]; then printf 'ListenStream=0.0.0.0:%s\n' "$port"; else printf 'Port %s\n' "$port"; fi
+  done
+}
+
+xhttp_reload_ssh_listeners() {
+  if [[ "$1" == socket ]]; then
+    # Ubuntu uses KillMode=process so stopping the listener retains accepted sessions.
+    [[ "$(systemctl show --property=KillMode --value ssh.service)" == process ]] || return 1
+    systemctl stop ssh.service && systemctl daemon-reload &&
+      systemctl restart ssh.socket && systemctl start ssh.service
+  else
+    systemctl reload ssh.service
+  fi
+}
+
+xhttp_wait_ssh_ports() {
+  local port="$1" other="${2:-}" state="${3:-up}" attempt
+  for (( attempt=0; attempt<50; attempt++ )); do
+    if port_busy "$port"; then
+      if [[ -z "$other" ]]; then return 0; fi
+      if [[ "$state" == up ]] && port_busy "$other"; then return 0; fi
+      if [[ "$state" == down ]] && ! port_busy "$other"; then return 0; fi
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
+xhttp_move_ssh_port() (
+  local old="$SSH_PORT" new="$SSH_TARGET_PORT" kind=daemon directory reply sudo_command='sudo -n'
+  local daemon_file=/etc/ssh/sshd_config.d/00-xhttp-vps-port.conf
+  local socket_file=/etc/systemd/system/ssh.socket.d/99-xhttp-vps-port.conf
+  local changed=0 committed=0
+  [[ -t 0 ]] && port_busy "$old" || exit 1
+  if [[ -e "$daemon_file" ]]; then
+    [[ "$(<"$daemon_file")" == "$(xhttp_render_ssh_ports daemon "$old" "$new")" ]] || exit 1
+    if [[ -e "$socket_file" ]]; then
+      [[ "$(<"$socket_file")" == "$(xhttp_render_ssh_ports socket "$old" "$new")" ]] || exit 1
+    fi
+    changed=1
+  else
+    [[ ! -e "$socket_file" ]] && ! port_busy "$new" || exit 1
+  fi
+  if systemctl is-active --quiet ssh.socket; then
+    kind=socket
+    [[ "$(systemctl show --property=KillMode --value ssh.service)" == process ]] || exit 1
+    install -d -m 755 /etc/systemd/system/ssh.socket.d || exit 1
+  fi
+  directory="$(mktemp -d /run/xhttp-vps-ssh-port.XXXXXXXX)" || exit 1
+  cleanup_ssh_port_change() {
+    local status="$?"
+    if [[ "$committed" == 0 ]]; then
+      if [[ "$changed" == 1 ]]; then
+        if ! rm -f -- "$daemon_file" "$socket_file" || ! xhttp_reload_ssh_listeners "$kind" || ! xhttp_wait_ssh_ports "$old"; then
+          printf 'Could not restore SSH on port %s. Keep this session open and use the provider console.\n' "$old" >&2
+          exit 70
+        fi
+      fi
+      xhttp_delete_firewall_rules "xhttp-vps-ssh:${SAFE_INSTANCE} $new" || true
+    fi
+    rm -f -- "$directory/verified" "$directory/daemon" "$directory/socket"
+    rmdir -- "$directory"
+    return "$status"
+  }
+  apply_ssh_ports() {
+    xhttp_render_ssh_ports daemon "$@" > "$directory/daemon" &&
+      install -m 644 "$directory/daemon" "$daemon_file" || return 1
+    if [[ "$kind" == socket ]]; then
+      xhttp_render_ssh_ports socket "$@" > "$directory/socket" &&
+        install -m 644 "$directory/socket" "$socket_file" || return 1
+    fi
+    sshd -t && xhttp_reload_ssh_listeners "$kind"
+  }
+  trap cleanup_ssh_port_change EXIT
+  trap 'exit 1' INT TERM HUP
+  SSH_PORT="$new" xhttp_configure_ssh_source keep-legacy || exit 1
+  changed=1
+  apply_ssh_ports "$old" "$new" && xhttp_wait_ssh_ports "$old" "$new" up || exit 1
+  SSH_PORT="$new" xhttp_print_ssh_connection
+  printf '\nAllow TCP/%s in the provider firewall. Connect in a separate SSH session on the new port and run:\n' "$new"
+  if [[ "$SSH_ACCESS_MODE" == existing ]]; then sudo_command=sudo; fi
+  printf '  test "${SSH_CONNECTION##* }" = %s && test "$(id -un)" = %s && %s touch %s/verified\n' "$new" "$ADMIN_USER" "$sudo_command" "$directory"
+  until [[ -f "$directory/verified" ]]; do
+    read -rp 'Press Enter once the new login succeeds, or type cancel to keep the original port: ' reply || exit 1
+    [[ "$reply" != cancel ]] || exit 2
+  done
+  apply_ssh_ports "$new" && xhttp_wait_ssh_ports "$new" "$old" down || exit 1
+  committed=1
+  xhttp_delete_firewall_rules "xhttp-vps-ssh:${SAFE_INSTANCE} $old" ||
+    printf 'Remove the installer firewall rule for the old SSH port %s manually.\n' "$old" >&2
+)
+
+xhttp_finalize_ssh_port() {
+  local config=/etc/ssh/sshd_config.d/00-xhttp-vps-port.conf
+  [[ -n "${SSH_TARGET_PORT:-}" && "$SSH_TARGET_PORT" != "$SSH_PORT" ]] || return 0
+  if [[ -f "$config" && "$(<"$config")" == "Port $SSH_TARGET_PORT" ]] &&
+    port_busy "$SSH_TARGET_PORT" && ! port_busy "$SSH_PORT"; then
+    xhttp_delete_firewall_rules "xhttp-vps-ssh:${SAFE_INSTANCE} $SSH_PORT" || true
+    SSH_PORT="$SSH_TARGET_PORT"
+  elif xhttp_move_ssh_port; then
+    SSH_PORT="$SSH_TARGET_PORT"
+  elif [[ "$?" == 2 ]]; then
+    printf 'SSH port change cancelled. Keeping port %s.\n' "$SSH_PORT"
+    SSH_TARGET_PORT=''
+  else
+    return 1
+  fi
+}
+
+xhttp_apply_ping_policy() {
+  [[ "${DISABLE_PING:-0}" == 1 ]] || return 0
+  printf '%s\n' 'net.ipv4.icmp_echo_ignore_all = 1' > /etc/sysctl.d/99-xhttp-vps-ping.conf &&
+    sysctl -w net.ipv4.icmp_echo_ignore_all=1 >/dev/null
+}
+
+xhttp_panel_2fa_enabled() {
+  local response
+  response="$(xhttp_memory_api /panel/api/setting/all -X POST)" || return 1
+  jq -e '.obj | if type == "string" then fromjson else . end | .twoFactorEnable == true and .hasTwoFactorToken != false' <<<"$response" >/dev/null
+}
+
+xhttp_enroll_panel_2fa() {
+  [[ "${PANEL_2FA_ENROLL:-0}" == 1 ]] || return 0
+  if xhttp_panel_2fa_enabled; then return 0; fi
+  [[ -t 0 ]] || return 1
+  printf '\n3X-UI TWO-FACTOR AUTHENTICATION\n'
+  printf '  Panel URL: https://%s:%s/%s/\n  Username:  %s\n  Password:  %s\n' "$DOMAIN" "$PANEL_PORT" "$PANEL_PATH" "$PANEL_USERNAME" "$PANEL_PASSWORD"
+  if [[ "$PANEL_ACCESS_MODE" != public ]]; then
+    printf '  Local SSH forward: %s -> 127.0.0.1:%s (SSH host %s, port %s, user %s)\n' "$PANEL_PORT" "$PANEL_PORT" "$PUBLIC_IP" "$SSH_PORT" "$ADMIN_USER"
+    printf '  Resolve %s to 127.0.0.1 locally while using the tunnel so HTTPS validates the panel certificate.\n' "$DOMAIN"
+  fi
+  printf '%s\n' 'In 3x-ui, open Settings → Security → Two-factor authentication. Scan the QR code, confirm the current code and save.'
+  until xhttp_panel_2fa_enabled; do
+    read -rp 'Press Enter after saving 2FA in 3x-ui, or Ctrl+C to pause setup: ' || return 1
+    if ! xhttp_panel_2fa_enabled; then printf '%s\n' 'The panel has not confirmed an active 2FA token yet.'; fi
+  done
+  printf '%s\n' '3x-ui confirmed that 2FA is enabled. Test it in a second browser session and store the authenticator backup separately.'
 }
 
 xhttp_subscription_profile_settings() {
@@ -1395,6 +1547,7 @@ xhttp_managed_paths() {
     /etc/systemd/system/xhttp-vps-maintenance.timer /etc/systemd/system/xhttp-vps-reboot.service \
     /etc/systemd/system/xhttp-vps-reboot.timer \
     "/root/cert/$DOMAIN" "$RESULT_FILE"
+  if [[ "${DISABLE_PING:-0}" == 1 ]]; then printf '%s\n' /etc/sysctl.d/99-xhttp-vps-ping.conf; fi
   if [[ "${ACME_CLIENT:-}" == certbot ]]; then
     printf '%s\n' /etc/xhttp-vps-acme /var/lib/xhttp-vps-acme /var/log/xhttp-vps-acme \
       /etc/systemd/system/xhttp-vps-cert-renew.service /etc/systemd/system/xhttp-vps-cert-renew.timer
@@ -1465,6 +1618,12 @@ xhttp_validate_state() {
   esac
   case "${MAINTENANCE_MODE:-weekly}" in security|weekly|none) ;; *) return 1 ;; esac
   case "${TWO_FACTOR_GUIDE:-0}" in 0|1) ;; *) return 1 ;; esac
+  case "${PANEL_2FA_ENROLL:-0}" in 0|1) ;; *) return 1 ;; esac
+  case "${DISABLE_PING:-0}" in 0|1) ;; *) return 1 ;; esac
+  case "${PREV_IPV4_ECHO_IGNORE:-0}" in 0|1) ;; *) return 1 ;; esac
+  if [[ -n "${SSH_TARGET_PORT:-}" ]]; then
+    [[ "$SSH_TARGET_PORT" =~ ^[1-9][0-9]{4}$ ]] && (( SSH_TARGET_PORT <= 65535 )) || return 1
+  fi
   xhttp_validate_ssh_access_state
 }
 

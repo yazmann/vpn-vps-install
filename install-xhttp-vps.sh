@@ -118,6 +118,9 @@ remove_installation() {
   [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6)" != 1 ]] || sysctl -w "net.ipv6.conf.all.disable_ipv6=${PREV_IPV6_ALL:-0}" >/dev/null
   [[ "$(sysctl -n net.ipv6.conf.default.disable_ipv6)" != 1 ]] || sysctl -w "net.ipv6.conf.default.disable_ipv6=${PREV_IPV6_DEFAULT:-0}" >/dev/null
   [[ "$(sysctl -n net.ipv6.conf.lo.disable_ipv6)" != 1 ]] || sysctl -w "net.ipv6.conf.lo.disable_ipv6=${PREV_IPV6_LO:-0}" >/dev/null
+  if [[ "${DISABLE_PING:-0}" == 1 && "$(sysctl -n net.ipv4.icmp_echo_ignore_all)" == 1 ]]; then
+    sysctl -w "net.ipv4.icmp_echo_ignore_all=${PREV_IPV4_ECHO_IGNORE:-0}" >/dev/null
+  fi
   if [[ "${TRANSPORT:-}" == amneziawg && "$(sysctl -n net.ipv4.ip_forward)" == 1 ]]; then
     sysctl -w "net.ipv4.ip_forward=${PREV_IPV4_FORWARD:-0}" >/dev/null
   fi
@@ -371,6 +374,7 @@ INBOUND_TAG=''
 PANEL_ACCESS_MODE=''
 PANEL_ALLOWED_IP=''
 TWO_FACTOR_GUIDE=0
+PANEL_2FA_ENROLL=0
 ENABLE_WARP=0
 SUB_ENCRYPT_LINKS=''
 SUB_PROFILE_MODE=''
@@ -403,18 +407,11 @@ case "$PANEL_ACCESS_CHOICE" in
   *) die "Unknown panel access choice: ${PANEL_ACCESS_CHOICE}" ;;
 esac
 
-cat <<'EOF'
-Two-factor authentication:
-  1) Not now (default)
-  2) Show setup steps after installation
-     Recommended as extra protection for public access.
-EOF
-read -rp "Select 2FA guidance [1]: " TWO_FACTOR_CHOICE
-TWO_FACTOR_CHOICE="${TWO_FACTOR_CHOICE:-1}"
-case "$TWO_FACTOR_CHOICE" in
-  1) TWO_FACTOR_GUIDE=0 ;;
-  2) TWO_FACTOR_GUIDE=1 ;;
-  *) die "Unknown 2FA choice: ${TWO_FACTOR_CHOICE}" ;;
+read -rp 'Enable 3x-ui two-factor authentication during setup (requires an authenticator app)? [y/N]: ' TWO_FACTOR_CHOICE
+case "${TWO_FACTOR_CHOICE,,}" in
+  ''|n|no) PANEL_2FA_ENROLL=0 ;;
+  y|yes) PANEL_2FA_ENROLL=1 ;;
+  *) die 'Enter yes or no for 3x-ui two-factor authentication.' ;;
 esac
 
 if [[ "$INSTALL_MODE" == standalone ]]; then
@@ -512,6 +509,20 @@ if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || (( SSH_PORT < 1 || SSH_PORT > 65535 )); th
   SSH_PORT="$(sshd -T 2>/dev/null | awk '$1=="port" {print $2; exit}' || true)"
 fi
 [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || SSH_PORT=22
+SSH_TARGET_PORT=''
+read -rp "Move SSH from port $SSH_PORT to a high port? [y/N]: " SSH_PORT_CHOICE
+case "${SSH_PORT_CHOICE,,}" in
+  ''|n|no) ;;
+  y|yes)
+    SSH_PORT_SUGGESTION="$(random_port)" || die 'Could not find a free high SSH port.'
+    read -rp "High SSH port (10000–65535) [$SSH_PORT_SUGGESTION]: " SSH_TARGET_PORT
+    SSH_TARGET_PORT="${SSH_TARGET_PORT:-$SSH_PORT_SUGGESTION}"
+    [[ "$SSH_TARGET_PORT" =~ ^[1-9][0-9]{4}$ ]] && (( SSH_TARGET_PORT <= 65535 )) &&
+      [[ "$SSH_TARGET_PORT" != "$SSH_PORT" ]] && ! port_busy "$SSH_TARGET_PORT" || die 'Choose a free high SSH port different from the current port.'
+    printf 'Allow TCP/%s at your VPS provider before switching. Keep TCP/%s open until the new login is verified.\n' "$SSH_TARGET_PORT" "$SSH_PORT"
+    ;;
+  *) die 'Enter yes or no for the SSH port change.' ;;
+esac
 
 cat <<'EOF'
 SSH access:
@@ -532,7 +543,8 @@ case "$SSH_ACCESS_CHOICE" in
   1)
     SSH_ACCESS_MODE=existing
     SSH_HARDENING=0
-    ADMIN_USER=root
+    ADMIN_USER="${SUDO_USER:-root}"
+    [[ "$ADMIN_USER" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || die 'Could not determine the current SSH administrator.'
     warn "The installer will preserve the current root and SSH authentication policy. Fail2ban reduces brute-force attempts but does not make weak credentials safe."
     ;;
   2)
@@ -601,6 +613,13 @@ if [[ -n "$SSH_ALLOWED_IP" ]]; then
   fi
 fi
 
+read -rp 'Disable IPv4 ping replies (keep other ICMP messages)? [y/N]: ' PING_CHOICE
+case "${PING_CHOICE,,}" in
+  ''|n|no) DISABLE_PING=0 ;;
+  y|yes) DISABLE_PING=1 ;;
+  *) die 'Enter yes or no for ping replies.' ;;
+esac
+
 cat <<'EOF'
 Automatic maintenance:
   1) Scheduled updates and conditional reboot (default)
@@ -650,9 +669,9 @@ SUB_JSON_PATH=''
 SUB_CLASH_PATH=''
 MIHOMO_ROUTING_PATH=''
 if xhttp_uses_panel; then
-PANEL_PORT="$(random_port)"
-while :; do SUB_PORT="$(random_port)"; [[ "$SUB_PORT" != "$PANEL_PORT" ]] && break; done
-while :; do FALLBACK_PORT="$(random_port)"; [[ "$FALLBACK_PORT" != "$PANEL_PORT" && "$FALLBACK_PORT" != "$SUB_PORT" ]] && break; done
+while :; do PANEL_PORT="$(random_port)"; [[ "$PANEL_PORT" != "$SSH_TARGET_PORT" ]] && break; done
+while :; do SUB_PORT="$(random_port)"; [[ "$SUB_PORT" != "$PANEL_PORT" && "$SUB_PORT" != "$SSH_TARGET_PORT" ]] && break; done
+while :; do FALLBACK_PORT="$(random_port)"; [[ "$FALLBACK_PORT" != "$PANEL_PORT" && "$FALLBACK_PORT" != "$SUB_PORT" && "$FALLBACK_PORT" != "$SSH_TARGET_PORT" ]] && break; done
 PANEL_PATH="panel-$(random_hex 16)"
 SUB_PATH="feed-$(random_hex 10)"
 SUB_JSON_PATH=""
@@ -688,6 +707,7 @@ PREV_CC="$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || echo cub
 PREV_IPV6_ALL="$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 0)"
 PREV_IPV6_DEFAULT="$(cat /proc/sys/net/ipv6/conf/default/disable_ipv6 2>/dev/null || echo 0)"
 PREV_IPV6_LO="$(cat /proc/sys/net/ipv6/conf/lo/disable_ipv6 2>/dev/null || echo 0)"
+PREV_IPV4_ECHO_IGNORE="$(sysctl -n net.ipv4.icmp_echo_ignore_all)"
 PREV_IPV4_FORWARD="$(sysctl -n net.ipv4.ip_forward)"
 UFW_WAS_ACTIVE=0
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
@@ -804,6 +824,8 @@ PANEL_PATH=${PANEL_PATH}
 PANEL_ACCESS_MODE=${PANEL_ACCESS_MODE}
 PANEL_ALLOWED_IP=${PANEL_ALLOWED_IP}
 TWO_FACTOR_GUIDE=${TWO_FACTOR_GUIDE}
+PANEL_2FA_ENROLL=${PANEL_2FA_ENROLL:-0}
+DISABLE_PING=${DISABLE_PING:-0}
 TRANSPORT=${TRANSPORT}
 UDP_PORT=${UDP_PORT}
 HY_PASSWORD=${HY_PASSWORD}
@@ -844,9 +866,11 @@ PREV_CC=${PREV_CC}
 PREV_IPV6_ALL=${PREV_IPV6_ALL}
 PREV_IPV6_DEFAULT=${PREV_IPV6_DEFAULT}
 PREV_IPV6_LO=${PREV_IPV6_LO}
+PREV_IPV4_ECHO_IGNORE=${PREV_IPV4_ECHO_IGNORE:-0}
 PREV_IPV4_FORWARD=${PREV_IPV4_FORWARD:-0}
 UFW_WAS_ACTIVE=${UFW_WAS_ACTIVE}
 SSH_PORT=${SSH_PORT}
+SSH_TARGET_PORT=${SSH_TARGET_PORT:-}
 SSH_ALLOWED_IP=${SSH_ALLOWED_IP:-}
 UFW_SSH_RULE_EXISTED=${UFW_SSH_RULE_EXISTED}
 UFW_HTTP_RULE_EXISTED=${UFW_HTTP_RULE_EXISTED}
@@ -892,8 +916,11 @@ cat <<EOF
   Maintenance:   $(xhttp_maintenance_label "$MAINTENANCE_MODE")
 EOF
 if [[ -n "${SSH_ALLOWED_IP:-}" ]]; then printf '  SSH source:    %s (UFW)\n' "$SSH_ALLOWED_IP"; fi
+if [[ -n "${SSH_TARGET_PORT:-}" ]]; then printf '  New SSH port:  %s (after tested login)\n' "$SSH_TARGET_PORT"; fi
+if [[ "${DISABLE_PING:-0}" == 1 ]]; then printf '  Ping replies:  disabled (IPv4 echo only)\n'; fi
 if xhttp_uses_panel; then
   printf '  Profile page:  %s\n  Subscription privacy headers: %s\n' "$SUB_PROFILE_MODE" "$SUB_PRIVACY_HEADERS"
+  if [[ "${PANEL_2FA_ENROLL:-0}" == 1 ]]; then printf '  Panel 2FA:     enroll during setup\n'; fi
 fi
 if [[ "${CREATE_RECOVERY_BACKUP:-0}" == 1 ]]; then printf '  Encrypted recovery backup: yes\n'; fi
 if [[ -n "$MIGRATION_DB" ]]; then printf '  User backup:   %s\n' "$MIGRATION_DB"; fi
@@ -922,9 +949,12 @@ if [[ "$REPAIRING_UDP" == 1 ]]; then
   xhttp_configure_automatic_updates
   xhttp_verify_automatic_updates
   xhttp_install_cert_renewal
-  xhttp_install_fail2ban_sshd
+  xhttp_apply_ping_policy
   if [[ -n "${SSH_ALLOWED_IP:-}" ]]; then xhttp_configure_ssh_source; fi
   if [[ "$SSH_HARDENING" == 1 ]]; then xhttp_harden_sshd; fi
+  xhttp_finalize_ssh_port || die 'SSH port migration did not complete. Keep this session open.'
+  write_state
+  xhttp_install_fail2ban_sshd
   xhttp_udp_finish
   PREVIOUS_INSTALL_PHASE="${INSTALL_PHASE:-}"
   INSTALL_PHASE=complete
@@ -1035,6 +1065,7 @@ net.ipv6.conf.default.disable_ipv6=1
 net.ipv6.conf.lo.disable_ipv6=1
 EOF
 sysctl --system >/dev/null
+xhttp_apply_ping_policy || die 'Could not apply the selected IPv4 ping policy.'
 [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" == "bbr" ]] || die "BBR could not be activated."
 [[ "$(sysctl -n net.core.default_qdisc)" == "fq" ]] || die "fq queue discipline could not be activated."
 [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6)" == "1" ]] || die "IPv6 could not be disabled."
@@ -1243,8 +1274,10 @@ if [[ "$ACME_CLIENT" == certbot ]]; then xhttp_install_cert_renewal; fi
 if ! xhttp_uses_panel; then
   [[ -r "$UDP_SCRIPT" ]] || die "UDP transport helpers are missing."
   log "Starting $(xhttp_transport_label "$TRANSPORT")"
-  xhttp_install_fail2ban_sshd || die "Fail2ban could not load the sshd jail."
   if [[ "$SSH_HARDENING" == 1 ]]; then xhttp_harden_sshd; fi
+  xhttp_finalize_ssh_port || die 'SSH port migration did not complete. Keep this session open.'
+  write_state
+  xhttp_install_fail2ban_sshd || die "Fail2ban could not load the sshd jail."
   xhttp_udp_finish
   INSTALL_PHASE=complete
   write_state
@@ -1563,10 +1596,6 @@ else
   if ufw status numbered | grep -Fq "# xhttp-vps:${SAFE_INSTANCE} panel"; then PANEL_FIREWALL_VERIFIED=1; fi
 fi
 
-log "Configuring Fail2ban"
-xhttp_install_fail2ban_sshd || die "Fail2ban could not enable and load the sshd jail."
-xhttp_configure_panel_fail2ban || die "Fail2ban could not apply the selected panel-access policy."
-
 if [[ "$SSH_HARDENING" == 1 ]]; then
   log "Applying the selected SSH policy"
   xhttp_harden_sshd \
@@ -1574,7 +1603,12 @@ if [[ "$SSH_HARDENING" == 1 ]]; then
 else
   warn "SSH hardening was skipped by explicit user choice."
 fi
+xhttp_finalize_ssh_port || die 'SSH port migration did not complete. Keep this session open.'
 write_state
+log "Configuring Fail2ban"
+xhttp_install_fail2ban_sshd || die "Fail2ban could not enable and load the sshd jail."
+xhttp_configure_panel_fail2ban || die "Fail2ban could not apply the selected panel-access policy."
+xhttp_enroll_panel_2fa || die '3x-ui has not confirmed two-factor authentication. Resume setup to finish enrollment.'
 
 log "Final checks"
 CHECK_FAILURES=0
@@ -1730,6 +1764,8 @@ umask 077
   printf 'VPN TRANSPORT: %s\n' "$(xhttp_transport_label "$TRANSPORT")"
   xhttp_print_ssh_connection
   printf 'MAINTENANCE: %s\n' "$(xhttp_maintenance_label "$MAINTENANCE_MODE")"
+  if [[ "${PANEL_2FA_ENROLL:-0}" == 1 ]]; then printf 'PANEL 2FA: Verified\n'; fi
+  if [[ "${DISABLE_PING:-0}" == 1 ]]; then printf 'IPV4 PING REPLIES: Disabled\n'; fi
   printf '%s\n' "$MODE_DETAILS"
   if [[ "$INSTALL_MODE" == "standalone" ]]; then
     printf '\nMAIN SERVER — COPY OR SAVE\n'

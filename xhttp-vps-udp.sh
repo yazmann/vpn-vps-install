@@ -349,6 +349,7 @@ xhttp_udp_finish() {
     printf 'VPN NAME: %s\nTRANSPORT: %s\nENDPOINT: %s:%s/UDP\nCLIENT PROFILE: %s\n' \
       "$VPN_NAME" "$(xhttp_transport_label "$TRANSPORT")" "$DOMAIN" "$UDP_PORT" "$profile"
     xhttp_print_ssh_connection
+    if [[ "${DISABLE_PING:-0}" == 1 ]]; then printf 'IPV4 PING REPLIES: Disabled\n'; fi
   } > "$report"
   mv -T "$report" "$RESULT_FILE"
   cat "$RESULT_FILE"

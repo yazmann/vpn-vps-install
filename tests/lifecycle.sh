@@ -39,6 +39,28 @@ password_sshd="$(xhttp_render_sshd_hardening root-password root)"
 grep -Fxq 'PermitRootLogin yes' <<<"$password_sshd"
 grep -Fxq 'PasswordAuthentication yes' <<<"$password_sshd"
 grep -Fxq 'AuthenticationMethods password' <<<"$password_sshd"
+[[ "$(xhttp_render_ssh_ports daemon 22 48215)" == $'Port 22\nPort 48215' ]]
+[[ "$(xhttp_render_ssh_ports socket 48215)" == $'[Socket]\nListenStream=\nListenStream=0.0.0.0:48215' ]]
+(
+  SSH_PORT=22 SSH_TARGET_PORT=48215
+  port_busy() { return 1; }
+  xhttp_move_ssh_port() { return 2; }
+  xhttp_finalize_ssh_port
+  [[ "$SSH_PORT" == 22 && -z "$SSH_TARGET_PORT" ]]
+  SSH_TARGET_PORT=48215
+  xhttp_move_ssh_port() { return 0; }
+  xhttp_finalize_ssh_port
+  [[ "$SSH_PORT" == 48215 ]]
+)
+(
+  xhttp_memory_api() {
+    [[ "$*" == '/panel/api/setting/all -X POST' ]] || return 1
+    printf '{"obj":{"twoFactorEnable":%s,"hasTwoFactorToken":%s}}\n' "${ENROLLED:-true}" "${HAS_TOKEN:-true}"
+  }
+  PANEL_2FA_ENROLL=1 xhttp_enroll_panel_2fa
+  if ENROLLED=false xhttp_panel_2fa_enabled; then exit 1; fi
+  if HAS_TOKEN=false xhttp_panel_2fa_enabled; then exit 1; fi
+)
 vision_stream="$(xhttp_build_stream_settings vision example.com 127.0.0.1:9443 private public abcd)"
 jq -e '.network=="tcp" and .security=="reality" and .tcpSettings.header.type=="none" and .realitySettings.target=="127.0.0.1:9443" and .realitySettings.serverNames==["example.com"]' <<<"$vision_stream" >/dev/null
 xhttp_stream="$(xhttp_build_stream_settings xhttp example.com 127.0.0.1:9443 private public abcd)"
@@ -104,6 +126,14 @@ export DOMAIN=example.com RESULT_FILE=/root/xhttp-vps-result-test.txt MANAGED_BA
 if xhttp_validate_state; then exit 1; fi
 test_dir="$(mktemp -d)"
 trap 'rm -rf "$test_dir"' EXIT
+(
+  eval "$(declare -f xhttp_apply_ping_policy | sed "s#/etc/sysctl.d/99-xhttp-vps-ping.conf#$test_dir/ping.conf#")"
+  sysctl() { [[ "$*" == '-w net.ipv4.icmp_echo_ignore_all=1' ]]; }
+  DISABLE_PING=0 xhttp_apply_ping_policy
+  [[ ! -e "$test_dir/ping.conf" ]]
+  DISABLE_PING=1 xhttp_apply_ping_policy
+  grep -Fxq 'net.ipv4.icmp_echo_ignore_all = 1' "$test_dir/ping.conf"
+)
 ssh-keygen -q -t ed25519 -N '' -f "$test_dir/key"
 key_b64="$(base64 -w0 "$test_dir/key.pub")"
 xhttp_validate_authorized_keys_b64 "$key_b64"
@@ -119,6 +149,10 @@ if [[ "${XHTTP_TEST_SSHD:-0}" == 1 ]]; then
     sshd -t
     xhttp_verify_managed_sshd_config
   )
+  xhttp_render_ssh_ports daemon 22 48215 >> "$test_dir/sshd_config"
+  ssh_effective="$(/usr/sbin/sshd -T -f "$test_dir/sshd_config" -h "$test_dir/key")"
+  grep -Fxq 'port 22' <<<"$ssh_effective"
+  grep -Fxq 'port 48215' <<<"$ssh_effective"
 fi
 if xhttp_validate_authorized_keys_b64 "$(printf 'no-port-forwarding %s\n' "$(cat "$test_dir/key.pub")" | base64 -w0)"; then exit 1; fi
 MANAGED_BACKUP="$test_dir/journal"
