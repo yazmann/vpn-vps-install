@@ -49,8 +49,8 @@ Suites: $suite
 Components: main
 Signed-By: /etc/apt/keyrings/xhttp-vps-amnezia.gpg
 EOF
-  apt-get -o DPkg::Lock::Timeout=300 update
-  apt-get -o DPkg::Lock::Timeout=300 install -y --no-install-recommends \
+  xhttp_apt_get -o APT::Update::Error-Mode=any update
+  xhttp_apt_apply install -y --no-install-recommends \
     "linux-headers-$(uname -r)" amneziawg
 )
 
@@ -313,7 +313,7 @@ EOF
   systemctl daemon-reload
   if ! systemctl is-active --quiet xhttp-vps-hysteria; then ! xhttp_udp_port_busy 443; fi
   systemctl enable xhttp-vps-hysteria
-  systemctl restart xhttp-vps-hysteria
+  xhttp_restart_vpn_service xhttp-vps-hysteria
   for _ in {1..20}; do
     pid="$(systemctl show --property=MainPID --value xhttp-vps-hysteria)"
     if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && ss -H -lunp 'sport = :443' | grep -Fq "pid=$pid,"; then

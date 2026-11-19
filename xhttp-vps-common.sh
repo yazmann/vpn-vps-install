@@ -449,14 +449,14 @@ xhttp_configure_panel_fail2ban() {
 xhttp_maintenance_label() {
   case "${1:-}" in
     security) printf '%s' 'daily Ubuntu security updates; no automatic reboot' ;;
-    weekly) printf 'daily security updates, Sunday 05:00 package updates and cleanup, conditional reboot at 05:30 (%s)' "${MAINTENANCE_TIMEZONE:-Europe/Moscow}" ;;
+    weekly) printf 'daily security updates, Sunday 05:00 APT and VPN component updates, conditional reboot at 05:30 (%s)' "${MAINTENANCE_TIMEZONE:-Europe/Moscow}" ;;
     none) printf '%s' 'no automatic updates or reboot' ;;
     *) return 1 ;;
   esac
 }
 
 xhttp_render_maintenance_timer() {
-  local unit=xhttp-vps-maintenance time=05:00:00 detail='package updates and cleanup'
+  local unit=xhttp-vps-maintenance time=05:00:00 detail='package and VPN component updates'
   if [[ "${1:-}" == reboot ]]; then
     unit=xhttp-vps-reboot
     time=05:30:00
@@ -478,12 +478,16 @@ EOF
 }
 
 xhttp_render_maintenance_script() {
+  printf '#!/usr/bin/env bash\n'
+  declare -f xhttp_apt_get xhttp_repair_apt xhttp_apt_apply xhttp_restart_vpn_service || return 1
+  declare -f xhttp_download_verified xhttp_latest_release_asset xhttp_release_arch \
+    xhttp_stage_panel_release xhttp_wait_for_vpn_service xhttp_update_panel xhttp_update_hysteria || return 1
   cat <<'EOF'
-#!/usr/bin/env bash
 set -Eeuo pipefail
 phase="$1"
 vpn_service="$2"
 export TZ="$3"
+panel_port="${4:-}"
 completed=/run/xhttp-vps-maintenance.ok
 exec 9>/run/xhttp-vps-setup.lock
 if ! flock -n 9; then
@@ -509,13 +513,29 @@ case "$phase" in
     today="$(date +%F)"
     export DEBIAN_FRONTEND=noninteractive
     export NEEDRESTART_MODE=a
-    apt-get -o APT::Update::Error-Mode=any update
-    apt-get -o DPkg::Lock::Timeout=1800 -y -o Dpkg::Options::="--force-confold" --with-new-pkgs upgrade
-    apt-get -o DPkg::Lock::Timeout=1800 -y autoremove
+    xhttp_apt_get -o APT::Update::Error-Mode=any update
+    xhttp_apt_apply -o DPkg::Lock::Timeout=1800 -y -o Dpkg::Options::="--force-confold" --with-new-pkgs upgrade
+    xhttp_apt_get -o DPkg::Lock::Timeout=1800 -y autoremove
     apt-get autoclean
     check_health
+    case "$vpn_service" in
+      x-ui|xhttp-vps-hysteria)
+        # A separate shell keeps errexit active even when the caller handles failure.
+        export -f xhttp_download_verified xhttp_latest_release_asset xhttp_release_arch \
+          xhttp_stage_panel_release xhttp_wait_for_vpn_service xhttp_update_panel xhttp_update_hysteria \
+          xhttp_restart_vpn_service
+        if bash -ec 'case "$1" in x-ui) xhttp_update_panel "$2" ;; *) xhttp_update_hysteria ;; esac' \
+          bash "$vpn_service" "$panel_port"; then
+          logger -t xhttp-vps-maintenance 'VPN release check completed.'
+        else
+          [[ "$?" != 70 ]] || exit 70
+          xhttp_wait_for_vpn_service "$vpn_service" "$panel_port"
+          logger -t xhttp-vps-maintenance 'VPN component update deferred. The existing service is healthy.'
+        fi
+        ;;
+    esac
     printf '%s\n' "$today" > "$completed"
-    logger -t xhttp-vps-maintenance 'Weekly package updates and cleanup completed.'
+    logger -t xhttp-vps-maintenance 'Weekly package and VPN component updates completed.'
     ;;
   reboot)
     [[ "$(date '+%u %H:%M')" == '7 05:30' && -f /var/run/reboot-required ]] || exit 0
@@ -540,12 +560,19 @@ EOF
 xhttp_install_maintenance() {
   local phase name service temporary
   service="$(xhttp_service_name)" || return 1
+  if [[ "$service" == x-ui ]]; then
+    [[ "${PANEL_PORT:-}" =~ ^[0-9]{1,5}$ ]] && (( 10#$PANEL_PORT > 0 && 10#$PANEL_PORT <= 65535 )) || return 1
+  fi
   [[ "$MAINTENANCE_TIMEZONE" =~ ^([A-Za-z0-9_+-]+/)*[A-Za-z0-9_+-]+$ ]] || return 1
   [[ -f "/usr/share/zoneinfo/$MAINTENANCE_TIMEZONE" ]] || return 1
   systemd-analyze calendar "Sun *-*-* 05:00:00 ${MAINTENANCE_TIMEZONE}" >/dev/null || return 1
   systemd-analyze calendar "Sun *-*-* 05:30:00 ${MAINTENANCE_TIMEZONE}" >/dev/null || return 1
-  xhttp_render_maintenance_script > /usr/local/sbin/xhttp-vps-maintenance || return 1
-  chmod 700 /usr/local/sbin/xhttp-vps-maintenance || return 1
+  temporary="$(mktemp /usr/local/sbin/.xhttp-vps-maintenance.XXXXXXXX)" || return 1
+  if ! xhttp_render_maintenance_script > "$temporary" || ! chmod 700 "$temporary" ||
+    ! mv -fT "$temporary" /usr/local/sbin/xhttp-vps-maintenance; then
+    rm -f -- "$temporary"
+    return 1
+  fi
   for phase in upgrade reboot; do
     name=xhttp-vps-maintenance
     if [[ "$phase" == reboot ]]; then name=xhttp-vps-reboot; fi
@@ -556,7 +583,7 @@ After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/xhttp-vps-maintenance $phase $service $MAINTENANCE_TIMEZONE
+ExecStart=/usr/local/sbin/xhttp-vps-maintenance $phase $service $MAINTENANCE_TIMEZONE "${PANEL_PORT:-}"
 Nice=10
 IOSchedulingClass=idle
 UMask=0027
@@ -644,9 +671,33 @@ EOF
   esac
 }
 
+xhttp_apt_get() {
+  apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 "$@"
+}
+
+xhttp_repair_apt() {
+  if ! dpkg --force-confold --configure -a; then
+    printf '%s\n' 'dpkg could not finish pending packages. Trying to repair dependencies through APT.' >&2
+  fi
+  xhttp_apt_get -y --no-remove -o Dpkg::Options::="--force-confold" -f install || return 1
+  dpkg --force-confold --configure -a && xhttp_apt_get check
+}
+
+xhttp_apt_apply() {
+  if xhttp_apt_get "$@"; then return 0; fi
+  printf '%s\n' 'APT operation failed. Repairing pending packages and retrying once.' >&2
+  xhttp_repair_apt && xhttp_apt_get "$@"
+}
+
+xhttp_restart_vpn_service() {
+  local service="$1"
+  if systemctl restart "$service"; then return 0; fi
+  systemctl reset-failed "$service" && systemctl restart "$service"
+}
+
 xhttp_download_verified() {
   local url="$1" expected="$2" output="$3" actual
-  curl -q -fL --proto '=https' --proto-redir '=https' --retry 3 --connect-timeout 10 --max-time 120 "$url" -o "$output" || {
+  curl -q -fL --proto '=https' --proto-redir '=https' --retry 3 --retry-all-errors --connect-timeout 10 --max-time 120 "$url" -o "$output" || {
     rm -f -- "$output"
     return 1
   }
@@ -659,8 +710,8 @@ xhttp_download_verified() {
 }
 
 xhttp_latest_release_asset() {
-  local repo="$1" asset="$2" output="$3" release record url digest
-  release="$(curl -q -fsSL --proto '=https' --proto-redir '=https' --retry 3 --connect-timeout 10 --max-time 30 \
+  local repo="$1" asset="$2" output="$3" current_digest="${4:-}" release record url digest
+  release="$(curl -q -fsSL --proto '=https' --proto-redir '=https' --retry 3 --retry-all-errors --connect-timeout 10 --max-time 30 \
     "https://api.github.com/repos/$repo/releases/latest")" || return 1
   record="$(jq -er --arg asset "$asset" '
     select(.draft == false and .prerelease == false)
@@ -670,7 +721,9 @@ xhttp_latest_release_asset() {
   ' <<<"$release")" || return 1
   IFS=$'\t' read -r url digest <<<"$record"
   [[ "$url" == "https://github.com/$repo/releases/download/"*"/$asset" ]] || return 1
-  xhttp_download_verified "$url" "$digest" "$output"
+  [[ "$digest" != "$current_digest" ]] || return 0
+  xhttp_download_verified "$url" "$digest" "$output" || return 1
+  printf '%s\n' "$digest" > "$output.sha256"
 }
 
 xhttp_release_arch() {
@@ -683,31 +736,171 @@ xhttp_release_arch() {
   esac
 }
 
-xhttp_install_panel() (
-  set -Eeuo pipefail
-  umask 077
-  local stage arch xray_arch archive
-  arch="$(xhttp_release_arch)"
+xhttp_stage_panel_release() {
+  local stage="$1" arch="$2" current="${3:-}" xray_arch panel_digest='' xray_digest=''
   case "$arch" in
     amd64) xray_arch=64 ;;
     arm64) xray_arch=arm64-v8a ;;
     armv7) xray_arch=arm32-v7a ;;
     s390x) xray_arch=s390x ;;
+    *) return 1 ;;
   esac
+  if [[ -n "$current" ]]; then
+    if [[ -f "$current/.xhttp-panel.sha256" ]]; then panel_digest="$(<"$current/.xhttp-panel.sha256")"; fi
+    if [[ -f "$current/.xhttp-xray.sha256" ]]; then xray_digest="$(<"$current/.xhttp-xray.sha256")"; fi
+  fi
+  xhttp_latest_release_asset MHSanaei/3x-ui "x-ui-linux-$arch.tar.gz" "$stage/panel.tar.gz" "$panel_digest" || return 1
+  xhttp_latest_release_asset XTLS/Xray-core "Xray-linux-$xray_arch.zip" "$stage/xray.zip" "$xray_digest" || return 1
+  if [[ -f "$stage/panel.tar.gz" ]]; then
+    tar -xzf "$stage/panel.tar.gz" --no-same-owner -C "$stage" || return 1
+    [[ -x "$stage/x-ui/x-ui" && -f "$stage/x-ui/x-ui.sh" && -d "$stage/x-ui/bin" ]] || return 1
+    mv -T "$stage/panel.tar.gz.sha256" "$stage/x-ui/.xhttp-panel.sha256" || return 1
+  fi
+  if [[ -f "$stage/xray.zip" ]]; then
+    unzip -p "$stage/xray.zip" xray > "$stage/xray" || return 1
+    chmod 755 "$stage/xray" && "$stage/xray" version >/dev/null || return 1
+  fi
+}
+
+xhttp_install_panel() (
+  set -Eeuo pipefail
+  umask 077
+  local stage arch
+  arch="$(xhttp_release_arch)"
   stage="$(mktemp -d /usr/local/.xhttp-panel.XXXXXXXX)"
   trap 'rm -rf -- "$stage"' EXIT
-  archive="$stage/panel.tar.gz"
-  xhttp_latest_release_asset MHSanaei/3x-ui "x-ui-linux-$arch.tar.gz" "$archive"
-  tar -xzf "$archive" --no-same-owner -C "$stage"
-  [[ -x "$stage/x-ui/x-ui" && -x "$stage/x-ui/bin/xray-linux-$arch" ]]
-  xhttp_latest_release_asset XTLS/Xray-core "Xray-linux-$xray_arch.zip" "$stage/xray.zip"
-  unzip -p "$stage/xray.zip" xray > "$stage/x-ui/bin/xray-linux-$arch"
-  chmod 755 "$stage/x-ui/bin/xray-linux-$arch"
-  "$stage/x-ui/bin/xray-linux-$arch" version >/dev/null
+  xhttp_stage_panel_release "$stage" "$arch"
+  mv -fT "$stage/xray" "$stage/x-ui/bin/xray-linux-$arch"
+  mv -T "$stage/xray.zip.sha256" "$stage/x-ui/.xhttp-xray.sha256"
   install -m 700 "$stage/x-ui/x-ui.sh" /usr/bin/x-ui
   install -m 644 "$stage/x-ui/x-ui.service.debian" /etc/systemd/system/x-ui.service
   systemctl daemon-reload
   mv -T "$stage/x-ui" /usr/local/x-ui
+)
+
+xhttp_wait_for_vpn_service() {
+  local service="$1" port="${2:-}" pid previous='' listeners core attempt
+  for (( attempt=0; attempt<30; attempt++ )); do
+    pid="$(systemctl show --property=MainPID --value "$service")" || return 1
+    if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && systemctl is-active --quiet "$service"; then
+      if [[ "$service" == x-ui ]]; then
+        listeners="$(ss -H -ltnp "sport = :$port")" || return 1
+        core="$(ss -H -ltnp 'sport = :443')" || return 1
+        if [[ "$core" != *'"xray-linux-'* ]]; then listeners=''; fi
+      else
+        listeners="$(ss -H -lunp 'sport = :443')" || return 1
+      fi
+      if [[ "$listeners" == *"pid=$pid,"* ]]; then
+        [[ "$previous" != "$pid" ]] || return 0
+        previous="$pid"
+      else
+        previous=''
+      fi
+    else
+      previous=''
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+xhttp_update_panel() (
+  set -Eeuo pipefail
+  umask 077
+  local port="$1" panel=/usr/local/x-ui cli=/usr/bin/x-ui database=/etc/x-ui/x-ui.db
+  local arch stage core cli_changed=0 stopped=0
+  arch="$(xhttp_release_arch)"
+  core="bin/xray-linux-$arch"
+  [[ "$port" =~ ^[0-9]{1,5}$ && -x "$panel/x-ui" && -x "$panel/$core" && -s "$database" ]]
+  stage="$(mktemp -d /usr/local/.xhttp-panel.XXXXXXXX)"
+  restore_panel() {
+    if [[ -d "$stage/previous" ]]; then
+      systemctl stop x-ui || return 1
+      if [[ -d "$panel" ]]; then mv -T "$panel" "$stage/failed" || return 1; fi
+      mv -T "$stage/previous" "$panel" || return 1
+      sqlite3 -batch -bail -cmd '.timeout 5000' "$database" ".restore '$stage/x-ui.db'" || return 1
+      if [[ "$cli_changed" == 1 ]]; then cp -aT "$stage/cli" "$cli" || return 1; fi
+    fi
+    xhttp_restart_vpn_service x-ui && xhttp_wait_for_vpn_service x-ui "$port"
+  }
+  cleanup_panel_update() {
+    local status="$?"
+    if [[ "$status" != 0 && "$stopped" == 1 ]]; then
+      if ! restore_panel; then
+        printf '3x-ui rollback failed. Retained recovery files at %s\n' "$stage" >&2
+        exit 70
+      fi
+      printf '%s\n' '3x-ui/Xray update failed. The previous service was restored.' >&2
+    fi
+    rm -rf -- "$stage"
+  }
+  trap cleanup_panel_update EXIT
+  trap 'exit 1' INT TERM HUP
+  xhttp_stage_panel_release "$stage" "$arch" "$panel"
+  [[ -d "$stage/x-ui" || -f "$stage/xray" ]] || exit 0
+  if [[ -d "$stage/x-ui" ]]; then
+    cp -aT "$cli" "$stage/cli"
+    if [[ ! -f "$stage/xray" ]]; then
+      cp -aT "$panel/$core" "$stage/x-ui/$core"
+      cp -aT "$panel/.xhttp-xray.sha256" "$stage/x-ui/.xhttp-xray.sha256"
+    fi
+  fi
+  stopped=1
+  systemctl stop x-ui
+  sqlite3 -batch -bail -cmd '.timeout 5000' "$database" ".backup '$stage/x-ui.db'"
+  if [[ ! -d "$stage/x-ui" ]]; then cp -aT "$panel" "$stage/x-ui"; fi
+  if [[ -f "$stage/xray" ]]; then
+    mv -fT "$stage/xray" "$stage/x-ui/$core"
+    mv -fT "$stage/xray.zip.sha256" "$stage/x-ui/.xhttp-xray.sha256"
+  fi
+  if [[ ! -f "$stage/panel.tar.gz" && -s "$panel/bin/config.json" ]]; then
+    XRAY_LOCATION_ASSET="$stage/x-ui/bin" "$stage/x-ui/$core" run -test -config "$panel/bin/config.json"
+  fi
+  mv -T "$panel" "$stage/previous"
+  mv -T "$stage/x-ui" "$panel"
+  xhttp_restart_vpn_service x-ui
+  xhttp_wait_for_vpn_service x-ui "$port"
+  if [[ -f "$stage/cli" ]]; then
+    cli_changed=1
+    install -m 700 "$panel/x-ui.sh" "$cli"
+  fi
+  printf '%s\n' '3x-ui/Xray releases applied and the panel and VPN listeners are ready.'
+)
+
+xhttp_update_hysteria() (
+  set -Eeuo pipefail
+  umask 077
+  local binary=/usr/local/bin/xhttp-vps-hysteria service=xhttp-vps-hysteria arch stage digest deployed=0
+  [[ -x "$binary" ]]
+  arch="$(xhttp_release_arch)"
+  if [[ "$arch" == armv7 ]]; then arch=arm; fi
+  digest="$(sha256sum "$binary" | awk '{print $1}')"
+  stage="$(mktemp -d /usr/local/bin/.xhttp-hysteria.XXXXXXXX)"
+  cleanup_hysteria_update() {
+    local status="$?"
+    if [[ "$status" != 0 && "$deployed" == 1 ]]; then
+      if ! cp -aT "$stage/previous" "$stage/restore" || ! mv -fT "$stage/restore" "$binary" ||
+        ! xhttp_restart_vpn_service "$service" ||
+        ! xhttp_wait_for_vpn_service "$service"; then
+        printf 'Hysteria 2 rollback failed. Retained recovery files at %s\n' "$stage" >&2
+        exit 70
+      fi
+      printf '%s\n' 'Hysteria 2 update failed. The previous service was restored.' >&2
+    fi
+    rm -rf -- "$stage"
+  }
+  trap cleanup_hysteria_update EXIT
+  trap 'exit 1' INT TERM HUP
+  xhttp_latest_release_asset apernet/hysteria "hysteria-linux-$arch" "$stage/hysteria" "$digest"
+  [[ -f "$stage/hysteria" ]] || exit 0
+  chmod 755 "$stage/hysteria"
+  "$stage/hysteria" version >/dev/null
+  cp -aT "$binary" "$stage/previous"
+  deployed=1
+  mv -fT "$stage/hysteria" "$binary"
+  xhttp_restart_vpn_service "$service"
+  xhttp_wait_for_vpn_service "$service"
+  printf '%s\n' 'Hysteria 2 release applied and the UDP listener is ready.'
 )
 
 xhttp_install_cert_renewal() {
