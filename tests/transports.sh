@@ -97,6 +97,9 @@ curl() {
 }
 xhttp_latest_release_asset example/project asset "$test_dir/asset"
 [[ "$(cat "$test_dir/asset")" == 'release payload' ]]
+[[ "$(cat "$test_dir/asset.sha256")" == "$release_digest" ]]
+PAYLOAD=corrupt xhttp_latest_release_asset example/project asset "$test_dir/unchanged" "$release_digest"
+[[ ! -e "$test_dir/unchanged" ]]
 if PAYLOAD=corrupt xhttp_latest_release_asset example/project asset "$test_dir/asset" 2>/dev/null; then exit 1; fi
 [[ ! -e "$test_dir/asset" ]]
 if PRERELEASE=true xhttp_latest_release_asset example/project asset "$test_dir/asset"; then exit 1; fi

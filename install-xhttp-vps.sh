@@ -204,13 +204,23 @@ fi
 printf '\nVPN VPS Setup\n\n'
 if [[ ${#MENU_STATE_FILES[@]} -eq 1 ]]; then
   if [[ "$HAS_CURRENT_SETTINGS" -eq 1 ]]; then
-    printf 'Existing installation:\n1) Show current settings (default)\n2) Verify and repair\n3) Permanently remove VPN (no archive)\n0) Exit\n'
+    printf 'Existing installation:\n1) Show current settings (default)\n2) Verify and repair\n3) Permanently remove VPN (no archive)\n4) Refresh automatic maintenance\n0) Exit\n'
     read -rp "Select [1]: " ACTION
     ACTION="${ACTION:-1}"
     case "$ACTION" in
       1) show_current_settings ;;
       2) [[ -x "$RECOVERY_SCRIPT" ]] || die "Recovery script is missing: ${RECOVERY_SCRIPT}"; exec "$RECOVERY_SCRIPT" ;;
       3) remove_installation; exit 0 ;;
+      4)
+        : "${TRANSPORT:=xhttp}" "${MAINTENANCE_MODE:=weekly}" "${MAINTENANCE_TIMEZONE:=Europe/Moscow}"
+        log 'Refreshing the saved automatic-update policy'
+        xhttp_configure_automatic_updates && xhttp_verify_automatic_updates || die 'Could not refresh automatic maintenance.'
+        if [[ "$COMMON_SCRIPT" != /root/xhttp-vps-common.sh ]]; then
+          install -m 700 "$COMMON_SCRIPT" /root/xhttp-vps-common.sh
+        fi
+        printf 'Automatic maintenance: %s\n' "$(xhttp_maintenance_label "$MAINTENANCE_MODE")"
+        exit 0
+        ;;
       0) exit 0 ;;
       *) die "Unknown menu item: $ACTION" ;;
     esac
@@ -544,7 +554,7 @@ fi
 cat <<'EOF'
 Automatic maintenance:
   1) Weekly package maintenance (default)
-     Daily security updates, package updates and cleanup on Sunday at 05:00.
+     Daily security updates. APT and VPN component updates and cleanup on Sunday at 05:00.
      Reboot at 05:30 when required and maintenance has completed.
   2) Security updates only
      Installed daily without automatic reboot.
