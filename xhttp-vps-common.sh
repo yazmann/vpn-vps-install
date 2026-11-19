@@ -749,11 +749,21 @@ xhttp_install_acme_nginx() (
   fi
 )
 
-xhttp_render_nginx_http2() {
+xhttp_nginx_version() {
   local version
   version="${XHTTP_NGINX_VERSION_OVERRIDE:-$(nginx -v 2>&1 | sed -n 's#^nginx version: nginx/\([0-9][0-9.]*\).*#\1#p')}"
-  [[ -n "$version" ]] || return 1
-  if [[ "$(printf '%s\n' 1.25.1 "$version" | sort -V | head -n 1)" == 1.25.1 ]]; then
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  printf '%s\n' "$version"
+}
+
+xhttp_version_at_least() {
+  [[ "$(printf '%s\n' "$1" "$2" | sort -V | head -n 1)" == "$2" ]]
+}
+
+xhttp_render_nginx_http2() {
+  local version
+  version="$(xhttp_nginx_version)" || return 1
+  if xhttp_version_at_least "$version" 1.25.1; then
     printf '    listen 127.0.0.1:%s ssl;\n    http2 on;\n' "$FALLBACK_PORT"
   else
     printf '    listen 127.0.0.1:%s ssl http2;\n' "$FALLBACK_PORT"
@@ -762,13 +772,21 @@ xhttp_render_nginx_http2() {
 
 xhttp_install_nginx() (
   set -Eeuo pipefail
-  local staging target=/etc/nginx/sites-available/3xui-self-steal.conf
+  local staging version target=/etc/nginx/sites-available/3xui-self-steal.conf
   local link=/etc/nginx/sites-enabled/3xui-self-steal.conf
   staging="$(mktemp -d /etc/nginx/xhttp-config.XXXXXXXX)"
-  trap 'rm -f "$staging/new" "$staging/previous" "$staging/link"; rmdir "$staging"' EXIT
+  trap 'rm -f "$staging/new" "$staging/previous" "$staging/link" "$staging/default.pem" "$staging/default-key.pem"; rmdir "$staging"' EXIT
   [[ ! -d "$target" && ! -d "$link" ]] || return 1
   if [[ -e "$target" || -L "$target" ]]; then cp -a "$target" "$staging/previous"; fi
   if [[ -e "$link" || -L "$link" ]]; then cp -a "$link" "$staging/link"; fi
+  version="$(xhttp_nginx_version)" || return 1
+  if ! xhttp_version_at_least "$version" 1.19.4 &&
+     [[ ! -s "$CERT_DIR/default.pem" || ! -s "$CERT_DIR/default-key.pem" ]]; then
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
+      -subj '/CN=localhost' -keyout "$staging/default-key.pem" -out "$staging/default.pem" >/dev/null 2>&1 || return 1
+    install -m 600 "$staging/default-key.pem" "$CERT_DIR/default-key.pem" || return 1
+    install -m 644 "$staging/default.pem" "$CERT_DIR/default.pem" || return 1
+  fi
   xhttp_render_nginx > "$staging/new"
   chmod 644 "$staging/new"
   mv -T "$staging/new" "$target"
@@ -782,29 +800,34 @@ xhttp_install_nginx() (
 )
 
 xhttp_render_nginx() {
-local listener address subscriptions='' FALLBACK_PORT="${FALLBACK_PORT:-}"
+local listener default_listener default_tls version subscriptions='' FALLBACK_PORT="${FALLBACK_PORT:-}"
 if xhttp_uses_panel; then
-  address="127.0.0.1:$FALLBACK_PORT"
   listener="$(xhttp_render_nginx_http2)" || return 1
   subscriptions="$(xhttp_render_subscription_locations)" || return 1
 else
   FALLBACK_PORT=443
-  address=0.0.0.0:443
   listener="$(xhttp_render_nginx_http2)" || return 1
   listener="${listener/127.0.0.1:/0.0.0.0:}"
-  if [[ "$TRANSPORT" == hysteria2 ]]; then
-    listener+=$'\n    add_header Alt-Svc \'h3=":443"; ma=86400\' always;'
-  fi
+fi
+default_listener="${listener/;/ default_server;}"
+if [[ "${TRANSPORT:-}" == hysteria2 ]]; then
+  listener+=$'\n    add_header Alt-Svc \'h3=":443"; ma=86400\' always;'
+fi
+version="$(xhttp_nginx_version)" || return 1
+if xhttp_version_at_least "$version" 1.19.4; then
+  default_tls='    ssl_reject_handshake on;'
+else
+  printf -v default_tls '    ssl_certificate %s/default.pem;\n    ssl_certificate_key %s/default-key.pem;' "$CERT_DIR" "$CERT_DIR"
 fi
 xhttp_render_acme_nginx
 cat <<EOF
 server {
-    listen $address ssl default_server;
+$default_listener
     server_name _;
     server_tokens off;
     access_log off;
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_reject_handshake on;
+$default_tls
     return 421;
 }
 server {
@@ -853,11 +876,16 @@ xhttp_probe_no_sni() {
 }
 
 xhttp_probe_rejected_sni() {
-  local response
+  local response version fingerprint peer
   response="$(
     timeout 12 openssl s_client -connect 127.0.0.1:443 -tls1_3 "$@" </dev/null 2>&1 || true
   )"
-  grep -Eiq 'unrecognized name|alert number 112' <<<"$response"
+  if grep -Eiq 'unrecognized name|alert number 112' <<<"$response"; then return 0; fi
+  version="$(xhttp_nginx_version)" || return 1
+  if xhttp_version_at_least "$version" 1.19.4; then return 1; fi
+  fingerprint="$(openssl x509 -noout -fingerprint -sha256 -in "$CERT_DIR/default.pem")" || return 1
+  peer="$(openssl x509 -noout -fingerprint -sha256 <<<"$response" 2>/dev/null)" || return 1
+  [[ "$peer" == "$fingerprint" ]]
 }
 
 xhttp_probe_h2_alpn() {

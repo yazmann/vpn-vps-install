@@ -17,6 +17,10 @@ grep -Fq 'listen 0.0.0.0:443 ssl http2;' <<<"$nginx"
 grep -Fq 'ssl_reject_handshake on;' <<<"$nginx"
 grep -Fq 'add_header Alt-Svc' <<<"$nginx"
 if grep -Fq proxy_pass <<<"$nginx"; then exit 1; fi
+jammy="$(XHTTP_NGINX_VERSION_OVERRIDE=1.18.0 xhttp_render_nginx)"
+grep -Fq 'listen 0.0.0.0:443 ssl http2 default_server;' <<<"$jammy"
+grep -Fq 'ssl_certificate /root/cert/vpn.example.com/default.pem;' <<<"$jammy"
+if grep -Fq ssl_reject_handshake <<<"$jammy"; then exit 1; fi
 paths="$(xhttp_managed_paths)"
 grep -Fxq /etc/xhttp-vps-hysteria.yaml <<<"$paths"
 grep -Fxq /etc/xhttp-vps-acme <<<"$paths"

@@ -1556,8 +1556,8 @@ if nginx -t >/dev/null 2>&1 && systemctl is-enabled --quiet nginx && systemctl i
 if [[ "$PANEL_HTTPS_VERIFIED" -eq 1 ]]; then status_line "Panel web interface" OK "domain TLS and base path"; else status_line "Panel web interface" ERROR; fi
 if curl -kfsSI --resolve "$DOMAIN:$FALLBACK_PORT:127.0.0.1" "https://$DOMAIN:$FALLBACK_PORT/" >/dev/null; then status_line "Cover website" OK; else status_line "Cover website" ERROR; fi
 if [[ "$PUBLIC_SELF_STEAL_VERIFIED" -eq 1 ]]; then status_line "Public self-steal website" OK "normal TLS through TCP 443"; else status_line "Public self-steal website" ERROR; fi
-if xhttp_probe_foreign_sni; then status_line "Foreign SNI behavior" OK "TLS handshake rejected"; else status_line "Foreign SNI behavior" ERROR; fi
-if xhttp_probe_no_sni; then status_line "Missing SNI behavior" OK "TLS handshake rejected"; else status_line "Missing SNI behavior" ERROR; fi
+if xhttp_probe_foreign_sni; then status_line "Foreign SNI behavior" OK "site certificate withheld"; else status_line "Foreign SNI behavior" ERROR; fi
+if xhttp_probe_no_sni; then status_line "Missing SNI behavior" OK "site certificate withheld"; else status_line "Missing SNI behavior" ERROR; fi
 if xhttp_probe_h2_alpn; then status_line "Fallback ALPN" OK "HTTP/2 negotiated"; else status_line "Fallback ALPN" ERROR; fi
 HTTP_REDIRECT_HEADERS="$(curl -fsSI --resolve "${DOMAIN}:80:127.0.0.1" "http://${DOMAIN}/" 2>/dev/null || true)"
 if grep -Eiq "^location:[[:space:]]*https://${DOMAIN}/" <<<"$HTTP_REDIRECT_HEADERS"; then status_line "HTTP / ACME webroot" OK "port 80 redirects; challenge path retained"; else status_line "HTTP / ACME webroot" ERROR; fi
