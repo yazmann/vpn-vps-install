@@ -105,13 +105,126 @@ xhttp_delete_firewall_rules() {
   ' <<<"$listing" | sort -rn)
 }
 
+xhttp_configure_ssh_source() {
+  local marker="xhttp-vps-ssh:${SAFE_INSTANCE}" rules
+  if [[ -z "${SSH_ALLOWED_IP:-}" ]]; then
+    ufw allow "$SSH_PORT"/tcp comment 'SSH - preserve remote access'
+    return
+  fi
+  xhttp_valid_ipv4 "$SSH_ALLOWED_IP" || return 1
+  xhttp_delete_firewall_rules "$marker" || return 1
+  # Insert the allow first so a failed operation never leaves only a deny.
+  ufw insert 1 allow in from "$SSH_ALLOWED_IP" to any port "$SSH_PORT" proto tcp comment "$marker allow" || return 1
+  rules="$(ufw show added)" || return 1
+  [[ "$rules" == *"$marker allow"* ]] || return 1
+  ufw insert 2 deny in from 0.0.0.0/0 to any port "$SSH_PORT" proto tcp comment "$marker deny"
+}
+
+xhttp_subscription_profile_settings() {
+  jq -c --arg mode "${SUB_PROFILE_MODE:-}" '
+    if $mode == "" then .
+    else .subProfileMode = $mode | .subProfileUrl = ""
+    end'
+}
+
+xhttp_verify_subscription_protection() {
+  local headers="${1//$'\r'/}"
+  if [[ "${SUB_PRIVACY_HEADERS:-false}" == true ]]; then
+    grep -Eiq '^cache-control:[[:space:]]*private, no-store$' <<<"$headers" || return 1
+    grep -Eiq '^referrer-policy:[[:space:]]*no-referrer$' <<<"$headers" || return 1
+  fi
+  case "${SUB_PROFILE_MODE:-}" in
+    none) ! grep -Eiq '^profile-web-page-url:' <<<"$headers" ;;
+    builtin) grep -Eiq '^profile-web-page-url:[[:space:]]*https://' <<<"$headers" ;;
+    *) return 0 ;;
+  esac
+}
+
+xhttp_write_recovery_backup() (
+  set -o pipefail
+  umask 077
+  local state="$1" output_dir="$2" source_root="${3:-/}" stage archive file suffix
+  local -a configs=(etc/nginx/sites-available/3xui-self-steal.conf var/www/3xui-cover)
+  stage="$(mktemp -d "$output_dir/.xhttp-recovery.XXXXXXXX")" || return 1
+  trap 'rm -rf -- "$stage"' EXIT
+  trap 'exit 1' INT TERM HUP
+  mkdir "$stage/files" "$stage/gnupg" || return 1
+  install -m 600 "$state" "$stage/files/installer.env" || return 1
+  case "${TRANSPORT:-xhttp}" in
+    vision|xhttp)
+      mkdir -p "$stage/files/etc/x-ui" || return 1
+      sqlite3 -batch -bail -readonly -cmd '.timeout 5000' "${source_root%/}/etc/x-ui/x-ui.db" \
+        ".backup '$stage/files/etc/x-ui/x-ui.db'" || return 1
+      [[ "$(sqlite3 -batch -bail -readonly "$stage/files/etc/x-ui/x-ui.db" 'PRAGMA quick_check;')" == ok ]] || return 1
+      ;;
+    amneziawg) configs+=(etc/amnezia/amneziawg/awg-vps.conf etc/xhttp-vps-awg) ;;
+    hysteria2) configs+=(etc/xhttp-vps-hysteria.yaml root/xhttp-vps-hysteria.uri) ;;
+    *) return 1 ;;
+  esac
+  ( cd "$source_root" && cp -a --parents -- "${configs[@]}" "$stage/files" ) || return 1
+  archive="$stage/archive.gpg"
+  local -a gpg_command=(gpg --homedir "$stage/gnupg" --batch --no-tty --quiet
+    --pinentry-mode loopback --no-symkey-cache --passphrase-fd 3)
+  tar -C "$stage/files" -czf - . |
+    "${gpg_command[@]}" --cipher-algo AES256 --symmetric --output "$archive" 3<<<"$RECOVERY_PASSPHRASE" || return 1
+  "${gpg_command[@]}" --decrypt "$archive" 3<<<"$RECOVERY_PASSPHRASE" | tar -tzf - >/dev/null || return 1
+  suffix="${stage##*.}"
+  file="$output_dir/xhttp-recovery-${DOMAIN}-$(date -u +%Y%m%dT%H%M%SZ)-${suffix}.tar.gz.gpg"
+  mv -T -- "$archive" "$file" || return 1
+  printf '%s\n' "$file"
+)
+
+xhttp_export_recovery_backup() {
+  local RECOVERY_PASSPHRASE confirmation file
+  [[ -t 0 ]] || { printf '%s\n' 'Open an interactive terminal to export a backup.' >&2; return 1; }
+  read -rsp 'Backup passphrase (leave empty to cancel): ' RECOVERY_PASSPHRASE || return 1
+  printf '\n'
+  [[ -n "$RECOVERY_PASSPHRASE" ]] || return 1
+  read -rsp 'Confirm backup passphrase: ' confirmation || return 1
+  printf '\n'
+  [[ "$RECOVERY_PASSPHRASE" == "$confirmation" ]] || { printf '%s\n' 'Passphrases did not match.' >&2; return 1; }
+  if ! command -v gpg >/dev/null; then
+    xhttp_apt_get -o APT::Update::Error-Mode=any update || return 1
+    xhttp_apt_apply install -y --no-install-recommends gnupg || return 1
+  fi
+  file="$(xhttp_write_recovery_backup "$1" /root)" || return 1
+  printf 'Verified encrypted backup: %s\n' "$file"
+  printf '%s\n' 'Copy the archive off the VPS and store its passphrase separately.'
+}
+
 xhttp_ssh_access_label() {
   case "$1" in
+    admin-cert) printf '%s' 'new sudo administrator, SSH certificate only, root and password login disabled' ;;
     admin) printf '%s' 'new sudo administrator, SSH key only, direct root login disabled' ;;
     root-key) printf '%s' 'root login by SSH key only; password login disabled' ;;
+    root-password) printf '%s' 'root login with the system password' ;;
     existing) printf '%s' 'current SSH policy retained (not recommended)' ;;
     *) return 1 ;;
   esac
+}
+
+xhttp_print_ssh_connection() {
+  local mode="${SSH_ACCESS_MODE:-existing}"
+  printf '\nSSH CONNECTION\n'
+  printf '  %-16s %s\n' 'Host:' "$DOMAIN" 'IPv4:' "${PUBLIC_IP:-Unknown}" 'Port:' "$SSH_PORT" 'Username:' "$ADMIN_USER" \
+    'Authentication:' "$(xhttp_ssh_access_label "$mode")" 'Source IPv4:' "${SSH_ALLOWED_IP:-Any}"
+  if [[ -n "${ADMIN_KEY_FINGERPRINTS:-}" ]]; then
+    printf '  %-16s %s\n' 'Key / CA SHA256:' "$ADMIN_KEY_FINGERPRINTS"
+  fi
+  case "$mode" in
+    admin-cert)
+      printf '  %-16s %s\n' 'Principal:' "$ADMIN_USER" 'Termius:' 'Attach the signed user certificate and its matching private key.'
+      printf '  Command:         ssh -p %s -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 -o CertificateFile=~/.ssh/id_ed25519-cert.pub %s@%s\n' "$SSH_PORT" "$ADMIN_USER" "$DOMAIN"
+      ;;
+    root-password)
+      printf '  %-16s %s\n' 'Password:' 'Use the root password set on the VPS.'
+      printf '  Command:         ssh -p %s -o PreferredAuthentications=password %s@%s\n' "$SSH_PORT" "$ADMIN_USER" "$DOMAIN"
+      ;;
+    *) printf '  Command:         ssh -p %s %s@%s\n' "$SSH_PORT" "$ADMIN_USER" "$DOMAIN" ;;
+  esac
+  if [[ "$mode" == admin || "$mode" == admin-cert ]]; then
+    printf '  %-16s %s\n' 'Check access:' 'Run sudo -n id -u in a new SSH session. Expected output: 0.'
+  fi
 }
 
 xhttp_inbound_tag_for() {
@@ -226,10 +339,21 @@ xhttp_authorized_key_fingerprints() (
   ssh-keygen -l -f "$temporary" | awk '{print $2}' | paste -sd, -
 )
 
+xhttp_validate_ssh_ca_b64() {
+  local key
+  xhttp_validate_authorized_keys_b64 "$1" || return 1
+  key="$(printf '%s' "$1" | base64 -d)" || return 1
+  [[ "$key" =~ ^ssh-ed25519[[:blank:]] && "$key" != *$'\n'* && "$key" != *$'\r'* ]]
+}
+
 xhttp_install_admin_access() {
   local home_dir temporary_sudo
   [[ "$ADMIN_USER" =~ ^[a-z_][a-z0-9_-]{0,30}$ && "$ADMIN_USER" != root ]] || return 1
-  xhttp_validate_authorized_keys_b64 "$ADMIN_KEYS_B64" || return 1
+  if [[ "$SSH_ACCESS_MODE" == admin-cert ]]; then
+    xhttp_validate_ssh_ca_b64 "$ADMIN_KEYS_B64" || return 1
+  else
+    xhttp_validate_authorized_keys_b64 "$ADMIN_KEYS_B64" || return 1
+  fi
   if getent passwd "$ADMIN_USER" >/dev/null; then
     home_dir="$(getent passwd "$ADMIN_USER" | cut -d: -f6)"
     [[ "$home_dir" == "/home/$ADMIN_USER" ]] || return 1
@@ -238,7 +362,11 @@ xhttp_install_admin_access() {
   fi
   home_dir="/home/$ADMIN_USER"
   install -d -m 700 -o "$ADMIN_USER" -g "$ADMIN_USER" "$home_dir/.ssh"
-  printf '%s' "$ADMIN_KEYS_B64" | base64 -d > "$home_dir/.ssh/authorized_keys.new"
+  {
+    if [[ "$SSH_ACCESS_MODE" == admin-cert ]]; then printf 'cert-authority,principals="%s" ' "$ADMIN_USER"; fi
+    printf '%s' "$ADMIN_KEYS_B64" | base64 -d
+    if [[ "$SSH_ACCESS_MODE" == admin-cert ]]; then printf '\n'; fi
+  } > "$home_dir/.ssh/authorized_keys.new"
   chown "$ADMIN_USER:$ADMIN_USER" "$home_dir/.ssh/authorized_keys.new"
   chmod 600 "$home_dir/.ssh/authorized_keys.new"
   mv -f "$home_dir/.ssh/authorized_keys.new" "$home_dir/.ssh/authorized_keys"
@@ -263,17 +391,25 @@ xhttp_install_root_key_access() {
 
 xhttp_install_ssh_access() {
   case "${SSH_ACCESS_MODE:-admin}" in
-    admin) xhttp_install_admin_access ;;
+    admin|admin-cert) xhttp_install_admin_access ;;
     root-key) xhttp_install_root_key_access ;;
+    root-password)
+      if [[ "$(passwd -S root | awk '{print $2}')" != P ]]; then
+        [[ -t 0 ]] || return 1
+        printf '%s\n' 'Set a root password for the selected SSH login mode.'
+        passwd root || return 1
+      fi
+      [[ "$(passwd -S root | awk '{print $2}')" == P ]]
+      ;;
     existing) return 0 ;;
     *) return 1 ;;
   esac
 }
 
 xhttp_render_sshd_hardening() {
-  local mode="$1" login_user="$2" permit_root allow_user
+  local mode="$1" login_user="$2" permit_root allow_user password=no authentication=publickey
   case "$mode" in
-    admin)
+    admin|admin-cert)
       [[ "$login_user" =~ ^[a-z_][a-z0-9_-]{0,30}$ && "$login_user" != root ]] || return 1
       permit_root=no
       allow_user="$login_user"
@@ -283,15 +419,22 @@ xhttp_render_sshd_hardening() {
       permit_root=prohibit-password
       allow_user=root
       ;;
+    root-password)
+      [[ "$login_user" == root ]] || return 1
+      permit_root=yes
+      allow_user=root
+      password=yes
+      authentication=password
+      ;;
     *) return 1 ;;
   esac
   cat <<EOF
 # Managed by xhttp-vps-setup. Keep local TCP forwarding for the private panel.
 PubkeyAuthentication yes
-PasswordAuthentication no
+PasswordAuthentication ${password}
 KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
-AuthenticationMethods publickey
+AuthenticationMethods ${authentication}
 PermitEmptyPasswords no
 PermitRootLogin ${permit_root}
 AllowUsers ${allow_user}
@@ -304,89 +447,107 @@ GatewayPorts no
 PermitTunnel no
 PermitUserEnvironment no
 EOF
+  if [[ "$mode" == admin-cert ]]; then
+    cat <<'EOF'
+# Only the CA and principal installed for this administrator may be used.
+AuthorizedKeysFile .ssh/authorized_keys
+AuthorizedKeysCommand none
+TrustedUserCAKeys none
+PubkeyAcceptedAlgorithms *-cert-v01@openssh.com
+EOF
+  fi
 }
 
-xhttp_harden_sshd() {
-  local temporary host_name root_config login_config allow_user target previous had_previous=0
-  case "${SSH_ACCESS_MODE:-admin}" in
-    admin) allow_user="$ADMIN_USER" ;;
-    root-key)
-      [[ "$ADMIN_USER" == root ]] || return 1
-      allow_user=root
+xhttp_verify_managed_sshd_config() {
+  local config root_config host_name source_ip="${SSH_CONNECTION:-}" password=no authentication=publickey
+  source_ip="${source_ip%% *}"
+  host_name="$(hostname -f 2>/dev/null || hostname)" || return 1
+  config="$(sshd -T -C "user=$ADMIN_USER,host=$host_name,addr=${source_ip:-127.0.0.1}")" || return 1
+  root_config="$(sshd -T -C "user=root,host=$host_name,addr=${source_ip:-127.0.0.1}")" || return 1
+  case "$SSH_ACCESS_MODE" in
+    admin|admin-cert) grep -Fxq 'permitrootlogin no' <<<"$root_config" || return 1 ;;
+    root-key) grep -Eq '^permitrootlogin (prohibit-password|without-password)$' <<<"$root_config" || return 1 ;;
+    root-password)
+      grep -Fxq 'permitrootlogin yes' <<<"$root_config" || return 1
+      password=yes
+      authentication=password
       ;;
     *) return 1 ;;
   esac
-  target=/etc/ssh/sshd_config.d/00-xhttp-vps-hardening.conf
-  previous="$(mktemp /etc/ssh/sshd_config.d/xhttp-vps-previous.XXXXXXXX)"
-  if [[ -e "$target" ]]; then
-    cp -a "$target" "$previous"
-    had_previous=1
+  if [[ "$SSH_ACCESS_MODE" == admin-cert ]]; then
+    grep -Fxq 'passwordauthentication no' <<<"$root_config" || return 1
+    grep -Fxq 'authorizedkeysfile .ssh/authorized_keys' <<<"$config" || return 1
+    grep -Fxq 'authorizedkeyscommand none' <<<"$config" || return 1
+    grep -Fxq 'trustedusercakeys none' <<<"$config" || return 1
+    awk '$1=="pubkeyacceptedalgorithms" {n=split($2,algorithms,","); for(i=1;i<=n;i++) if(algorithms[i]!~/-cert-v01@openssh\.com$/) exit 1; found=n} END {if(!found) exit 1}' <<<"$config" || return 1
   fi
-  temporary="$(mktemp /etc/ssh/sshd_config.d/00-xhttp-vps-hardening.conf.XXXXXXXX)"
-  if ! xhttp_render_sshd_hardening "${SSH_ACCESS_MODE:-admin}" "$ADMIN_USER" > "$temporary"; then
-    rm -f "$temporary" "$previous"
-    return 1
-  fi
-  chmod 600 "$temporary"
-  mv -f "$temporary" "$target"
-  if ! sshd -t; then
-    rm -f "$target"
-    if [[ "$had_previous" == 1 ]]; then mv -f "$previous" "$target"; else rm -f "$previous"; fi
-    return 1
-  fi
-  host_name="$(hostname -f 2>/dev/null || hostname)"
-  root_config="$(sshd -T -C "user=root,host=${host_name},addr=127.0.0.1")"
-  login_config="$(sshd -T -C "user=${allow_user},host=${host_name},addr=127.0.0.1")"
-  if [[ "${SSH_ACCESS_MODE:-admin}" == admin ]]; then
-    grep -qx 'permitrootlogin no' <<<"$root_config" || {
-      rm -f "$target"
-      if [[ "$had_previous" == 1 ]]; then mv -f "$previous" "$target"; else rm -f "$previous"; fi
-      return 1
-    }
-  else
-    grep -Eq '^permitrootlogin (prohibit-password|without-password)$' <<<"$root_config" || {
-      rm -f "$target"
-      if [[ "$had_previous" == 1 ]]; then mv -f "$previous" "$target"; else rm -f "$previous"; fi
-      return 1
-    }
-  fi
-  if ! grep -qx 'passwordauthentication no' <<<"$login_config" \
-    || ! grep -qx 'kbdinteractiveauthentication no' <<<"$login_config" \
-    || ! grep -qx 'authenticationmethods publickey' <<<"$login_config" \
-    || ! grep -Eq "^allowusers( .*)? ${allow_user}( .*)?$|^allowusers ${allow_user}$" <<<"$login_config"; then
-    rm -f "$target"
-    if [[ "$had_previous" == 1 ]]; then mv -f "$previous" "$target"; else rm -f "$previous"; fi
-    return 1
-  fi
-  rm -f "$previous"
-  systemctl reload ssh
-  passwd -l root >/dev/null
+  grep -Fxq "passwordauthentication $password" <<<"$config" &&
+    grep -Fxq 'kbdinteractiveauthentication no' <<<"$config" &&
+    grep -Fxq "authenticationmethods $authentication" <<<"$config" &&
+    grep -Eq "^allowusers( .*)? ${ADMIN_USER}( .*)?$|^allowusers ${ADMIN_USER}$" <<<"$config"
 }
 
 xhttp_verify_ssh_access() {
-  local host_name config key_path
-  host_name="$(hostname -f 2>/dev/null || hostname)"
-  case "${SSH_ACCESS_MODE:-admin}" in
-    admin)
-      getent passwd "$ADMIN_USER" >/dev/null || return 1
+  local key_path
+  xhttp_verify_managed_sshd_config || return 1
+  case "$SSH_ACCESS_MODE" in
+    admin|admin-cert)
       sudo -u "$ADMIN_USER" sudo -n true || return 1
-      key_path="/home/${ADMIN_USER}/.ssh/authorized_keys"
-      config="$(sshd -T -C "user=${ADMIN_USER},host=${host_name},addr=127.0.0.1")" || return 1
-      grep -qx 'permitrootlogin no' < <(sshd -T -C "user=root,host=${host_name},addr=127.0.0.1") || return 1
+      key_path="/home/$ADMIN_USER/.ssh/authorized_keys"
       ;;
-    root-key)
-      [[ "$ADMIN_USER" == root ]] || return 1
-      key_path=/root/.ssh/authorized_keys
-      config="$(sshd -T -C "user=root,host=${host_name},addr=127.0.0.1")" || return 1
-      grep -Eq '^permitrootlogin (prohibit-password|without-password)$' <<<"$config" || return 1
-      ;;
+    root-key) key_path=/root/.ssh/authorized_keys ;;
+    root-password) [[ "$(passwd -S root | awk '{print $2}')" == P ]]; return ;;
     *) return 1 ;;
   esac
   [[ -s "$key_path" && "$(stat -c '%a' "$key_path")" == 600 ]] || return 1
-  [[ "$(passwd -S root | awk '{print $2}')" == L ]] || return 1
-  grep -qx 'passwordauthentication no' <<<"$config" \
-    && grep -qx 'kbdinteractiveauthentication no' <<<"$config" \
-    && grep -qx 'authenticationmethods publickey' <<<"$config"
+  if [[ "$SSH_ACCESS_MODE" == admin-cert ]]; then
+    cmp -s "$key_path" <(printf 'cert-authority,principals="%s" ' "$ADMIN_USER"; printf '%s' "$ADMIN_KEYS_B64" | base64 -d; printf '\n') || return 1
+  fi
+  [[ "$(passwd -S root | awk '{print $2}')" == L ]]
+}
+
+xhttp_confirm_certificate_login() (
+  [[ "$SSH_ACCESS_MODE" == admin-cert ]] || return 0
+  if xhttp_verify_ssh_access; then return 0; fi
+  [[ -t 0 ]] || { printf '%s\n' 'An interactive terminal is required to confirm certificate login.' >&2; return 1; }
+  local directory
+  directory="$(mktemp -d /run/xhttp-vps-cert-test.XXXXXXXX)" || return 1
+  trap 'rm -f -- "$directory/verified"; rmdir -- "$directory"' EXIT
+  trap 'exit 1' INT TERM HUP
+  xhttp_print_ssh_connection
+  printf '\nOpen a second SSH session with the signed certificate. In that session run:\n'
+  printf '  test "$(id -un)" = %s && sudo -n touch %s/verified\n' "$ADMIN_USER" "$directory"
+  until [[ -f "$directory/verified" ]]; do
+    read -rp 'Press Enter after the second-session test succeeds, or Ctrl+C to pause setup: ' || return 1
+    if [[ ! -f "$directory/verified" ]]; then printf '%s\n' 'Waiting for a successful login and sudo check.'; fi
+  done
+)
+
+xhttp_harden_sshd() {
+  local target=/etc/ssh/sshd_config.d/00-xhttp-vps-hardening.conf temporary previous had_previous=0
+  xhttp_confirm_certificate_login || return 1
+  previous="$(mktemp /etc/ssh/sshd_config.d/xhttp-vps-previous.XXXXXXXX)" || return 1
+  if [[ -e "$target" ]]; then
+    cp -a "$target" "$previous" || return 1
+    had_previous=1
+  fi
+  temporary="$(mktemp /etc/ssh/sshd_config.d/00-xhttp-vps-hardening.conf.XXXXXXXX)" || return 1
+  if ! xhttp_render_sshd_hardening "$SSH_ACCESS_MODE" "$ADMIN_USER" > "$temporary" ||
+    ! chmod 600 "$temporary" || ! mv -f "$temporary" "$target"; then
+    rm -f -- "$temporary" "$previous"
+    return 1
+  fi
+  if ! sshd -t || ! xhttp_verify_managed_sshd_config || ! systemctl reload ssh; then
+    if [[ "$had_previous" == 1 ]]; then
+      mv -f "$previous" "$target" || return 1
+    else
+      rm -f "$target" "$previous" || return 1
+    fi
+    systemctl reload ssh || true
+    return 1
+  fi
+  rm -f -- "$previous"
+  if [[ "$SSH_ACCESS_MODE" != root-password ]]; then passwd -l root >/dev/null; fi
 }
 
 xhttp_install_fail2ban_sshd() {
@@ -1116,8 +1277,16 @@ cat <<EOF
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$remote_addr;
         proxy_set_header X-Forwarded-Proto https;
-    }
 EOF
+if [[ "${SUB_PRIVACY_HEADERS:-false}" == true ]]; then
+  cat <<'EOF'
+        proxy_hide_header Cache-Control;
+        proxy_hide_header Referrer-Policy;
+        add_header Cache-Control 'private, no-store' always;
+        add_header Referrer-Policy 'no-referrer' always;
+EOF
+fi
+printf '    }\n'
 done
 }
 
@@ -1247,6 +1416,10 @@ xhttp_validate_ssh_access_state() {
     if [[ "${SSH_HARDENING:-0}" == 1 ]]; then ssh_mode='admin'; else ssh_mode='existing'; fi
   fi
   case "$ssh_mode" in
+    admin-cert)
+      [[ "${SSH_HARDENING:-0}" == 1 && "${ADMIN_USER:-}" =~ ^[a-z_][a-z0-9_-]{0,30}$ && "$ADMIN_USER" != root ]] || return 1
+      xhttp_validate_ssh_ca_b64 "${ADMIN_KEYS_B64:-}" || return 1
+      ;;
     admin)
       [[ "${SSH_HARDENING:-0}" == 1 ]] || return 1
       [[ "${ADMIN_USER:-}" =~ ^[a-z_][a-z0-9_-]{0,30}$ && "$ADMIN_USER" != root ]] || return 1
@@ -1255,6 +1428,9 @@ xhttp_validate_ssh_access_state() {
     root-key)
       [[ "${SSH_HARDENING:-0}" == 1 && "${ADMIN_USER:-}" == root ]] || return 1
       xhttp_validate_authorized_keys_b64 "${ADMIN_KEYS_B64:-}" || return 1
+      ;;
+    root-password)
+      [[ "${SSH_HARDENING:-0}" == 1 && "${ADMIN_USER:-}" == root ]] || return 1
       ;;
     existing)
       [[ "${SSH_HARDENING:-0}" == 0 ]] || return 1
@@ -1271,6 +1447,10 @@ xhttp_validate_state() {
   [[ "${SAFE_INSTANCE:-}" =~ ^[A-Za-z0-9_-]+$ || -z "${SAFE_INSTANCE:-}" ]] || return 1
   case "${ACME_CLIENT:-acme.sh}" in certbot|acme.sh) ;; *) return 1 ;; esac
   case "${SUB_ENCRYPT_LINKS:-}" in true|false|'') ;; *) return 1 ;; esac
+  case "${SUB_PROFILE_MODE:-}" in none|builtin|'') ;; *) return 1 ;; esac
+  case "${SUB_PRIVACY_HEADERS:-}" in true|false|'') ;; *) return 1 ;; esac
+  case "${CREATE_RECOVERY_BACKUP:-0}" in 0|1) ;; *) return 1 ;; esac
+  [[ -z "${SSH_ALLOWED_IP:-}" ]] || xhttp_valid_ipv4 "$SSH_ALLOWED_IP" || return 1
   case "${TRANSPORT:-xhttp}" in
     vision|xhttp) ;;
     amneziawg|hysteria2)
