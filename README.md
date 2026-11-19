@@ -1,4 +1,4 @@
-# VPN VPS Setup
+# VPN VPS Install
 
 Установщик VPN для Ubuntu VPS. Поддерживает Vision и XHTTP с REALITY, AmneziaWG (AWG) и Hysteria 2. Для подписок Vision и XHTTP рекомендуются [Happ](https://www.happ.su/) и [INCY](https://incy.cc/).
 
@@ -61,7 +61,7 @@
   trap 'rm -rf -- "$workdir"' EXIT
   curl -q --fail --silent --show-error --location --retry 3 --connect-timeout 10 \
     --proto '=https' --proto-redir '=https' \
-    "https://codeload.github.com/yazmann/xhttp-vps-setup/tar.gz/$revision" \
+    "https://github.com/yazmann/vpn-vps-install/archive/$revision.tar.gz" \
     --output "$workdir/source.tar.gz"
   tar -xzf "$workdir/source.tar.gz" -C "$workdir" --strip-components=1 \
     --no-same-owner --no-same-permissions
