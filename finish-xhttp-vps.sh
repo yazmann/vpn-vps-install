@@ -110,6 +110,7 @@ sqlite3 /etc/x-ui/x-ui.db ".timeout 5000" ".backup '$REPAIR_BACKUP/x-ui.db'"
 chmod 600 "$REPAIR_BACKUP/x-ui.db"
 printf 'Database backup before repair: %s\n' "$REPAIR_BACKUP"
 CERT_DIR="/root/cert/$DOMAIN"
+xhttp_prepare_staging_ca || die "Could not verify the Let's Encrypt staging certificate."
 [[ -s "$CERT_DIR/fullchain.pem" && -s "$CERT_DIR/privkey.pem" ]] || die "Certificate files are missing. Resume bootstrap before configuring the panel."
 {
   printf 'SUB_JSON_PATH=%q\n' "${SUB_JSON_PATH:-}"
@@ -127,7 +128,7 @@ if [[ "${ACME_CLIENT:-}" == certbot ]]; then xhttp_install_cert_renewal; fi
 API_BASE="https://${DOMAIN}:${PANEL_PORT}/${PANEL_PATH}"
 API_HEADER_FILE="$(xhttp_create_api_header_file "$PANEL_API_TOKEN")" \
   || die "The panel API token is empty or contains invalid control characters."
-API_AUTH=(--noproxy '*' --resolve "${DOMAIN}:${PANEL_PORT}:127.0.0.1" -H "@${API_HEADER_FILE}")
+API_AUTH=(--cacert "$(xhttp_tls_ca_file)" --noproxy '*' --resolve "${DOMAIN}:${PANEL_PORT}:127.0.0.1" -H "@${API_HEADER_FILE}")
 trap 'rm -f "${API_HEADER_FILE:-}"' EXIT
 
 build_warp_outbound() {
@@ -207,7 +208,7 @@ if [[ "$READY" -eq 0 && "$R" == *'error: 401'* ]]; then
     rm -f "$API_HEADER_FILE"
     API_HEADER_FILE="$(xhttp_create_api_header_file "$PANEL_API_TOKEN")" \
       || die "The replacement API token contains invalid control characters."
-    API_AUTH=(--noproxy '*' --resolve "${DOMAIN}:${PANEL_PORT}:127.0.0.1" -H "@${API_HEADER_FILE}")
+    API_AUTH=(--cacert "$(xhttp_tls_ca_file)" --noproxy '*' --resolve "${DOMAIN}:${PANEL_PORT}:127.0.0.1" -H "@${API_HEADER_FILE}")
     printf '\nPANEL_API_TOKEN=%q\n' "$PANEL_API_TOKEN" >> "${STATE_FILES[0]}"
     READY=0
     for _ in $(seq 1 15); do
@@ -596,6 +597,7 @@ printf '%b================================================================%b\n' 
 printf '%b                    VPN REPAIR COMPLETED SUCCESSFULLY%b\n' "$green" "$plain"
 printf '%b                     ALL APPLICABLE CHECKS PASSED%b\n' "$green" "$plain"
 printf '%b================================================================%b\n\n' "$green" "$plain"
+printf 'TLS: %s\n\n' "$(xhttp_tls_label)"
 printf '%bPANEL%b\n' "$cyan" "$plain"
 printf '  %bURL:%b      %s\n' "$yellow" "$plain" "$PANEL_DISPLAY_URL"
 printf '  %bAccess:%b   %s\n' "$yellow" "$plain" "$PANEL_ACCESS_DETAILS"

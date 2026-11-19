@@ -169,6 +169,7 @@ if [[ "${1:-}" == --resume ]]; then
   if xhttp_uses_panel; then : "${INBOUND_TAG:=$(xhttp_inbound_tag_for "$TRANSPORT")}"; fi
   : "${UDP_PORT:=}" "${HY_PASSWORD:=}"
   : "${ACME_CLIENT:=acme.sh}"
+  : "${TLS_MODE:=production}"
   : "${MIGRATION_DB:=}" "${MIGRATION_INBOUND:=}"
   : "${SUB_ENCRYPT_LINKS:=}"
   : "${MAINTENANCE_TIMEZONE:=Europe/Moscow}"
@@ -267,8 +268,9 @@ else
 fi
 
 TLS_MODE="production"
+if [[ "${1:-}" == --staging ]]; then TLS_MODE=staging; fi
 ACME_CLIENT=certbot
-printf '%bTLS:%b production Lets Encrypt certificate (required).\n' "$cyan" "$plain"
+printf '%bTLS:%b %s (required).\n' "$cyan" "$plain" "$(xhttp_tls_label)"
 
 [[ -r /etc/os-release ]] || die "Cannot identify the operating system."
 # shellcheck disable=SC1091
@@ -548,7 +550,7 @@ case "$SSH_ACCESS_CHOICE" in
     warn "The installer will preserve the current root and SSH authentication policy. Fail2ban reduces brute-force attempts but does not make weak credentials safe."
     ;;
   2)
-    SSH_ACCESS_MODE=root-key
+    SSH_ACCESS_MODE='root-key'
     SSH_HARDENING=1
     ADMIN_USER=root
     warn "Root will remain reachable by its SSH key. Password login is disabled, but this is less safe than a separate administrator."
@@ -564,7 +566,7 @@ case "$SSH_ACCESS_CHOICE" in
     getent passwd "$ADMIN_USER" >/dev/null && die "User ${ADMIN_USER} already exists; use a fresh name."
     ;;
   5)
-    SSH_ACCESS_MODE=root-password
+    SSH_ACCESS_MODE='root-password'
     SSH_HARDENING=1
     ADMIN_USER=root
     warn 'Root password login selected. Use a strong unique password and restrict the source IPv4 when possible.'
@@ -1087,7 +1089,7 @@ fi
 ufw default deny incoming
 ufw default allow outgoing
 xhttp_configure_ssh_source || die 'Could not apply the selected SSH source policy.'
-if [[ "$TLS_MODE" == "production" ]]; then
+if [[ "$TLS_MODE" == production || "$TLS_MODE" == staging ]]; then
   ufw allow 80/tcp comment "xhttp-vps:${SAFE_INSTANCE} ACME"
 fi
 ufw allow 443/tcp comment "xhttp-vps:${SAFE_INSTANCE} VPN"
@@ -1105,7 +1107,7 @@ if xhttp_uses_panel && [[ ! -x /usr/local/x-ui/x-ui || ( -z "$PANEL_API_TOKEN" &
   write_state
 fi
 if [[ ! -s "$CERT_DIR/fullchain.pem" || ! -s "$CERT_DIR/privkey.pem" ]]; then
-  [[ "$TLS_MODE" == "production" ]] || die "Missing legacy test certificate."
+  [[ "$TLS_MODE" == production || "$TLS_MODE" == staging ]] || die "Missing legacy test certificate."
   log "Issuing the TLS certificate through the persistent Nginx webroot"
   install -d -m 700 "$CERT_DIR"
   install -d -m 755 /var/www/3xui-cover/.well-known/acme-challenge
@@ -1119,9 +1121,8 @@ if [[ ! -s "$CERT_DIR/fullchain.pem" || ! -s "$CERT_DIR/privkey.pem" ]]; then
     || die "The local Nginx ACME webroot probe failed."
   rm -f "/var/www/3xui-cover/.well-known/acme-challenge/${ACME_PROBE}"
   if [[ "$ACME_CLIENT" == certbot ]]; then
-    certbot certonly --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring \
-      --config-dir /etc/xhttp-vps-acme --work-dir /var/lib/xhttp-vps-acme --logs-dir /var/log/xhttp-vps-acme \
-      --webroot --webroot-path /var/www/3xui-cover --cert-name "$DOMAIN" -d "$DOMAIN"
+    xhttp_issue_certbot_certificate /etc/xhttp-vps-acme /var/lib/xhttp-vps-acme \
+      /var/log/xhttp-vps-acme /var/www/3xui-cover
     ln -sfn "/etc/xhttp-vps-acme/live/$DOMAIN/fullchain.pem" "$CERT_DIR/fullchain.pem"
     ln -sfn "/etc/xhttp-vps-acme/live/$DOMAIN/privkey.pem" "$CERT_DIR/privkey.pem"
   else
@@ -1137,6 +1138,7 @@ fi
 
 if xhttp_uses_panel; then
 [[ -s "$CERT_DIR/fullchain.pem" && -s "$CERT_DIR/privkey.pem" ]] || die "TLS certificate deployment failed."
+xhttp_prepare_staging_ca || die "Could not verify the Let's Encrypt staging certificate."
 /usr/local/x-ui/x-ui cert -webCert "$CERT_DIR/fullchain.pem" -webCertKey "$CERT_DIR/privkey.pem" >/dev/null
 # The installer's result file is authoritative. Reading it also protects us
 # from future installer-side normalization of the port or web base path.
@@ -1300,7 +1302,7 @@ if [[ "$RESUMING" == 1 ]]; then exec "$RECOVERY_SCRIPT"; fi
 API_BASE="https://${DOMAIN}:${PANEL_PORT}/${PANEL_PATH}"
 API_HEADER_FILE="$(xhttp_create_api_header_file "$PANEL_API_TOKEN")" \
   || die "The panel API token is empty or contains invalid control characters."
-API_AUTH=(--noproxy '*' --resolve "${DOMAIN}:${PANEL_PORT}:127.0.0.1" -H "@${API_HEADER_FILE}")
+API_AUTH=(--cacert "$(xhttp_tls_ca_file)" --noproxy '*' --resolve "${DOMAIN}:${PANEL_PORT}:127.0.0.1" -H "@${API_HEADER_FILE}")
 trap 'rm -f "${API_HEADER_FILE:-}"' EXIT
 
 build_warp_outbound() {
@@ -1647,11 +1649,7 @@ if [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6)" == 1 ]]; then status_line "I
 if xhttp_validate_single_dns_ipv4 "$PUBLIC_IP" <<<"$(dig +short A "$DOMAIN")" && ! dig +short AAAA "$DOMAIN" | grep -q .; then status_line "DNS A / AAAA" OK "$DOMAIN → $PUBLIC_IP"; else status_line "DNS A / AAAA" ERROR; fi
 if ufw status | grep -q '^Status: active'; then status_line "UFW firewall" OK; else status_line "UFW firewall" ERROR; fi
 if openssl x509 -in "$CERT_DIR/fullchain.pem" -checkend 86400 -noout >/dev/null 2>&1; then
-  if [[ "$TLS_MODE" == "production" ]]; then
-    status_line "TLS certificate" OK "trusted Let's Encrypt"
-  else
-    status_line "TLS certificate" OK "TEST: self-signed, 30 days"
-  fi
+  status_line "TLS certificate" OK "$(xhttp_tls_label)"
 else
   status_line "TLS certificate" ERROR
 fi
@@ -1817,7 +1815,7 @@ printf '%b                 VPN INSTALLATION COMPLETED SUCCESSFULLY%b\n' "$green"
 printf '%b                     ALL APPLICABLE CHECKS PASSED%b\n' "$green" "$plain"
 printf '%b================================================================%b\n\n' "$green" "$plain"
 printf '%b%s:%b          %s\n' "$blue" "$([[ "$INSTALL_MODE" == "standalone" ]] && echo "VPN" || echo "NODE")" "$plain" "$VPN_NAME"
-printf '%bTLS:%b          %s\n\n' "$blue" "$plain" "$([[ "$TLS_MODE" == "production" ]] && echo "Trusted Let's Encrypt certificate" || echo "Test self-signed certificate")"
+printf '%bTLS:%b          %s\n\n' "$blue" "$plain" "$(xhttp_tls_label)"
 printf '%bPANEL%b\n' "$cyan" "$plain"
 printf '  %bURL:%b      %s\n' "$yellow" "$plain" "$PANEL_DISPLAY_URL"
 printf '  %bAccess:%b   %s\n' "$yellow" "$plain" "$PANEL_ACCESS_DETAILS"

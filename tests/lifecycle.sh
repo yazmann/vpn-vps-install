@@ -14,6 +14,17 @@ xhttp_validate_single_dns_ipv4 203.0.113.7 <<<$'203.0.113.7\n203.0.113.7'
 if xhttp_validate_single_dns_ipv4 203.0.113.7 <<<$'203.0.113.7\n198.51.100.2'; then exit 1; fi
 if xhttp_validate_single_dns_ipv4 203.0.113.7 <<<'198.51.100.2'; then exit 1; fi
 if xhttp_validate_single_dns_ipv4 203.0.113.7 <<<$'origin.example.\n203.0.113.7'; then exit 1; fi
+(
+  DOMAIN=example.com
+  CERT_DIR=/root/cert/example.com
+  certbot() { printf '%s\n' "$@"; }
+  production_args="$(TLS_MODE=production xhttp_issue_certbot_certificate /etc/acme /var/lib/acme /var/log/acme /var/www/acme)"
+  staging_args="$(TLS_MODE=staging xhttp_issue_certbot_certificate /etc/acme /var/lib/acme /var/log/acme /var/www/acme)"
+  if grep -Fxq -- --test-cert <<<"$production_args"; then exit 1; fi
+  grep -Fxq -- --test-cert <<<"$staging_args"
+  [[ "$(TLS_MODE=production xhttp_tls_ca_file)" == /etc/ssl/certs/ca-certificates.crt ]]
+  [[ "$(TLS_MODE=staging xhttp_tls_ca_file)" == "$CERT_DIR/staging-ca.pem" ]]
+)
 
 [[ "$(xhttp_transport_flow vision)" == xtls-rprx-vision ]]
 [[ -z "$(xhttp_transport_flow xhttp)" ]]
@@ -243,6 +254,9 @@ grep -Fq 'location ^~ /.well-known/acme-challenge/' <<<"$nginx"
 grep -Fq 'return 301 https://example.com$request_uri;' <<<"$nginx"
 if grep -Fq 'Referrer-Policy' <<<"$nginx"; then exit 1; fi
 protected_nginx="$(SUB_PRIVACY_HEADERS=true xhttp_render_nginx)"
+staging_nginx="$(TLS_MODE=staging xhttp_render_nginx)"
+grep -Fq "proxy_ssl_trusted_certificate $CERT_DIR/staging-ca.pem;" <<<"$staging_nginx"
+grep -Fq 'proxy_ssl_verify on;' <<<"$staging_nginx"
 grep -Fq "add_header Cache-Control 'private, no-store' always;" <<<"$protected_nginx"
 grep -Fq "add_header Referrer-Policy 'no-referrer' always;" <<<"$protected_nginx"
 profile='{"subProfileMode":"custom","subProfileUrl":"https://old.example/"}'

@@ -336,7 +336,7 @@ xhttp_udp_finish() {
     hysteria2) xhttp_install_hysteria; profile=/root/xhttp-vps-hysteria.uri ;;
   esac
   systemctl is-active --quiet "$service"
-  curl -q -fsS --noproxy '*' --resolve "$DOMAIN:443:127.0.0.1" --max-time 10 \
+  curl -q -fsS --cacert "$(xhttp_tls_ca_file)" --noproxy '*' --resolve "$DOMAIN:443:127.0.0.1" --max-time 10 \
     "https://$DOMAIN/" -o /dev/null
   xhttp_probe_foreign_sni
   xhttp_probe_no_sni
@@ -348,6 +348,7 @@ xhttp_udp_finish() {
   {
     printf 'VPN NAME: %s\nTRANSPORT: %s\nENDPOINT: %s:%s/UDP\nCLIENT PROFILE: %s\n' \
       "$VPN_NAME" "$(xhttp_transport_label "$TRANSPORT")" "$DOMAIN" "$UDP_PORT" "$profile"
+    printf 'TLS: %s\n' "$(xhttp_tls_label)"
     xhttp_print_ssh_connection
     if [[ "${DISABLE_PING:-0}" == 1 ]]; then printf 'IPV4 PING REPLIES: Disabled\n'; fi
   } > "$report"

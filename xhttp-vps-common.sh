@@ -1215,8 +1215,55 @@ xhttp_update_hysteria() (
   printf '%s\n' 'Hysteria 2 release applied and the UDP listener is ready.'
 )
 
+xhttp_issue_certbot_certificate() {
+  local config_dir="$1" work_dir="$2" logs_dir="$3" webroot="$4"
+  local -a ca_options=()
+  if [[ "${TLS_MODE:-production}" == staging ]]; then ca_options+=(--test-cert); fi
+  certbot certonly --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring \
+    "${ca_options[@]}" --config-dir "$config_dir" --work-dir "$work_dir" --logs-dir "$logs_dir" \
+    --webroot --webroot-path "$webroot" --cert-name "$DOMAIN" -d "$DOMAIN"
+}
+
+xhttp_tls_ca_file() {
+  if [[ "${TLS_MODE:-production}" == staging ]]; then
+    printf '%s\n' "$CERT_DIR/staging-ca.pem"
+  else
+    printf '%s\n' /etc/ssl/certs/ca-certificates.crt
+  fi
+}
+
+xhttp_prepare_staging_ca() (
+  [[ "${TLS_MODE:-production}" == staging ]] || return 0
+  local bundle root name
+  bundle="$(xhttp_tls_ca_file)"
+  if [[ ! -s "$bundle" ]]; then
+    root="$(mktemp "$CERT_DIR/.staging-root.XXXXXXXX")" || return 1
+    local temporary
+    temporary="$(mktemp "$CERT_DIR/.staging-ca.XXXXXXXX")" || { rm -f -- "$root"; return 1; }
+    trap 'rm -f -- "$root" "$temporary"' EXIT
+    for name in letsencrypt-stg-root-x1.pem letsencrypt-stg-root-x2.pem gen-y/root-ye.pem gen-y/root-yr.pem; do
+      curl -q -fsS --proto '=https' --connect-timeout 5 --max-time 20 --retry 2 \
+        "https://letsencrypt.org/certs/staging/$name" --output "$root" || return 1
+      openssl x509 -in "$root" -outform PEM >> "$temporary" || return 1
+    done
+    mv -fT "$temporary" "$bundle" || return 1
+  fi
+  openssl verify -purpose sslserver -verify_hostname "$DOMAIN" -no-CApath -no-CAstore \
+    -CAfile "$bundle" -untrusted "$CERT_DIR/fullchain.pem" "$CERT_DIR/fullchain.pem" >/dev/null
+)
+
+xhttp_tls_label() {
+  case "${TLS_MODE:-production}" in
+    production) printf "%s\n" "Trusted Let's Encrypt certificate" ;;
+    staging) printf '%s\n' "Let's Encrypt staging certificate (test trust only)" ;;
+    *) printf '%s\n' 'Test self-signed certificate' ;;
+  esac
+}
+
 xhttp_install_cert_renewal() {
   local reload='systemctl reload nginx'
+  local ca_option=
+  if [[ "${TLS_MODE:-production}" == staging ]]; then ca_option=' --test-cert'; fi
   case "${TRANSPORT:-xhttp}" in
     vision|xhttp) reload+=' && systemctl try-restart x-ui' ;;
     hysteria2) reload+=' && systemctl try-restart xhttp-vps-hysteria' ;;
@@ -1230,7 +1277,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 UMask=0077
-ExecStart=/usr/bin/certbot renew --quiet --config-dir /etc/xhttp-vps-acme --work-dir /var/lib/xhttp-vps-acme --logs-dir /var/log/xhttp-vps-acme --deploy-hook "$reload"
+ExecStart=/usr/bin/certbot renew --quiet${ca_option} --config-dir /etc/xhttp-vps-acme --work-dir /var/lib/xhttp-vps-acme --logs-dir /var/log/xhttp-vps-acme --deploy-hook "$reload"
 EOF
   cat > /etc/systemd/system/xhttp-vps-cert-renew.timer <<'EOF'
 [Unit]
@@ -1429,14 +1476,15 @@ EOF
 }
 
 xhttp_render_subscription_locations() {
-local path
+local path ca_file
+ca_file="$(xhttp_tls_ca_file)"
 for path in "$SUB_PATH" "${SUB_JSON_PATH:-}" "${SUB_CLASH_PATH:-}"; do
 [[ -n "$path" ]] || continue
 cat <<EOF
     location ^~ /${path}/ {
         proxy_pass https://127.0.0.1:${SUB_PORT};
         proxy_ssl_verify on;
-        proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+        proxy_ssl_trusted_certificate $ca_file;
         proxy_ssl_verify_depth 3;
         proxy_ssl_server_name on;
         proxy_ssl_name ${DOMAIN};
@@ -1462,7 +1510,7 @@ xhttp_probe_cover_website() (
   [[ -s "$index" ]] || return 1
   response="$(mktemp)" || return 1
   trap 'rm -f -- "$response"' EXIT
-  status="$(curl -q -fsS --noproxy '*' --resolve "${DOMAIN}:443:127.0.0.1" --max-time 5 \
+  status="$(curl -q -fsS --cacert "$(xhttp_tls_ca_file)" --noproxy '*' --resolve "${DOMAIN}:443:127.0.0.1" --max-time 5 \
     --output "$response" --write-out '%{http_code}' "https://${DOMAIN}/")" || return 1
   [[ "$status" == 200 ]] && cmp -s -- "$index" "$response"
 )
@@ -1501,7 +1549,7 @@ xhttp_probe_h2_alpn() {
   local response
   response="$(
     timeout 12 openssl s_client -connect 127.0.0.1:443 -tls1_3 \
-      -servername "$DOMAIN" -verify_hostname "$DOMAIN" -verify_return_error \
+      -servername "$DOMAIN" -verify_hostname "$DOMAIN" -verify_return_error -CAfile "$(xhttp_tls_ca_file)" \
       -alpn 'h2,http/1.1' </dev/null 2>&1 || true
   )"
   grep -Fq 'ALPN protocol: h2' <<<"$response" && grep -Fq 'Verify return code: 0 (ok)' <<<"$response"
@@ -1633,6 +1681,7 @@ xhttp_validate_state() {
   [[ -d "$MANAGED_BACKUP" && ! -L "$MANAGED_BACKUP" ]] || return 1
   [[ "${SAFE_INSTANCE:-}" =~ ^[A-Za-z0-9_-]+$ || -z "${SAFE_INSTANCE:-}" ]] || return 1
   case "${ACME_CLIENT:-acme.sh}" in certbot|acme.sh) ;; *) return 1 ;; esac
+  [[ "${TLS_MODE:-production}" != staging || "${ACME_CLIENT:-}" == certbot ]] || return 1
   case "${SUB_ENCRYPT_LINKS:-}" in true|false|'') ;; *) return 1 ;; esac
   case "${SUB_PROFILE_MODE:-}" in none|builtin|'') ;; *) return 1 ;; esac
   case "${SUB_PRIVACY_HEADERS:-}" in true|false|'') ;; *) return 1 ;; esac
