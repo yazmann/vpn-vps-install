@@ -205,7 +205,7 @@ if [[ ${#MENU_STATE_FILES[@]} -eq 1 ]]; then
   fi
 fi
 
-printf '\nVPN VPS Setup\n\n'
+printf '\nVPN VPS Install\n\n'
 if [[ ${#MENU_STATE_FILES[@]} -eq 1 ]]; then
   if [[ "$HAS_CURRENT_SETTINGS" -eq 1 ]]; then
     printf 'Existing installation:\n1) Show current settings (default)\n2) Verify and repair\n3) Permanently remove VPN (no archive)\n4) Refresh automatic maintenance\n5) Export an encrypted recovery backup\n0) Exit\n'
@@ -1218,7 +1218,7 @@ case "$COVER_STYLE" in
 esac
 PHOTO_PAGE="https://unsplash.com/photos/${PHOTO_ID}"
 PHOTO_FILE="/var/www/3xui-cover/hero.jpg"
-REPO_ASSET_BASE="${REPO_ASSET_BASE:-https://raw.githubusercontent.com/yazmann/xhttp-vps-setup/main/assets}"
+REPO_ASSET_BASE="${REPO_ASSET_BASE:-https://raw.githubusercontent.com/yazmann/vpn-vps-install/main/assets}"
 PHOTO_MARKUP=''
 PHOTO_TEMP="$(mktemp /var/www/3xui-cover/.photo.XXXXXXXX)"
 if curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time 15 \
