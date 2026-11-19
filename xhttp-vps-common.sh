@@ -449,101 +449,178 @@ xhttp_configure_panel_fail2ban() {
 xhttp_maintenance_label() {
   case "${1:-}" in
     security) printf '%s' 'daily Ubuntu security updates; no automatic reboot' ;;
-    weekly) printf 'weekly Ubuntu updates on Sunday 05:00 %s; reboot only when required; 3x-ui and Xray are NOT updated automatically' "${MAINTENANCE_TIMEZONE:-Europe/Moscow}" ;;
+    weekly) printf 'daily security updates, Sunday 05:00 package updates and cleanup, conditional reboot at 05:30 (%s)' "${MAINTENANCE_TIMEZONE:-Europe/Moscow}" ;;
     none) printf '%s' 'no automatic updates or reboot' ;;
     *) return 1 ;;
   esac
 }
 
 xhttp_render_maintenance_timer() {
+  local unit=xhttp-vps-maintenance time=05:00:00 detail='package updates and cleanup'
+  if [[ "${1:-}" == reboot ]]; then
+    unit=xhttp-vps-reboot
+    time=05:30:00
+    detail='conditional reboot'
+  fi
   cat <<EOF
 [Unit]
-Description=Weekly Ubuntu maintenance schedule for xhttp-vps
+Description=Weekly $detail for xhttp-vps
 
 [Timer]
-OnCalendar=Sun *-*-* 05:00:00 ${MAINTENANCE_TIMEZONE}
-AccuracySec=1m
+OnCalendar=Sun *-*-* $time ${MAINTENANCE_TIMEZONE}
+AccuracySec=1s
 Persistent=false
-Unit=xhttp-vps-maintenance.service
+Unit=$unit.service
 
 [Install]
 WantedBy=timers.target
 EOF
 }
 
+xhttp_render_maintenance_script() {
+  cat <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+phase="$1"
+vpn_service="$2"
+export TZ="$3"
+completed=/run/xhttp-vps-maintenance.ok
+exec 9>/run/xhttp-vps-setup.lock
+if ! flock -n 9; then
+  logger -t xhttp-vps-maintenance "Skipped $phase while setup or weekly maintenance held the lock."
+  exit 0
+fi
+
+check_health() {
+  apt-get -o DPkg::Lock::Timeout=0 check || return 1
+  local audit service
+  audit="$(dpkg --audit)" || return 1
+  [[ -z "$audit" ]] || return 1
+  nginx -t || return 1
+  systemctl is-active --quiet ssh.service ssh.socket || return 1
+  for service in nginx "$vpn_service"; do
+    systemctl is-active --quiet "$service" || return 1
+  done
+}
+
+case "$phase" in
+  upgrade)
+    rm -f -- "$completed"
+    today="$(date +%F)"
+    export DEBIAN_FRONTEND=noninteractive
+    export NEEDRESTART_MODE=a
+    apt-get -o APT::Update::Error-Mode=any update
+    apt-get -o DPkg::Lock::Timeout=1800 -y -o Dpkg::Options::="--force-confold" --with-new-pkgs upgrade
+    apt-get -o DPkg::Lock::Timeout=1800 -y autoremove
+    apt-get autoclean
+    check_health
+    printf '%s\n' "$today" > "$completed"
+    logger -t xhttp-vps-maintenance 'Weekly package updates and cleanup completed.'
+    ;;
+  reboot)
+    [[ "$(date '+%u %H:%M')" == '7 05:30' && -f /var/run/reboot-required ]] || exit 0
+    if [[ ! -f "$completed" || "$(<"$completed")" != "$(date +%F)" ]]; then
+      logger -t xhttp-vps-maintenance 'Reboot skipped because weekly maintenance did not complete this Sunday.'
+      exit 0
+    fi
+    if systemctl is-active --quiet apt-daily.service apt-daily-upgrade.service; then
+      logger -t xhttp-vps-maintenance 'Reboot skipped while automatic APT work was active.'
+      exit 0
+    fi
+    check_health
+    [[ "$(date '+%u %H:%M')" == '7 05:30' ]] || exit 0
+    logger -t xhttp-vps-maintenance 'Package updates require a reboot. Rebooting in the weekly window.'
+    systemctl --no-block reboot
+    ;;
+  *) exit 1 ;;
+esac
+EOF
+}
+
 xhttp_install_maintenance() {
-  local temporary service
+  local phase name service temporary
   service="$(xhttp_service_name)" || return 1
   [[ "$MAINTENANCE_TIMEZONE" =~ ^([A-Za-z0-9_+-]+/)*[A-Za-z0-9_+-]+$ ]] || return 1
   [[ -f "/usr/share/zoneinfo/$MAINTENANCE_TIMEZONE" ]] || return 1
-  cat > /usr/local/sbin/xhttp-vps-maintenance <<'EOF'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-exec 9>/run/xhttp-vps-setup.lock
-flock -n 9 || exit 0
-export DEBIAN_FRONTEND=noninteractive
-export NEEDRESTART_MODE=a
-apt-get -o DPkg::Lock::Timeout=1800 update
-apt-get -o DPkg::Lock::Timeout=1800 -y -o Dpkg::Options::="--force-confold" upgrade
-apt-get check
-[[ -z "$(dpkg --audit)" ]]
-nginx -t
-for service in ssh nginx "$1"; do
-  systemctl is-active --quiet "$service"
-done
-if [[ -f /var/run/reboot-required ]]; then
-  logger -t xhttp-vps-maintenance 'Updates completed; reboot-required is present. Scheduling reboot.'
-  systemctl --no-block reboot
-else
-  logger -t xhttp-vps-maintenance 'Updates completed; reboot is not required.'
-fi
-EOF
-  chmod 700 /usr/local/sbin/xhttp-vps-maintenance
-  cat > /etc/systemd/system/xhttp-vps-maintenance.service <<EOF
+  systemd-analyze calendar "Sun *-*-* 05:00:00 ${MAINTENANCE_TIMEZONE}" >/dev/null || return 1
+  systemd-analyze calendar "Sun *-*-* 05:30:00 ${MAINTENANCE_TIMEZONE}" >/dev/null || return 1
+  xhttp_render_maintenance_script > /usr/local/sbin/xhttp-vps-maintenance || return 1
+  chmod 700 /usr/local/sbin/xhttp-vps-maintenance || return 1
+  for phase in upgrade reboot; do
+    name=xhttp-vps-maintenance
+    if [[ "$phase" == reboot ]]; then name=xhttp-vps-reboot; fi
+    cat > "/etc/systemd/system/$name.service" <<EOF || return 1
 [Unit]
-Description=Install weekly Ubuntu updates and reboot only when required
-Wants=network-online.target
-After=network-online.target apt-daily.service apt-daily-upgrade.service
+Description=Run weekly VPN maintenance ($phase)
+After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/xhttp-vps-maintenance $service
+ExecStart=/usr/local/sbin/xhttp-vps-maintenance $phase $service $MAINTENANCE_TIMEZONE
 Nice=10
 IOSchedulingClass=idle
 UMask=0027
 TimeoutStartSec=2h
 EOF
-  temporary="$(mktemp /etc/systemd/system/xhttp-vps-maintenance.timer.XXXXXXXX)"
-  xhttp_render_maintenance_timer > "$temporary"
-  chmod 644 "$temporary"
-  mv -f "$temporary" /etc/systemd/system/xhttp-vps-maintenance.timer
-  systemd-analyze calendar "Sun *-*-* 05:00:00 ${MAINTENANCE_TIMEZONE}" >/dev/null
-  systemctl daemon-reload
-  systemctl enable --now xhttp-vps-maintenance.timer
+    temporary="$(mktemp "/etc/systemd/system/$name.timer.XXXXXXXX")" || return 1
+    xhttp_render_maintenance_timer "$phase" > "$temporary" &&
+      chmod 644 "$temporary" && mv -f "$temporary" "/etc/systemd/system/$name.timer" || {
+      rm -f -- "$temporary"
+      return 1
+    }
+  done
+  systemctl daemon-reload || return 1
+  systemctl enable --now xhttp-vps-maintenance.timer xhttp-vps-reboot.timer
 }
 
 xhttp_disable_maintenance() {
-  systemctl disable --now xhttp-vps-maintenance.timer 2>/dev/null || true
+  local timer
+  for timer in xhttp-vps-maintenance.timer xhttp-vps-reboot.timer; do
+    if systemctl is-enabled --quiet "$timer" || systemctl is-active --quiet "$timer"; then
+      systemctl disable --now "$timer" || return 1
+    fi
+  done
   rm -f /usr/local/sbin/xhttp-vps-maintenance \
     /etc/systemd/system/xhttp-vps-maintenance.service \
-    /etc/systemd/system/xhttp-vps-maintenance.timer
+    /etc/systemd/system/xhttp-vps-maintenance.timer \
+    /etc/systemd/system/xhttp-vps-reboot.service \
+    /etc/systemd/system/xhttp-vps-reboot.timer \
+    /run/xhttp-vps-maintenance.ok || return 1
   systemctl daemon-reload
+}
+
+xhttp_verify_automatic_updates() {
+  local config timer
+  config="$(apt-config dump)" || return 1
+  grep -Fqx 'Unattended-Upgrade::Automatic-Reboot "false";' <<<"$config" || return 1
+  if [[ "$MAINTENANCE_MODE" == none ]]; then
+    grep -Fqx 'APT::Periodic::Enable "0";' <<<"$config" || return 1
+  else
+    grep -Fqx 'APT::Periodic::Unattended-Upgrade "1";' <<<"$config" || return 1
+  fi
+  for timer in xhttp-vps-maintenance.timer xhttp-vps-reboot.timer; do
+    if [[ "$MAINTENANCE_MODE" == weekly ]]; then
+      systemctl is-enabled --quiet "$timer" && systemctl is-active --quiet "$timer" || return 1
+    elif systemctl is-enabled --quiet "$timer" 2>/dev/null || systemctl is-active --quiet "$timer" 2>/dev/null; then
+      return 1
+    fi
+  done
 }
 
 xhttp_configure_automatic_updates() {
   case "${MAINTENANCE_MODE:-}" in
     security|weekly)
-      cat > /etc/apt/apt.conf.d/52xhttp-vps-auto-upgrades <<'EOF'
+      cat > /etc/apt/apt.conf.d/52xhttp-vps-auto-upgrades <<'EOF' || return 1
 APT::Periodic::Enable "1";
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 EOF
-      cat > /etc/apt/apt.conf.d/53xhttp-vps-unattended-upgrades <<'EOF'
+      cat > /etc/apt/apt.conf.d/53xhttp-vps-unattended-upgrades <<'EOF' || return 1
 // Managed by VLESS VPS Setup. Official Ubuntu security updates only.
 Unattended-Upgrade::Automatic-Reboot "false";
 Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
 EOF
-      systemctl enable --now apt-daily.timer apt-daily-upgrade.timer
+      systemctl enable --now apt-daily.timer apt-daily-upgrade.timer || return 1
       if [[ "$MAINTENANCE_MODE" == weekly ]]; then
         xhttp_install_maintenance
       else
@@ -551,12 +628,12 @@ EOF
       fi
       ;;
     none)
-      cat > /etc/apt/apt.conf.d/52xhttp-vps-auto-upgrades <<'EOF'
+      cat > /etc/apt/apt.conf.d/52xhttp-vps-auto-upgrades <<'EOF' || return 1
 APT::Periodic::Enable "0";
 APT::Periodic::Update-Package-Lists "0";
 APT::Periodic::Unattended-Upgrade "0";
 EOF
-      cat > /etc/apt/apt.conf.d/53xhttp-vps-unattended-upgrades <<'EOF'
+      cat > /etc/apt/apt.conf.d/53xhttp-vps-unattended-upgrades <<'EOF' || return 1
 // Managed by VLESS VPS Setup. Automatic package installation is disabled.
 Unattended-Upgrade::Automatic-Reboot "false";
 Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
@@ -969,7 +1046,8 @@ xhttp_managed_paths() {
     /etc/apt/apt.conf.d/52xhttp-vps-auto-upgrades /etc/apt/apt.conf.d/53xhttp-vps-unattended-upgrades \
     /etc/fail2ban/jail.d/xhttp-vps-sshd.local \
     /usr/local/sbin/xhttp-vps-maintenance /etc/systemd/system/xhttp-vps-maintenance.service \
-    /etc/systemd/system/xhttp-vps-maintenance.timer \
+    /etc/systemd/system/xhttp-vps-maintenance.timer /etc/systemd/system/xhttp-vps-reboot.service \
+    /etc/systemd/system/xhttp-vps-reboot.timer \
     "/root/cert/$DOMAIN" "$RESULT_FILE"
   if [[ "${ACME_CLIENT:-}" == certbot ]]; then
     printf '%s\n' /etc/xhttp-vps-acme /var/lib/xhttp-vps-acme /var/log/xhttp-vps-acme \
