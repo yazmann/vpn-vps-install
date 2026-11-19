@@ -8,12 +8,23 @@ xhttp_valid_ipv4 203.0.113.7
 xhttp_valid_ipv4 0.0.0.0
 if xhttp_valid_ipv4 256.1.1.1; then exit 1; fi
 if xhttp_valid_ipv4 1.2.3; then exit 1; fi
-if xhttp_valid_ipv4 '1.2.3.4 extra'; then exit 1; fi
+if xhttp_valid_ipv4 '203.0.113.7 extra'; then exit 1; fi
 xhttp_validate_single_dns_ipv4 203.0.113.7 <<<'203.0.113.7'
 xhttp_validate_single_dns_ipv4 203.0.113.7 <<<$'203.0.113.7\n203.0.113.7'
 if xhttp_validate_single_dns_ipv4 203.0.113.7 <<<$'203.0.113.7\n198.51.100.2'; then exit 1; fi
 if xhttp_validate_single_dns_ipv4 203.0.113.7 <<<'198.51.100.2'; then exit 1; fi
 if xhttp_validate_single_dns_ipv4 203.0.113.7 <<<$'origin.example.\n203.0.113.7'; then exit 1; fi
+(
+  DOMAIN=example.com
+  CERT_DIR=/root/cert/example.com
+  certbot() { printf '%s\n' "$@"; }
+  production_args="$(TLS_MODE=production xhttp_issue_certbot_certificate /etc/acme /var/lib/acme /var/log/acme /var/www/acme)"
+  staging_args="$(TLS_MODE=staging xhttp_issue_certbot_certificate /etc/acme /var/lib/acme /var/log/acme /var/www/acme)"
+  if grep -Fxq -- --test-cert <<<"$production_args"; then exit 1; fi
+  grep -Fxq -- --test-cert <<<"$staging_args"
+  [[ "$(TLS_MODE=production xhttp_tls_ca_file)" == /etc/ssl/certs/ca-certificates.crt ]]
+  [[ "$(TLS_MODE=staging xhttp_tls_ca_file)" == "$CERT_DIR/staging-ca.pem" ]]
+)
 
 [[ "$(xhttp_transport_flow vision)" == xtls-rprx-vision ]]
 [[ -z "$(xhttp_transport_flow xhttp)" ]]
@@ -100,6 +111,13 @@ grep -Fq 'failed login: username=.*IP="<HOST>"' <<<"$(xhttp_render_panel_fail2ba
 
 warp='{"tag":"warp","protocol":"wireguard","settings":{}}'
 base='{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"blocked","protocol":"blackhole"}],"routing":{"rules":[{"inboundTag":["api"],"outboundTag":"api"},{"protocol":["bittorrent"],"outboundTag":"blocked"},{"ip":["geoip:private"],"outboundTag":"blocked"},{"outboundTag":"direct","network":"tcp,udp"}]}}'
+warp_account='{"private_key":"fixture","client_id":"AQID"}'
+warp_profile='{"config":{"peers":[{"public_key":"fixture","endpoint":{"host":"warp.example:2408","v4":"192.0.2.10:0"}}],"interface":{"addresses":{"v4":"198.51.100.2"}}}}'
+xhttp_build_warp_outbound "$warp_account" "$warp_profile" |
+  jq -e '.settings.peers[0].endpoint=="192.0.2.10:2408" and .settings.reserved==[1,2,3]' >/dev/null
+warp_profile="$(jq -c 'del(.config.peers[0].endpoint.v4)' <<<"$warp_profile")"
+xhttp_build_warp_outbound "$warp_account" "$warp_profile" |
+  jq -e '.settings.peers[0].endpoint=="warp.example:2408"' >/dev/null
 result="$(xhttp_warp_config "$warp" <<<"$base")"
 jq -e '.routing.rules[0].outboundTag=="api" and .routing.rules[1].protocol==["bittorrent"] and .routing.rules[2].ip==["geoip:private"] and .routing.rules[3].ruleTag=="xhttp-vps-warp-ru-domain" and .routing.rules[4].ip==["geoip:ru"] and .routing.rules[5].outboundTag=="direct" and ([.routing.rules[]|select(.outboundTag=="warp")]|length)==2 and .routing.rules[3].domain==["domain:ru","domain:su","domain:xn--p1ai","geosite:category-ru"] and .routing.domainStrategy=="IPOnDemand"' <<<"$result" >/dev/null
 [[ "$result" == "$(xhttp_warp_config "$warp" <<<"$result")" ]]
@@ -243,6 +261,9 @@ grep -Fq 'location ^~ /.well-known/acme-challenge/' <<<"$nginx"
 grep -Fq 'return 301 https://example.com$request_uri;' <<<"$nginx"
 if grep -Fq 'Referrer-Policy' <<<"$nginx"; then exit 1; fi
 protected_nginx="$(SUB_PRIVACY_HEADERS=true xhttp_render_nginx)"
+staging_nginx="$(TLS_MODE=staging xhttp_render_nginx)"
+grep -Fq "proxy_ssl_trusted_certificate $CERT_DIR/staging-ca.pem;" <<<"$staging_nginx"
+grep -Fq 'proxy_ssl_verify on;' <<<"$staging_nginx"
 grep -Fq "add_header Cache-Control 'private, no-store' always;" <<<"$protected_nginx"
 grep -Fq "add_header Referrer-Policy 'no-referrer' always;" <<<"$protected_nginx"
 profile='{"subProfileMode":"custom","subProfileUrl":"https://old.example/"}'
@@ -252,6 +273,20 @@ SUB_PROFILE_MODE=builtin xhttp_subscription_profile_settings <<<"$profile" | jq 
 headers=$'HTTP/2 200\r\ncache-control: private, no-store\r\nreferrer-policy: no-referrer\r\n'
 SUB_PROFILE_MODE=none SUB_PRIVACY_HEADERS=true xhttp_verify_subscription_protection "$headers"
 if SUB_PROFILE_MODE=none xhttp_verify_subscription_protection "${headers}"$'profile-web-page-url: https://example.com/page\r\n'; then exit 1; fi
+(
+  curl() {
+    [[ "$1" == -q && "$2" == --user-agent && "${*: -1}" == https://example.com/sub/client ]] || return 1
+    case "$3" in
+      Happ) printf 'routing-enable: true\r\nrouting: happ://routing/onadd/test\r\n' ;;
+      INCY) printf '%s\n' "$incy_body" | base64 -w0 ;;
+      *) return 1 ;;
+    esac
+  }
+  incy_body='incy://routing/onadd/test'
+  xhttp_verify_subscription_routing example.com sub/client
+  incy_body='vless://test'
+  if xhttp_verify_subscription_routing example.com sub/client; then exit 1; fi
+)
 export XHTTP_NGINX_VERSION_OVERRIDE=1.26.0
 nginx="$(xhttp_render_nginx)"
 grep -Fq 'listen 127.0.0.1:12345 ssl;' <<<"$nginx"

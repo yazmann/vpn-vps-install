@@ -169,6 +169,7 @@ if [[ "${1:-}" == --resume ]]; then
   if xhttp_uses_panel; then : "${INBOUND_TAG:=$(xhttp_inbound_tag_for "$TRANSPORT")}"; fi
   : "${UDP_PORT:=}" "${HY_PASSWORD:=}"
   : "${ACME_CLIENT:=acme.sh}"
+  : "${TLS_MODE:=production}"
   : "${MIGRATION_DB:=}" "${MIGRATION_INBOUND:=}"
   : "${SUB_ENCRYPT_LINKS:=}"
   : "${MAINTENANCE_TIMEZONE:=Europe/Moscow}"
@@ -267,8 +268,9 @@ else
 fi
 
 TLS_MODE="production"
+if [[ "${1:-}" == --staging ]]; then TLS_MODE=staging; fi
 ACME_CLIENT=certbot
-printf '%bTLS:%b production Lets Encrypt certificate (required).\n' "$cyan" "$plain"
+printf '%bTLS:%b %s (required).\n' "$cyan" "$plain" "$(xhttp_tls_label)"
 
 [[ -r /etc/os-release ]] || die "Cannot identify the operating system."
 # shellcheck disable=SC1091
@@ -548,7 +550,7 @@ case "$SSH_ACCESS_CHOICE" in
     warn "The installer will preserve the current root and SSH authentication policy. Fail2ban reduces brute-force attempts but does not make weak credentials safe."
     ;;
   2)
-    SSH_ACCESS_MODE=root-key
+    SSH_ACCESS_MODE='root-key'
     SSH_HARDENING=1
     ADMIN_USER=root
     warn "Root will remain reachable by its SSH key. Password login is disabled, but this is less safe than a separate administrator."
@@ -564,7 +566,7 @@ case "$SSH_ACCESS_CHOICE" in
     getent passwd "$ADMIN_USER" >/dev/null && die "User ${ADMIN_USER} already exists; use a fresh name."
     ;;
   5)
-    SSH_ACCESS_MODE=root-password
+    SSH_ACCESS_MODE='root-password'
     SSH_HARDENING=1
     ADMIN_USER=root
     warn 'Root password login selected. Use a strong unique password and restrict the source IPv4 when possible.'
@@ -1087,7 +1089,7 @@ fi
 ufw default deny incoming
 ufw default allow outgoing
 xhttp_configure_ssh_source || die 'Could not apply the selected SSH source policy.'
-if [[ "$TLS_MODE" == "production" ]]; then
+if [[ "$TLS_MODE" == production || "$TLS_MODE" == staging ]]; then
   ufw allow 80/tcp comment "xhttp-vps:${SAFE_INSTANCE} ACME"
 fi
 ufw allow 443/tcp comment "xhttp-vps:${SAFE_INSTANCE} VPN"
@@ -1105,7 +1107,7 @@ if xhttp_uses_panel && [[ ! -x /usr/local/x-ui/x-ui || ( -z "$PANEL_API_TOKEN" &
   write_state
 fi
 if [[ ! -s "$CERT_DIR/fullchain.pem" || ! -s "$CERT_DIR/privkey.pem" ]]; then
-  [[ "$TLS_MODE" == "production" ]] || die "Missing legacy test certificate."
+  [[ "$TLS_MODE" == production || "$TLS_MODE" == staging ]] || die "Missing legacy test certificate."
   log "Issuing the TLS certificate through the persistent Nginx webroot"
   install -d -m 700 "$CERT_DIR"
   install -d -m 755 /var/www/3xui-cover/.well-known/acme-challenge
@@ -1119,9 +1121,8 @@ if [[ ! -s "$CERT_DIR/fullchain.pem" || ! -s "$CERT_DIR/privkey.pem" ]]; then
     || die "The local Nginx ACME webroot probe failed."
   rm -f "/var/www/3xui-cover/.well-known/acme-challenge/${ACME_PROBE}"
   if [[ "$ACME_CLIENT" == certbot ]]; then
-    certbot certonly --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring \
-      --config-dir /etc/xhttp-vps-acme --work-dir /var/lib/xhttp-vps-acme --logs-dir /var/log/xhttp-vps-acme \
-      --webroot --webroot-path /var/www/3xui-cover --cert-name "$DOMAIN" -d "$DOMAIN"
+    xhttp_issue_certbot_certificate /etc/xhttp-vps-acme /var/lib/xhttp-vps-acme \
+      /var/log/xhttp-vps-acme /var/www/3xui-cover
     ln -sfn "/etc/xhttp-vps-acme/live/$DOMAIN/fullchain.pem" "$CERT_DIR/fullchain.pem"
     ln -sfn "/etc/xhttp-vps-acme/live/$DOMAIN/privkey.pem" "$CERT_DIR/privkey.pem"
   else
@@ -1135,8 +1136,8 @@ if [[ ! -s "$CERT_DIR/fullchain.pem" || ! -s "$CERT_DIR/privkey.pem" ]]; then
   fi
 fi
 
-if xhttp_uses_panel; then
 [[ -s "$CERT_DIR/fullchain.pem" && -s "$CERT_DIR/privkey.pem" ]] || die "TLS certificate deployment failed."
+if xhttp_uses_panel; then
 /usr/local/x-ui/x-ui cert -webCert "$CERT_DIR/fullchain.pem" -webCertKey "$CERT_DIR/privkey.pem" >/dev/null
 # The installer's result file is authoritative. Reading it also protects us
 # from future installer-side normalization of the port or web base path.
@@ -1300,26 +1301,8 @@ if [[ "$RESUMING" == 1 ]]; then exec "$RECOVERY_SCRIPT"; fi
 API_BASE="https://${DOMAIN}:${PANEL_PORT}/${PANEL_PATH}"
 API_HEADER_FILE="$(xhttp_create_api_header_file "$PANEL_API_TOKEN")" \
   || die "The panel API token is empty or contains invalid control characters."
-API_AUTH=(--noproxy '*' --resolve "${DOMAIN}:${PANEL_PORT}:127.0.0.1" -H "@${API_HEADER_FILE}")
+API_AUTH=(--cacert "$(xhttp_tls_ca_file)" --noproxy '*' --resolve "${DOMAIN}:${PANEL_PORT}:127.0.0.1" -H "@${API_HEADER_FILE}")
 trap 'rm -f "${API_HEADER_FILE:-}"' EXIT
-
-build_warp_outbound() {
-  local data_json="$1" config_json="$2" private_key client_id peer_key endpoint addresses reserved
-  WARP_OUT=""
-  private_key="$(jq -r '.private_key // empty' <<<"$data_json")"
-  client_id="$(jq -r '.client_id // empty' <<<"$data_json")"
-  peer_key="$(jq -r '.config.peers[0].public_key // empty' <<<"$config_json")"
-  endpoint="$(jq -r '.config.peers[0].endpoint.host // empty' <<<"$config_json")"
-  addresses="$(jq -nc --arg v4 "$(jq -r '.config.interface.addresses.v4 // empty' <<<"$config_json")" \
-    --arg v6 "$(jq -r '.config.interface.addresses.v6 // empty' <<<"$config_json")" \
-    '[$v4, $v6 | select(length > 0) | if contains(":") then . + "/128" else . + "/32" end]')"
-  [[ -n "$private_key" && -n "$client_id" && -n "$peer_key" && -n "$endpoint" && "$addresses" != "[]" ]] || return 1
-  reserved="$(printf '%s' "$client_id" | base64 -d 2>/dev/null | od -An -tu1 | awk 'BEGIN { printf "[" } { for (i=1; i<=NF; i++) { if (n++) printf ","; printf $i } } END { print "]" }')" || return 1
-  [[ "$reserved" != "[]" ]] || return 1
-  WARP_OUT="$(jq -nc --arg private "$private_key" --arg public "$peer_key" --arg endpoint "$endpoint" \
-    --argjson addresses "$addresses" --argjson reserved "$reserved" \
-    '{tag:"warp",protocol:"wireguard",settings:{mtu:1420,secretKey:$private,address:$addresses,reserved:$reserved,domainStrategy:"ForceIPv4v6",peers:[{publicKey:$public,endpoint:$endpoint}],noKernelTun:true}}')" || return 1
-}
 
 log "Waiting for the private IPv4 panel API and verifying its bearer token"
 API_READY=0; RESPONSE=""; API_HTTP_CODE="000"
@@ -1446,7 +1429,7 @@ if [[ "$ENABLE_WARP" -eq 1 ]]; then
     WARP_CONFIG_RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/config")"
     WARP_DATA="$(jq -c '.obj | if type=="string" then fromjson else . end' <<<"$WARP_DATA_RESPONSE")"
     WARP_CONFIG="$(jq -c '.obj | if type=="string" then fromjson else . end' <<<"$WARP_CONFIG_RESPONSE")"
-    if ! build_warp_outbound "$WARP_DATA" "$WARP_CONFIG"; then
+    if ! WARP_OUT="$(xhttp_build_warp_outbound "$WARP_DATA" "$WARP_CONFIG")"; then
       die "WARP account data is incomplete. WARP was requested, so installation cannot continue."
     else
       RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/")"
@@ -1537,13 +1520,9 @@ if [[ "$INSTALL_MODE" == "standalone" ]]; then
       "https://${DOMAIN}/${SUB_PATH}/${CLIENT_SUB_ID}" 2>/dev/null || true)"
     if [[ -n "$SUB_HEADERS" ]] && xhttp_verify_subscription_protection "$SUB_HEADERS"; then SUB_PROTECTION_VERIFIED=1; fi
   fi
-  if [[ "$CLIENT_ROUTING_CONFIGURED" -eq 1 && "$SUBSCRIPTION_VERIFIED" -eq 1 ]]; then
-    SUB_DECODED="$(printf '%s' "$SUB_RESPONSE" | base64 -d 2>/dev/null || true)"
-    if grep -qi '^Routing-Enable:[[:space:]]*true' <<<"$SUB_HEADERS" \
-      && grep -qi '^Routing:[[:space:]]*happ://routing/onadd/' <<<"$SUB_HEADERS" \
-      && grep -q 'incy://routing/onadd/' <<<"$SUB_DECODED"; then
-      CLIENT_ROUTING_VERIFIED=1
-    fi
+  if [[ "$CLIENT_ROUTING_CONFIGURED" -eq 1 && "$SUBSCRIPTION_VERIFIED" -eq 1 ]] \
+    && xhttp_verify_subscription_routing "$DOMAIN" "${SUB_PATH}/${CLIENT_SUB_ID}"; then
+    CLIENT_ROUTING_VERIFIED=1
   fi
   if [[ "$MIHOMO_CONFIGURED" -eq 1 ]]; then
     MIHOMO_RESPONSE="$(curl -kfsS --resolve "${DOMAIN}:443:127.0.0.1" --max-time 10 \
@@ -1651,11 +1630,7 @@ if [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6)" == 1 ]]; then status_line "I
 if xhttp_validate_single_dns_ipv4 "$PUBLIC_IP" <<<"$(dig +short A "$DOMAIN")" && ! dig +short AAAA "$DOMAIN" | grep -q .; then status_line "DNS A / AAAA" OK "$DOMAIN → $PUBLIC_IP"; else status_line "DNS A / AAAA" ERROR; fi
 if ufw status | grep -q '^Status: active'; then status_line "UFW firewall" OK; else status_line "UFW firewall" ERROR; fi
 if openssl x509 -in "$CERT_DIR/fullchain.pem" -checkend 86400 -noout >/dev/null 2>&1; then
-  if [[ "$TLS_MODE" == "production" ]]; then
-    status_line "TLS certificate" OK "trusted Let's Encrypt"
-  else
-    status_line "TLS certificate" OK "TEST: self-signed, 30 days"
-  fi
+  status_line "TLS certificate" OK "$(xhttp_tls_label)"
 else
   status_line "TLS certificate" ERROR
 fi
@@ -1821,7 +1796,7 @@ printf '%b                 VPN INSTALLATION COMPLETED SUCCESSFULLY%b\n' "$green"
 printf '%b                     ALL APPLICABLE CHECKS PASSED%b\n' "$green" "$plain"
 printf '%b================================================================%b\n\n' "$green" "$plain"
 printf '%b%s:%b          %s\n' "$blue" "$([[ "$INSTALL_MODE" == "standalone" ]] && echo "VPN" || echo "NODE")" "$plain" "$VPN_NAME"
-printf '%bTLS:%b          %s\n\n' "$blue" "$plain" "$([[ "$TLS_MODE" == "production" ]] && echo "Trusted Let's Encrypt certificate" || echo "Test self-signed certificate")"
+printf '%bTLS:%b          %s\n\n' "$blue" "$plain" "$(xhttp_tls_label)"
 printf '%bPANEL%b\n' "$cyan" "$plain"
 printf '  %bURL:%b      %s\n' "$yellow" "$plain" "$PANEL_DISPLAY_URL"
 printf '  %bAccess:%b   %s\n' "$yellow" "$plain" "$PANEL_ACCESS_DETAILS"

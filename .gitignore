@@ -1,10 +1,25 @@
 # Never commit generated credentials, databases or certificates
 *.env
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
+*.sqlite3
+*.sqlite*-shm
+*.sqlite*-wal
 *.pem
 *.key
+*.p12
+*.pfx
 *.log
+*.tar.gz.gpg
+authorized_keys
+client.conf
+amneziawg-*.conf
+xhttp-vps-*.uri
+xhttp-vps-result-*.txt
+*-app-test-links.txt
+*-app-subscriptions.txt
 
 # Editor / OS files
 .DS_Store
@@ -15,6 +30,8 @@ Thumbs.db
 # Local Codex/runtime artifacts
 .agents/
 .codex/
+/outputs/
+/work/
 
 # Deprecated local drafts; keep the maintained installer files only
 install-boiler-node.sh

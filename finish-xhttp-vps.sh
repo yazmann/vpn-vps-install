@@ -127,26 +127,8 @@ if [[ "${ACME_CLIENT:-}" == certbot ]]; then xhttp_install_cert_renewal; fi
 API_BASE="https://${DOMAIN}:${PANEL_PORT}/${PANEL_PATH}"
 API_HEADER_FILE="$(xhttp_create_api_header_file "$PANEL_API_TOKEN")" \
   || die "The panel API token is empty or contains invalid control characters."
-API_AUTH=(--noproxy '*' --resolve "${DOMAIN}:${PANEL_PORT}:127.0.0.1" -H "@${API_HEADER_FILE}")
+API_AUTH=(--cacert "$(xhttp_tls_ca_file)" --noproxy '*' --resolve "${DOMAIN}:${PANEL_PORT}:127.0.0.1" -H "@${API_HEADER_FILE}")
 trap 'rm -f "${API_HEADER_FILE:-}"' EXIT
-
-build_warp_outbound() {
-  local data_json="$1" config_json="$2" private_key client_id peer_key endpoint addresses reserved
-  WARP_OUT=""
-  private_key="$(jq -r '.private_key // empty' <<<"$data_json")"
-  client_id="$(jq -r '.client_id // empty' <<<"$data_json")"
-  peer_key="$(jq -r '.config.peers[0].public_key // empty' <<<"$config_json")"
-  endpoint="$(jq -r '.config.peers[0].endpoint.host // empty' <<<"$config_json")"
-  addresses="$(jq -nc --arg v4 "$(jq -r '.config.interface.addresses.v4 // empty' <<<"$config_json")" \
-    --arg v6 "$(jq -r '.config.interface.addresses.v6 // empty' <<<"$config_json")" \
-    '[$v4, $v6 | select(length > 0) | if contains(":") then . + "/128" else . + "/32" end]')"
-  [[ -n "$private_key" && -n "$client_id" && -n "$peer_key" && -n "$endpoint" && "$addresses" != "[]" ]] || return 1
-  reserved="$(printf '%s' "$client_id" | base64 -d 2>/dev/null | od -An -tu1 | awk 'BEGIN { printf "[" } { for (i=1; i<=NF; i++) { if (n++) printf ","; printf $i } } END { print "]" }')" || return 1
-  [[ "$reserved" != "[]" ]] || return 1
-  WARP_OUT="$(jq -nc --arg private "$private_key" --arg public "$peer_key" --arg endpoint "$endpoint" \
-    --argjson addresses "$addresses" --argjson reserved "$reserved" \
-    '{tag:"warp",protocol:"wireguard",settings:{mtu:1420,secretKey:$private,address:$addresses,reserved:$reserved,domainStrategy:"ForceIPv4v6",peers:[{publicKey:$public,endpoint:$endpoint}],noKernelTun:true}}')" || return 1
-}
 
 configure_warp_swap() {
   local memory_kib free_kib
@@ -207,7 +189,7 @@ if [[ "$READY" -eq 0 && "$R" == *'error: 401'* ]]; then
     rm -f "$API_HEADER_FILE"
     API_HEADER_FILE="$(xhttp_create_api_header_file "$PANEL_API_TOKEN")" \
       || die "The replacement API token contains invalid control characters."
-    API_AUTH=(--noproxy '*' --resolve "${DOMAIN}:${PANEL_PORT}:127.0.0.1" -H "@${API_HEADER_FILE}")
+    API_AUTH=(--cacert "$(xhttp_tls_ca_file)" --noproxy '*' --resolve "${DOMAIN}:${PANEL_PORT}:127.0.0.1" -H "@${API_HEADER_FILE}")
     printf '\nPANEL_API_TOKEN=%q\n' "$PANEL_API_TOKEN" >> "${STATE_FILES[0]}"
     READY=0
     for _ in $(seq 1 15); do
@@ -337,7 +319,7 @@ if [[ "${ENABLE_WARP:-0}" -eq 1 ]]; then
     WARP_CONFIG_RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/config")"
     WARP_DATA="$(jq -c '.obj|if type=="string" then fromjson else . end' <<<"$WARP_DATA_RESPONSE")"
     WARP_CONFIG="$(jq -c '.obj|if type=="string" then fromjson else . end' <<<"$WARP_CONFIG_RESPONSE")"
-    if ! build_warp_outbound "$WARP_DATA" "$WARP_CONFIG"; then
+    if ! WARP_OUT="$(xhttp_build_warp_outbound "$WARP_DATA" "$WARP_CONFIG")"; then
       die "WARP account data is incomplete. WARP was requested, so repair cannot continue."
     else
       R="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/")"
@@ -401,9 +383,9 @@ if [[ "$INSTALL_MODE" == "standalone" ]]; then
     SUB_HEADERS="$(curl -kfsS --resolve "${DOMAIN}:443:127.0.0.1" --max-time 5 -D - -o /dev/null "https://${DOMAIN}/${SUB_PATH}/${CLIENT_SUB_ID}" 2>/dev/null || true)"
     if [[ -n "$SUB_HEADERS" ]] && xhttp_verify_subscription_protection "$SUB_HEADERS"; then SUB_PROTECTION_OK=1; fi
   fi
-  if [[ "$ROUTING_CONFIGURED" -eq 1 && "$SUB_OK" -eq 1 ]]; then
-    SUB_DECODED="$(printf '%s' "$SUB_DATA" | base64 -d 2>/dev/null || true)"
-    if grep -qi '^Routing-Enable:[[:space:]]*true' <<<"$SUB_HEADERS" && grep -qi '^Routing:[[:space:]]*happ://routing/onadd/' <<<"$SUB_HEADERS" && grep -q 'incy://routing/onadd/' <<<"$SUB_DECODED"; then ROUTING_OK=1; fi
+  if [[ "$ROUTING_CONFIGURED" -eq 1 && "$SUB_OK" -eq 1 ]] \
+    && xhttp_verify_subscription_routing "$DOMAIN" "${SUB_PATH}/${CLIENT_SUB_ID}"; then
+    ROUTING_OK=1
   fi
   if [[ "$MIHOMO_CONFIGURED" -eq 1 ]]; then
     MIHOMO_DATA="$(curl -kfsS --resolve "${DOMAIN}:443:127.0.0.1" --max-time 10 "$MIHOMO_ROUTING_URL" 2>/dev/null || true)"
@@ -596,6 +578,7 @@ printf '%b================================================================%b\n' 
 printf '%b                    VPN REPAIR COMPLETED SUCCESSFULLY%b\n' "$green" "$plain"
 printf '%b                     ALL APPLICABLE CHECKS PASSED%b\n' "$green" "$plain"
 printf '%b================================================================%b\n\n' "$green" "$plain"
+printf 'TLS: %s\n\n' "$(xhttp_tls_label)"
 printf '%bPANEL%b\n' "$cyan" "$plain"
 printf '  %bURL:%b      %s\n' "$yellow" "$plain" "$PANEL_DISPLAY_URL"
 printf '  %bAccess:%b   %s\n' "$yellow" "$plain" "$PANEL_ACCESS_DETAILS"

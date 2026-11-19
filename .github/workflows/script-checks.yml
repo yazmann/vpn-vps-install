@@ -70,7 +70,7 @@ jobs:
           grep -Fq 'permit_root=prohibit-password' xhttp-vps-common.sh
           grep -Fq 'AllowTcpForwarding local' xhttp-vps-common.sh
           grep -Fq "SSH_ACCESS_MODE='admin'" install-xhttp-vps.sh
-          grep -Fq 'SSH_ACCESS_MODE=root-key' install-xhttp-vps.sh
+          grep -Fq "SSH_ACCESS_MODE='root-key'" install-xhttp-vps.sh
           grep -Fq 'SSH_ACCESS_MODE=existing' install-xhttp-vps.sh
           grep -Fq 'systemctl --no-block reboot' xhttp-vps-common.sh
           grep -Fq -- '-f /var/run/reboot-required' xhttp-vps-common.sh
