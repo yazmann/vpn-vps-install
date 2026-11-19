@@ -111,6 +111,13 @@ grep -Fq 'failed login: username=.*IP="<HOST>"' <<<"$(xhttp_render_panel_fail2ba
 
 warp='{"tag":"warp","protocol":"wireguard","settings":{}}'
 base='{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"blocked","protocol":"blackhole"}],"routing":{"rules":[{"inboundTag":["api"],"outboundTag":"api"},{"protocol":["bittorrent"],"outboundTag":"blocked"},{"ip":["geoip:private"],"outboundTag":"blocked"},{"outboundTag":"direct","network":"tcp,udp"}]}}'
+warp_account='{"private_key":"fixture","client_id":"AQID"}'
+warp_profile='{"config":{"peers":[{"public_key":"fixture","endpoint":{"host":"warp.example:2408","v4":"192.0.2.10:0"}}],"interface":{"addresses":{"v4":"198.51.100.2"}}}}'
+xhttp_build_warp_outbound "$warp_account" "$warp_profile" |
+  jq -e '.settings.peers[0].endpoint=="192.0.2.10:2408" and .settings.reserved==[1,2,3]' >/dev/null
+warp_profile="$(jq -c 'del(.config.peers[0].endpoint.v4)' <<<"$warp_profile")"
+xhttp_build_warp_outbound "$warp_account" "$warp_profile" |
+  jq -e '.settings.peers[0].endpoint=="warp.example:2408"' >/dev/null
 result="$(xhttp_warp_config "$warp" <<<"$base")"
 jq -e '.routing.rules[0].outboundTag=="api" and .routing.rules[1].protocol==["bittorrent"] and .routing.rules[2].ip==["geoip:private"] and .routing.rules[3].ruleTag=="xhttp-vps-warp-ru-domain" and .routing.rules[4].ip==["geoip:ru"] and .routing.rules[5].outboundTag=="direct" and ([.routing.rules[]|select(.outboundTag=="warp")]|length)==2 and .routing.rules[3].domain==["domain:ru","domain:su","domain:xn--p1ai","geosite:category-ru"] and .routing.domainStrategy=="IPOnDemand"' <<<"$result" >/dev/null
 [[ "$result" == "$(xhttp_warp_config "$warp" <<<"$result")" ]]

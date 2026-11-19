@@ -110,7 +110,6 @@ sqlite3 /etc/x-ui/x-ui.db ".timeout 5000" ".backup '$REPAIR_BACKUP/x-ui.db'"
 chmod 600 "$REPAIR_BACKUP/x-ui.db"
 printf 'Database backup before repair: %s\n' "$REPAIR_BACKUP"
 CERT_DIR="/root/cert/$DOMAIN"
-xhttp_prepare_staging_ca || die "Could not verify the Let's Encrypt staging certificate."
 [[ -s "$CERT_DIR/fullchain.pem" && -s "$CERT_DIR/privkey.pem" ]] || die "Certificate files are missing. Resume bootstrap before configuring the panel."
 {
   printf 'SUB_JSON_PATH=%q\n' "${SUB_JSON_PATH:-}"
@@ -130,24 +129,6 @@ API_HEADER_FILE="$(xhttp_create_api_header_file "$PANEL_API_TOKEN")" \
   || die "The panel API token is empty or contains invalid control characters."
 API_AUTH=(--cacert "$(xhttp_tls_ca_file)" --noproxy '*' --resolve "${DOMAIN}:${PANEL_PORT}:127.0.0.1" -H "@${API_HEADER_FILE}")
 trap 'rm -f "${API_HEADER_FILE:-}"' EXIT
-
-build_warp_outbound() {
-  local data_json="$1" config_json="$2" private_key client_id peer_key endpoint addresses reserved
-  WARP_OUT=""
-  private_key="$(jq -r '.private_key // empty' <<<"$data_json")"
-  client_id="$(jq -r '.client_id // empty' <<<"$data_json")"
-  peer_key="$(jq -r '.config.peers[0].public_key // empty' <<<"$config_json")"
-  endpoint="$(jq -r '.config.peers[0].endpoint.host // empty' <<<"$config_json")"
-  addresses="$(jq -nc --arg v4 "$(jq -r '.config.interface.addresses.v4 // empty' <<<"$config_json")" \
-    --arg v6 "$(jq -r '.config.interface.addresses.v6 // empty' <<<"$config_json")" \
-    '[$v4, $v6 | select(length > 0) | if contains(":") then . + "/128" else . + "/32" end]')"
-  [[ -n "$private_key" && -n "$client_id" && -n "$peer_key" && -n "$endpoint" && "$addresses" != "[]" ]] || return 1
-  reserved="$(printf '%s' "$client_id" | base64 -d 2>/dev/null | od -An -tu1 | awk 'BEGIN { printf "[" } { for (i=1; i<=NF; i++) { if (n++) printf ","; printf $i } } END { print "]" }')" || return 1
-  [[ "$reserved" != "[]" ]] || return 1
-  WARP_OUT="$(jq -nc --arg private "$private_key" --arg public "$peer_key" --arg endpoint "$endpoint" \
-    --argjson addresses "$addresses" --argjson reserved "$reserved" \
-    '{tag:"warp",protocol:"wireguard",settings:{mtu:1420,secretKey:$private,address:$addresses,reserved:$reserved,domainStrategy:"ForceIPv4v6",peers:[{publicKey:$public,endpoint:$endpoint}],noKernelTun:true}}')" || return 1
-}
 
 configure_warp_swap() {
   local memory_kib free_kib
@@ -338,7 +319,7 @@ if [[ "${ENABLE_WARP:-0}" -eq 1 ]]; then
     WARP_CONFIG_RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/config")"
     WARP_DATA="$(jq -c '.obj|if type=="string" then fromjson else . end' <<<"$WARP_DATA_RESPONSE")"
     WARP_CONFIG="$(jq -c '.obj|if type=="string" then fromjson else . end' <<<"$WARP_CONFIG_RESPONSE")"
-    if ! build_warp_outbound "$WARP_DATA" "$WARP_CONFIG"; then
+    if ! WARP_OUT="$(xhttp_build_warp_outbound "$WARP_DATA" "$WARP_CONFIG")"; then
       die "WARP account data is incomplete. WARP was requested, so repair cannot continue."
     else
       R="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/")"

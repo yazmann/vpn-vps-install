@@ -1203,7 +1203,7 @@ xhttp_update_hysteria() (
   }
   trap cleanup_hysteria_update EXIT
   trap 'exit 1' INT TERM HUP
-  xhttp_latest_release_asset apernet/hysteria "hysteria-linux-$arch" "$stage/hysteria" "$digest"
+  xhttp_latest_release_asset HyNetworks/hysteria "hysteria-linux-$arch" "$stage/hysteria" "$digest"
   [[ -f "$stage/hysteria" ]] || exit 0
   chmod 755 "$stage/hysteria"
   "$stage/hysteria" version >/dev/null
@@ -1403,6 +1403,10 @@ xhttp_install_nginx() (
   set -Eeuo pipefail
   local staging version target=/etc/nginx/sites-available/3xui-self-steal.conf
   local link=/etc/nginx/sites-enabled/3xui-self-steal.conf
+  if ! xhttp_prepare_staging_ca; then
+    printf "%s\n" "Could not verify the Let's Encrypt staging certificate." >&2
+    return 1
+  fi
   staging="$(mktemp -d /etc/nginx/xhttp-config.XXXXXXXX)"
   trap 'rm -f "$staging/new" "$staging/previous" "$staging/link" "$staging/default.pem" "$staging/default-key.pem"; rmdir "$staging"' EXIT
   [[ ! -d "$target" && ! -d "$link" ]] || return 1
@@ -1565,6 +1569,32 @@ random_port() {
     port_busy "$p" || { printf '%s' "$p"; return; }
   done
   return 1
+}
+
+xhttp_build_warp_outbound() {
+  local data_json="$1" config_json="$2" private_key client_id peer_key endpoint addresses reserved
+  local ipv4_endpoint ipv4 port
+  private_key="$(jq -r '.private_key // empty' <<<"$data_json")"
+  client_id="$(jq -r '.client_id // empty' <<<"$data_json")"
+  peer_key="$(jq -r '.config.peers[0].public_key // empty' <<<"$config_json")"
+  endpoint="$(jq -r '.config.peers[0].endpoint.host // empty' <<<"$config_json")"
+  ipv4_endpoint="$(jq -r '.config.peers[0].endpoint.v4 // empty' <<<"$config_json")"
+  # The VPS uses IPv4 and the account response can use port 0 as a placeholder.
+  ipv4="${ipv4_endpoint%%:*}"
+  port="${ipv4_endpoint#*:}"
+  if [[ "$ipv4_endpoint" != *:* || "$port" == 0 ]]; then port="${endpoint##*:}"; fi
+  if xhttp_valid_ipv4 "$ipv4" && [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 )); then
+    endpoint="$ipv4:$port"
+  fi
+  addresses="$(jq -nc --arg v4 "$(jq -r '.config.interface.addresses.v4 // empty' <<<"$config_json")" \
+    --arg v6 "$(jq -r '.config.interface.addresses.v6 // empty' <<<"$config_json")" \
+    '[$v4, $v6 | select(length > 0) | if contains(":") then . + "/128" else . + "/32" end]')"
+  [[ -n "$private_key" && -n "$client_id" && -n "$peer_key" && -n "$endpoint" && "$addresses" != "[]" ]] || return 1
+  reserved="$(printf '%s' "$client_id" | base64 -d 2>/dev/null | od -An -tu1 | awk 'BEGIN { printf "[" } { for (i=1; i<=NF; i++) { if (n++) printf ","; printf $i } } END { print "]" }')" || return 1
+  [[ "$reserved" != "[]" ]] || return 1
+  jq -nc --arg private "$private_key" --arg public "$peer_key" --arg endpoint "$endpoint" \
+    --argjson addresses "$addresses" --argjson reserved "$reserved" \
+    '{tag:"warp",protocol:"wireguard",settings:{mtu:1420,secretKey:$private,address:$addresses,reserved:$reserved,domainStrategy:"ForceIPv4v6",peers:[{publicKey:$public,endpoint:$endpoint}],noKernelTun:true}}'
 }
 
 xhttp_warp_config() {

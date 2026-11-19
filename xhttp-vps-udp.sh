@@ -274,7 +274,7 @@ xhttp_install_hysteria() (
   stage="$(mktemp -d)"
   trap 'rm -rf -- "$stage"' EXIT
   if [[ ! -x "$binary" ]]; then
-    xhttp_latest_release_asset apernet/hysteria "hysteria-linux-$arch" "$stage/hysteria"
+    xhttp_latest_release_asset HyNetworks/hysteria "hysteria-linux-$arch" "$stage/hysteria"
     install -m 755 "$stage/hysteria" "$binary"
   fi
   xhttp_render_hysteria_config > "$stage/config"

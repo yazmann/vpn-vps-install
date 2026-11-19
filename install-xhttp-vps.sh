@@ -1136,9 +1136,8 @@ if [[ ! -s "$CERT_DIR/fullchain.pem" || ! -s "$CERT_DIR/privkey.pem" ]]; then
   fi
 fi
 
-if xhttp_uses_panel; then
 [[ -s "$CERT_DIR/fullchain.pem" && -s "$CERT_DIR/privkey.pem" ]] || die "TLS certificate deployment failed."
-xhttp_prepare_staging_ca || die "Could not verify the Let's Encrypt staging certificate."
+if xhttp_uses_panel; then
 /usr/local/x-ui/x-ui cert -webCert "$CERT_DIR/fullchain.pem" -webCertKey "$CERT_DIR/privkey.pem" >/dev/null
 # The installer's result file is authoritative. Reading it also protects us
 # from future installer-side normalization of the port or web base path.
@@ -1305,24 +1304,6 @@ API_HEADER_FILE="$(xhttp_create_api_header_file "$PANEL_API_TOKEN")" \
 API_AUTH=(--cacert "$(xhttp_tls_ca_file)" --noproxy '*' --resolve "${DOMAIN}:${PANEL_PORT}:127.0.0.1" -H "@${API_HEADER_FILE}")
 trap 'rm -f "${API_HEADER_FILE:-}"' EXIT
 
-build_warp_outbound() {
-  local data_json="$1" config_json="$2" private_key client_id peer_key endpoint addresses reserved
-  WARP_OUT=""
-  private_key="$(jq -r '.private_key // empty' <<<"$data_json")"
-  client_id="$(jq -r '.client_id // empty' <<<"$data_json")"
-  peer_key="$(jq -r '.config.peers[0].public_key // empty' <<<"$config_json")"
-  endpoint="$(jq -r '.config.peers[0].endpoint.host // empty' <<<"$config_json")"
-  addresses="$(jq -nc --arg v4 "$(jq -r '.config.interface.addresses.v4 // empty' <<<"$config_json")" \
-    --arg v6 "$(jq -r '.config.interface.addresses.v6 // empty' <<<"$config_json")" \
-    '[$v4, $v6 | select(length > 0) | if contains(":") then . + "/128" else . + "/32" end]')"
-  [[ -n "$private_key" && -n "$client_id" && -n "$peer_key" && -n "$endpoint" && "$addresses" != "[]" ]] || return 1
-  reserved="$(printf '%s' "$client_id" | base64 -d 2>/dev/null | od -An -tu1 | awk 'BEGIN { printf "[" } { for (i=1; i<=NF; i++) { if (n++) printf ","; printf $i } } END { print "]" }')" || return 1
-  [[ "$reserved" != "[]" ]] || return 1
-  WARP_OUT="$(jq -nc --arg private "$private_key" --arg public "$peer_key" --arg endpoint "$endpoint" \
-    --argjson addresses "$addresses" --argjson reserved "$reserved" \
-    '{tag:"warp",protocol:"wireguard",settings:{mtu:1420,secretKey:$private,address:$addresses,reserved:$reserved,domainStrategy:"ForceIPv4v6",peers:[{publicKey:$public,endpoint:$endpoint}],noKernelTun:true}}')" || return 1
-}
-
 log "Waiting for the private IPv4 panel API and verifying its bearer token"
 API_READY=0; RESPONSE=""; API_HTTP_CODE="000"
 for _ in $(seq 1 15); do
@@ -1448,7 +1429,7 @@ if [[ "$ENABLE_WARP" -eq 1 ]]; then
     WARP_CONFIG_RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/config")"
     WARP_DATA="$(jq -c '.obj | if type=="string" then fromjson else . end' <<<"$WARP_DATA_RESPONSE")"
     WARP_CONFIG="$(jq -c '.obj | if type=="string" then fromjson else . end' <<<"$WARP_CONFIG_RESPONSE")"
-    if ! build_warp_outbound "$WARP_DATA" "$WARP_CONFIG"; then
+    if ! WARP_OUT="$(xhttp_build_warp_outbound "$WARP_DATA" "$WARP_CONFIG")"; then
       die "WARP account data is incomplete. WARP was requested, so installation cannot continue."
     else
       RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/")"
