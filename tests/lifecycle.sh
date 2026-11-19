@@ -8,7 +8,7 @@ xhttp_valid_ipv4 203.0.113.7
 xhttp_valid_ipv4 0.0.0.0
 if xhttp_valid_ipv4 256.1.1.1; then exit 1; fi
 if xhttp_valid_ipv4 1.2.3; then exit 1; fi
-if xhttp_valid_ipv4 '1.2.3.4 extra'; then exit 1; fi
+if xhttp_valid_ipv4 '203.0.113.7 extra'; then exit 1; fi
 xhttp_validate_single_dns_ipv4 203.0.113.7 <<<'203.0.113.7'
 xhttp_validate_single_dns_ipv4 203.0.113.7 <<<$'203.0.113.7\n203.0.113.7'
 if xhttp_validate_single_dns_ipv4 203.0.113.7 <<<$'203.0.113.7\n198.51.100.2'; then exit 1; fi
