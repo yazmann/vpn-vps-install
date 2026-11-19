@@ -387,8 +387,7 @@ if jq -e --arg d "$DOMAIN" --arg t "127.0.0.1:${FALLBACK_PORT}" --arg transport 
        else $s.network=="xhttp" and $s.xhttpSettings.host==$d and $s.xhttpSettings.path=="/" end))))
 ' <<<"$R" >/dev/null 2>&1; then INBOUND_OK=1; fi
 for _ in $(seq 1 20); do
-  COVER_DATA="$(curl -fsS --noproxy '*' --resolve "${DOMAIN}:443:127.0.0.1" --max-time 5 "https://${DOMAIN}/" 2>/dev/null || true)"
-  if grep -Fq "$DOMAIN" <<<"$COVER_DATA"; then SELF_STEAL_OK=1; break; fi
+  if xhttp_probe_cover_website 2>/dev/null; then SELF_STEAL_OK=1; break; fi
   sleep 1
 done
 if [[ "$INSTALL_MODE" == "standalone" ]]; then
@@ -522,7 +521,11 @@ if xhttp_probe_no_sni; then report "Missing SNI behavior" OK; else report "Missi
 if xhttp_probe_h2_alpn; then report "Fallback ALPN (HTTP/2)" OK; else report "Fallback ALPN (HTTP/2)" ERROR; fi
 HTTP_REDIRECT_HEADERS="$(curl -fsSI --resolve "${DOMAIN}:80:127.0.0.1" "http://${DOMAIN}/" 2>/dev/null || true)"
 if grep -Eiq "^location:[[:space:]]*https://${DOMAIN}/" <<<"$HTTP_REDIRECT_HEADERS"; then report "HTTP / ACME webroot" OK; else report "HTTP / ACME webroot" ERROR; fi
-if ss -H -ltn "sport = :$SUB_PORT" | grep -q .; then report "Subscription service" OK; else report "Subscription service" ERROR; fi
+if xhttp_verify_loopback_listener "$SUB_PORT"; then
+  report "Subscription service (loopback only)" OK
+else
+  report "Subscription service (loopback only)" ERROR
+fi
 if [[ "$INBOUND_OK" -eq 1 ]] && ss -H -ltn 'sport = :443' | grep -q .; then report "VPN Reality self-steal" OK; else report "VPN Reality self-steal" ERROR; fi
 if [[ "$INSTALL_MODE" == "standalone" ]]; then
   if [[ "$CLIENT_OK" -eq 1 ]]; then report "First VLESS client" OK; else report "First VLESS client" ERROR; fi
