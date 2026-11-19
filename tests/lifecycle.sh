@@ -252,6 +252,20 @@ SUB_PROFILE_MODE=builtin xhttp_subscription_profile_settings <<<"$profile" | jq 
 headers=$'HTTP/2 200\r\ncache-control: private, no-store\r\nreferrer-policy: no-referrer\r\n'
 SUB_PROFILE_MODE=none SUB_PRIVACY_HEADERS=true xhttp_verify_subscription_protection "$headers"
 if SUB_PROFILE_MODE=none xhttp_verify_subscription_protection "${headers}"$'profile-web-page-url: https://example.com/page\r\n'; then exit 1; fi
+(
+  curl() {
+    [[ "$1" == -q && "$2" == --user-agent && "${*: -1}" == https://example.com/sub/client ]] || return 1
+    case "$3" in
+      Happ) printf 'routing-enable: true\r\nrouting: happ://routing/onadd/test\r\n' ;;
+      INCY) printf '%s\n' "$incy_body" | base64 -w0 ;;
+      *) return 1 ;;
+    esac
+  }
+  incy_body='incy://routing/onadd/test'
+  xhttp_verify_subscription_routing example.com sub/client
+  incy_body='vless://test'
+  if xhttp_verify_subscription_routing example.com sub/client; then exit 1; fi
+)
 export XHTTP_NGINX_VERSION_OVERRIDE=1.26.0
 nginx="$(xhttp_render_nginx)"
 grep -Fq 'listen 127.0.0.1:12345 ssl;' <<<"$nginx"

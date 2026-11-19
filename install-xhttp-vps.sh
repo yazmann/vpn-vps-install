@@ -1537,13 +1537,9 @@ if [[ "$INSTALL_MODE" == "standalone" ]]; then
       "https://${DOMAIN}/${SUB_PATH}/${CLIENT_SUB_ID}" 2>/dev/null || true)"
     if [[ -n "$SUB_HEADERS" ]] && xhttp_verify_subscription_protection "$SUB_HEADERS"; then SUB_PROTECTION_VERIFIED=1; fi
   fi
-  if [[ "$CLIENT_ROUTING_CONFIGURED" -eq 1 && "$SUBSCRIPTION_VERIFIED" -eq 1 ]]; then
-    SUB_DECODED="$(printf '%s' "$SUB_RESPONSE" | base64 -d 2>/dev/null || true)"
-    if grep -qi '^Routing-Enable:[[:space:]]*true' <<<"$SUB_HEADERS" \
-      && grep -qi '^Routing:[[:space:]]*happ://routing/onadd/' <<<"$SUB_HEADERS" \
-      && grep -q 'incy://routing/onadd/' <<<"$SUB_DECODED"; then
-      CLIENT_ROUTING_VERIFIED=1
-    fi
+  if [[ "$CLIENT_ROUTING_CONFIGURED" -eq 1 && "$SUBSCRIPTION_VERIFIED" -eq 1 ]] \
+    && xhttp_verify_subscription_routing "$DOMAIN" "${SUB_PATH}/${CLIENT_SUB_ID}"; then
+    CLIENT_ROUTING_VERIFIED=1
   fi
   if [[ "$MIHOMO_CONFIGURED" -eq 1 ]]; then
     MIHOMO_RESPONSE="$(curl -kfsS --resolve "${DOMAIN}:443:127.0.0.1" --max-time 10 \

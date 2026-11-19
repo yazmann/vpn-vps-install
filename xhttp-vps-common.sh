@@ -292,6 +292,21 @@ xhttp_verify_subscription_protection() {
   esac
 }
 
+xhttp_verify_subscription_routing() {
+  local domain="$1" path="$2" headers body decoded
+  local url="https://${domain}/${path}"
+  # 3x-ui returns the routing profile for the requesting client.
+  headers="$(curl -q --user-agent Happ -kfsS --resolve "${domain}:443:127.0.0.1" \
+    --max-time 5 -D - -o /dev/null "$url")" || return 1
+  headers="${headers//$'\r'/}"
+  grep -Eiq '^routing-enable:[[:space:]]*true[[:space:]]*$' <<<"$headers" || return 1
+  grep -Eiq '^routing:[[:space:]]*happ://routing/onadd/' <<<"$headers" || return 1
+  body="$(curl -q --user-agent INCY -kfsS --resolve "${domain}:443:127.0.0.1" \
+    --max-time 5 "$url")" || return 1
+  decoded="$(printf '%s' "$body" | base64 -d)" || return 1
+  grep -Fq 'incy://routing/onadd/' <<<"$decoded"
+}
+
 xhttp_write_recovery_backup() (
   set -o pipefail
   umask 077
