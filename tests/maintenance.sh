@@ -5,32 +5,28 @@ cd "$(dirname "$0")/.."
 source ./xhttp-vps-common.sh
 
 export MAINTENANCE_TIMEZONE=Europe/Moscow
-reboot_timer="$(xhttp_render_maintenance_timer reboot)"
-grep -Fqx 'OnCalendar=Sun *-*-* 05:30:00 Europe/Moscow' <<<"$reboot_timer"
-grep -Fqx 'Persistent=false' <<<"$reboot_timer"
-grep -Fqx 'Unit=xhttp-vps-reboot.service' <<<"$reboot_timer"
+timer="$(xhttp_render_maintenance_timer)"
+grep -Fqx 'OnCalendar=*-*-* 05:30:00 Europe/Moscow' <<<"$timer"
+grep -Fqx 'Persistent=false' <<<"$timer"
+grep -Fqx 'Unit=xhttp-vps-maintenance.service' <<<"$timer"
 
 test_dir="$(mktemp -d)"
 export test_dir
 trap 'rm -rf "$test_dir"' EXIT
 (
-  xhttp_update_panel() { return "${UPDATE_STATUS:-0}"; }
+  xhttp_update_panel() {
+    printf 'vpn-release\n' >> "$test_dir/apt"
+    return "${UPDATE_STATUS:-0}"
+  }
   xhttp_wait_for_vpn_service() { [[ "${VPNSERVICE_HEALTHY:-1}" == 1 ]]; }
   xhttp_render_maintenance_script
 ) | sed \
-  -e "s#/run/xhttp-vps-maintenance.ok#$test_dir/completed#" \
   -e "s#/run/xhttp-vps-setup.lock#$test_dir/lock#" \
   -e "s#/var/run/reboot-required#$test_dir/reboot-required#" > "$test_dir/run"
 
 flock() { [[ "${LOCK_BUSY:-0}" == 0 ]]; }
 logger() { :; }
-date() {
-  case "$1" in
-    '+%u %H:%M') printf '%s\n' "${TEST_SLOT:-7 05:30}" ;;
-    +%F) printf '%s\n' '2026-11-22' ;;
-    *) return 1 ;;
-  esac
-}
+date() { [[ "$1" == +%u ]] && printf '%s\n' "${TEST_WEEKDAY:-1}"; }
 apt-get() {
   printf '%s\n' "${*: -1}" >> "$test_dir/apt"
   if [[ "${*: -1}" == "${FAIL_APT_ONCE:-}" && ! -e "$test_dir/apt-failed" ]]; then
@@ -39,55 +35,75 @@ apt-get() {
   fi
   [[ "${*: -1}" != "${FAIL_APT:-}" ]]
 }
+unattended-upgrade() {
+  printf 'security\n' >> "$test_dir/apt"
+  if [[ "${FAIL_SECURITY_ONCE:-0}" == 1 && ! -e "$test_dir/security-failed" ]]; then
+    touch "$test_dir/security-failed"
+    return 1
+  fi
+}
 dpkg() { :; }
 nginx() { [[ "${BAD_NGINX:-0}" == 0 ]]; }
 systemctl() {
   case "$*" in
-    '--no-block reboot') printf 'reboot\n' >> "$test_dir/reboots" ;;
+    '--no-block reboot') printf 'reboot\n' >> "$test_dir/apt" ;;
     'is-active --quiet apt-daily.service apt-daily-upgrade.service') [[ "${APT_ACTIVE:-0}" == 1 ]] ;;
     'is-active --quiet ssh.service ssh.socket') [[ "${NO_SSH:-0}" == 0 ]] ;;
     'is-active --quiet '*) return 0 ;;
     *) return 1 ;;
   esac
 }
-export -f flock logger date apt-get dpkg nginx systemctl
+export -f flock logger date apt-get unattended-upgrade dpkg nginx systemctl
 
-run_phase() { bash "$test_dir/run" "$1" "${2:-awg-quick@awg-vps}" Europe/Moscow 2020; }
+run_maintenance() {
+  : > "$test_dir/apt"
+  bash "$test_dir/run" "$1" "${2:-awg-quick@awg-vps}" Europe/Moscow 2020
+}
 
+assert_no_reboot() {
+  if grep -Fqx reboot "$test_dir/apt"; then return 1; fi
+}
+
+run_maintenance weekly x-ui
+cmp "$test_dir/apt" <(printf '%s\n' update security check)
 touch "$test_dir/reboot-required"
-run_phase reboot
-[[ ! -e "$test_dir/reboots" ]]
-FAIL_APT=autoremove run_phase upgrade && exit 1
-[[ ! -e "$test_dir/completed" ]]
-run_phase reboot
-[[ ! -e "$test_dir/reboots" ]]
-: > "$test_dir/apt"
-run_phase upgrade
-cmp "$test_dir/apt" <(printf '%s\n' update upgrade autoremove autoclean check)
-grep -Fqx '2026-11-22' "$test_dir/completed"
-[[ ! -e "$test_dir/reboots" ]]
+run_maintenance weekly
+cmp "$test_dir/apt" <(printf '%s\n' update security check reboot)
+TEST_WEEKDAY=7 run_maintenance security x-ui
+cmp "$test_dir/apt" <(printf '%s\n' update security check)
+TEST_WEEKDAY=7 run_maintenance weekly x-ui
+cmp "$test_dir/apt" <(printf '%s\n' update security upgrade autoremove autoclean vpn-release check reboot)
 
-TEST_SLOT='7 05:31' run_phase reboot
-LOCK_BUSY=1 run_phase reboot
-APT_ACTIVE=1 run_phase reboot
-BAD_NGINX=1 run_phase reboot && exit 1
-NO_SSH=1 run_phase reboot && exit 1
-rm -f "$test_dir/reboot-required"
-run_phase reboot
-[[ ! -e "$test_dir/reboots" ]]
+LOCK_BUSY=1 run_maintenance weekly
+[[ ! -s "$test_dir/apt" ]]
+APT_ACTIVE=1 run_maintenance weekly
+cmp "$test_dir/apt" <(printf '%s\n' update security check)
+if BAD_NGINX=1 run_maintenance weekly; then exit 1; fi
+assert_no_reboot
+if NO_SSH=1 run_maintenance weekly; then exit 1; fi
+assert_no_reboot
+if TEST_WEEKDAY=7 FAIL_APT=autoremove run_maintenance weekly; then exit 1; fi
+assert_no_reboot
 
-touch "$test_dir/reboot-required"
-run_phase reboot
-grep -Fqx reboot "$test_dir/reboots"
+FAIL_SECURITY_ONCE=1 run_maintenance weekly
+cmp "$test_dir/apt" <(printf '%s\n' update security install check security check reboot)
+TEST_WEEKDAY=7 FAIL_APT_ONCE=upgrade UPDATE_STATUS=1 run_maintenance weekly x-ui
+cmp "$test_dir/apt" <(printf '%s\n' update security upgrade install check upgrade autoremove autoclean vpn-release check reboot)
+if TEST_WEEKDAY=7 VPNSERVICE_HEALTHY=0 UPDATE_STATUS=1 run_maintenance weekly x-ui; then exit 1; fi
+assert_no_reboot
+if TEST_WEEKDAY=7 UPDATE_STATUS=70 run_maintenance weekly x-ui; then exit 1; fi
+assert_no_reboot
 
-: > "$test_dir/apt"
-FAIL_APT_ONCE=upgrade UPDATE_STATUS=1 run_phase upgrade x-ui
-cmp "$test_dir/apt" <(printf '%s\n' update upgrade install check upgrade autoremove autoclean check)
-[[ -s "$test_dir/completed" ]]
-if VPNSERVICE_HEALTHY=0 UPDATE_STATUS=1 run_phase upgrade x-ui; then exit 1; fi
-[[ ! -e "$test_dir/completed" ]]
-if UPDATE_STATUS=70 run_phase upgrade x-ui; then exit 1; fi
-[[ ! -e "$test_dir/completed" ]]
+# Check the actual APT fragments without replacing the runner's configuration.
+eval "$(declare -f xhttp_configure_automatic_updates | sed "s#/etc/apt/apt.conf.d#$test_dir#g")"
+xhttp_install_maintenance() { :; }
+MAINTENANCE_MODE=weekly xhttp_configure_automatic_updates
+apt_policy="$(cat "$test_dir/52xhttp-vps-auto-upgrades" "$test_dir/53xhttp-vps-unattended-upgrades")"
+printf '%s\n' "$apt_policy" > "$test_dir/apt.conf"
+effective_policy="$(apt-config -c "$test_dir/apt.conf" dump)"
+grep -Fqx 'APT::Periodic::Enable "0";' <<<"$effective_policy"
+grep -Fqx 'Unattended-Upgrade::Allowed-Origins:: "${distro_id}:${distro_codename}-security";' <<<"$effective_policy"
+grep -Fqx 'Unattended-Upgrade::Automatic-Reboot "false";' <<<"$effective_policy"
 
 # Exercise binary deployment and SQLite rollback without touching system services.
 eval "$(declare -f xhttp_update_panel xhttp_update_hysteria | sed \
@@ -151,4 +167,4 @@ if ATTEMPT=fail bash -c 'xhttp_update_hysteria'; then exit 1; fi
 grep -Fqx '# old' "$test_dir/bin/xhttp-vps-hysteria"
 bash -c 'xhttp_update_hysteria'
 grep -Fqx '# new' "$test_dir/bin/xhttp-vps-hysteria"
-printf 'Weekly maintenance tests passed.\n'
+printf 'Scheduled maintenance tests passed.\n'
