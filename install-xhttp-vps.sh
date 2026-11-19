@@ -55,6 +55,17 @@ COMMON_SCRIPT="$(dirname "$(readlink -f "$0")")/xhttp-vps-common.sh"
 [[ -r "$COMMON_SCRIPT" ]] || die "Place xhttp-vps-common.sh alongside this installer."
 # shellcheck source=xhttp-vps-common.sh
 source "$COMMON_SCRIPT"
+UDP_SCRIPT="$(dirname "$COMMON_SCRIPT")/xhttp-vps-udp.sh"
+if [[ -r "$UDP_SCRIPT" ]]; then
+  # shellcheck source=xhttp-vps-udp.sh
+  source "$UDP_SCRIPT"
+fi
+MIGRATION_SCRIPT="$(dirname "$COMMON_SCRIPT")/xhttp-vps-migrate.sh"
+if [[ -r "$MIGRATION_SCRIPT" ]]; then
+  # shellcheck source=xhttp-vps-migrate.sh
+  source "$MIGRATION_SCRIPT"
+fi
+xhttp_lock || die "Another setup or repair is already running."
 
 remove_installation() {
   local script_path answer expected
@@ -73,34 +84,44 @@ remove_installation() {
   xhttp_validate_state && [[ -f "$MANAGED_BACKUP/ready" ]] \
     || die "This installation has no valid ownership journal. Automatic removal is disabled; preserve the state and remove legacy components manually."
   xhttp_validate_ownership_journal || die "Ownership journal contains an invalid managed path or index."
-  systemctl disable --now x-ui 2>/dev/null || true
+  local service
+  service="$(xhttp_service_name)"
+  if systemctl is-active --quiet "$service"; then systemctl stop "$service"; fi
+  systemctl disable "$service" 2>/dev/null || true
+  systemctl disable --now xhttp-vps-cert-renew.timer 2>/dev/null || true
+  if systemctl is-active --quiet xhttp-vps-cert-renew.service; then
+    systemctl stop xhttp-vps-cert-renew.service
+  fi
   systemctl disable --now xhttp-vps-maintenance.timer 2>/dev/null || true
-  if command -v fail2ban-client >/dev/null; then fail2ban-client stop xhttp-vps-panel >/dev/null 2>&1 || true; fi
-  xhttp_restore_owned_files
-  systemctl daemon-reload
+  if [[ "${TRANSPORT:-}" == amneziawg && -x /usr/local/sbin/xhttp-vps-awg-firewall ]]; then
+    /usr/local/sbin/xhttp-vps-awg-firewall down
+  fi
+  if xhttp_uses_panel && command -v fail2ban-client >/dev/null; then fail2ban-client stop xhttp-vps-panel >/dev/null 2>&1 || true; fi
   # Shared services, ACME accounts, SSH access, packages and swap are retained.
   # Delete only rules carrying this installation's unique marker.
   if command -v ufw >/dev/null; then
-    while IFS= read -r rule_number; do
-      ufw --force delete "$rule_number"
-    done < <(ufw status numbered | awk -v marker="# xhttp-vps:${SAFE_INSTANCE} " '
-      index($0,marker) {sub(/^\[[[:space:]]*/, ""); sub(/\].*$/, ""); print}
-    ' | sort -rn)
+    xhttp_delete_firewall_rules "xhttp-vps:${SAFE_INSTANCE}"
   fi
-  if command -v nginx >/dev/null && nginx -t; then systemctl reload nginx || true; fi
-  if command -v fail2ban-client >/dev/null; then fail2ban-client reload >/dev/null 2>&1 || true; fi
-  if [[ -x /root/.acme.sh/acme.sh ]]; then
+  if [[ "${ACME_CLIENT:-}" != certbot && -x /root/.acme.sh/acme.sh ]]; then
     /root/.acme.sh/acme.sh --remove -d "$DOMAIN" || true
     /root/.acme.sh/acme.sh --remove -d "$DOMAIN" --ecc || true
   fi
+  xhttp_restore_owned_files
+  systemctl daemon-reload
+  if command -v nginx >/dev/null && nginx -t; then systemctl reload nginx || true; fi
+  if command -v fail2ban-client >/dev/null; then fail2ban-client reload >/dev/null 2>&1 || true; fi
   # Restore recorded runtime values only while they still match our settings.
   [[ "$(sysctl -n net.core.default_qdisc)" != fq ]] || sysctl -w "net.core.default_qdisc=${PREV_QDISC:-fq_codel}" >/dev/null
   [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" != bbr ]] || sysctl -w "net.ipv4.tcp_congestion_control=${PREV_CC:-cubic}" >/dev/null
   [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6)" != 1 ]] || sysctl -w "net.ipv6.conf.all.disable_ipv6=${PREV_IPV6_ALL:-0}" >/dev/null
   [[ "$(sysctl -n net.ipv6.conf.default.disable_ipv6)" != 1 ]] || sysctl -w "net.ipv6.conf.default.disable_ipv6=${PREV_IPV6_DEFAULT:-0}" >/dev/null
   [[ "$(sysctl -n net.ipv6.conf.lo.disable_ipv6)" != 1 ]] || sysctl -w "net.ipv6.conf.lo.disable_ipv6=${PREV_IPV6_LO:-0}" >/dev/null
+  if [[ "${TRANSPORT:-}" == amneziawg && "$(sysctl -n net.ipv4.ip_forward)" == 1 ]]; then
+    sysctl -w "net.ipv4.ip_forward=${PREV_IPV4_FORWARD:-0}" >/dev/null
+  fi
   sysctl --system >/dev/null || true
-  rm -f -- "${states[0]}" /root/finish-xhttp-vps.sh /root/xhttp-vps-common.sh /root/optimize-xhttp-memory.sh
+  rm -f -- "${states[0]}" /root/finish-xhttp-vps.sh /root/xhttp-vps-common.sh /root/optimize-xhttp-memory.sh \
+    /root/xhttp-vps-udp.sh /root/xhttp-vps-migrate.sh
   printf '%s\n' 'Removal completed without an archive. Packages, swap, the current SSH policy, the SSH firewall rule and the shared ACME client were retained.'
   [[ "$script_path" != /root/install-xhttp-vps.sh ]] || rm -f -- "$script_path"
 }
@@ -126,6 +147,7 @@ show_current_settings() {
 }
 
 RESUMING=0
+REPAIRING_UDP=0
 if [[ "${1:-}" == --resume ]]; then
   RESUMING=1
   mapfile -t RESUME_STATES < <(find /root -maxdepth 1 -type f \( -name '3xui-vps-*.env' -o -name '3xui-node-*.env' \) -print)
@@ -139,7 +161,11 @@ if [[ "${1:-}" == --resume ]]; then
   : "${PANEL_ACCESS_MODE:=public}"
   : "${PANEL_ALLOWED_IP:=}"
   : "${TRANSPORT:=xhttp}"
-  : "${INBOUND_TAG:=$(xhttp_inbound_tag_for "$TRANSPORT")}"
+  if xhttp_uses_panel; then : "${INBOUND_TAG:=$(xhttp_inbound_tag_for "$TRANSPORT")}"; fi
+  : "${UDP_PORT:=}" "${HY_PASSWORD:=}"
+  : "${ACME_CLIENT:=acme.sh}"
+  : "${MIGRATION_DB:=}" "${MIGRATION_INBOUND:=}"
+  : "${SUB_ENCRYPT_LINKS:=}"
   : "${MAINTENANCE_TIMEZONE:=Europe/Moscow}"
   : "${MAINTENANCE_MODE:=weekly}"
   : "${TWO_FACTOR_GUIDE:=0}"
@@ -152,8 +178,13 @@ if [[ "${1:-}" == --resume ]]; then
   : "${ADMIN_KEY_FINGERPRINTS:=}"
   : "${NODE_API_TOKEN:=}"
   xhttp_validate_state && [[ -f "$MANAGED_BACKUP/ready" ]] || die "Resume requires the ownership journal from this installer version."
-  if [[ "${INSTALL_PHASE:-bootstrap}" != bootstrap ]]; then exec "$RECOVERY_SCRIPT"; fi
   CERT_DIR="/root/cert/$DOMAIN"
+  if [[ "${INSTALL_PHASE:-bootstrap}" != bootstrap ]]; then
+    if xhttp_uses_panel; then exec "$RECOVERY_SCRIPT"; fi
+    if [[ -s "$CERT_DIR/fullchain.pem" && -s "$CERT_DIR/privkey.pem" && -s /var/www/3xui-cover/index.html ]]; then
+      REPAIRING_UDP=1
+    fi
+  fi
   # shellcheck disable=SC1091
   source /etc/os-release
   UBUNTU_VERSION="$VERSION_ID"
@@ -168,7 +199,7 @@ if [[ ${#MENU_STATE_FILES[@]} -eq 1 ]]; then
   fi
 fi
 
-printf '\nVLESS VPS Setup\n\n'
+printf '\nVPN VPS Setup\n\n'
 if [[ ${#MENU_STATE_FILES[@]} -eq 1 ]]; then
   if [[ "$HAS_CURRENT_SETTINGS" -eq 1 ]]; then
     printf 'Existing installation:\n1) Show current settings (default)\n2) Verify and repair\n3) Permanently remove VPN (no archive)\n0) Exit\n'
@@ -195,18 +226,28 @@ if [[ ${#MENU_STATE_FILES[@]} -eq 1 ]]; then
 elif [[ ${#MENU_STATE_FILES[@]} -gt 1 ]]; then
   die "Multiple installer state files were found in /root. Resolve them manually before continuing."
 else
-  printf 'New VPS:\n1) Install standalone VPN (default)\n2) Install remote node\n0) Exit\n'
+  printf 'New VPS:\n1) Install standalone VPN (default)\n2) Install remote node\n3) Install standalone VPN and import VLESS users from a 3x-ui SQLite backup\n0) Exit\n'
   read -rp "Select [1]: " ACTION
   ACTION="${ACTION:-1}"
+  MIGRATION_DB=''
+  MIGRATION_INBOUND=''
   case "$ACTION" in
     1) INSTALL_MODE="standalone" ;;
     2) INSTALL_MODE="node" ;;
+    3)
+      INSTALL_MODE=standalone
+      [[ -r "$MIGRATION_SCRIPT" ]] || die "Place xhttp-vps-migrate.sh alongside this installer."
+      read -rp "Path to the source 3x-ui SQLite backup: " MIGRATION_DB
+      MIGRATION_DB="$(realpath -e -- "$MIGRATION_DB")" || die "SQLite backup does not exist."
+      [[ -f "$MIGRATION_DB" && -r "$MIGRATION_DB" ]] || die "SQLite backup is not a readable file."
+      ;;
     0) exit 0 ;;
     *) die "Unknown menu item: $ACTION" ;;
   esac
 fi
 
 TLS_MODE="production"
+ACME_CLIENT=certbot
 printf '%bTLS:%b production Lets Encrypt certificate (required).\n' "$cyan" "$plain"
 
 [[ -r /etc/os-release ]] || die "Cannot identify the operating system."
@@ -291,17 +332,43 @@ VPN_NAME="${VPN_NAME:-$DEFAULT_VPN_NAME}"
 [[ ${#VPN_NAME} -ge 1 && ${#VPN_NAME} -le 64 ]] || die "${NAME_LABEL} must contain 1-64 characters."
 if LC_ALL=C grep -q '[[:cntrl:]]' <<<"$VPN_NAME"; then die "${NAME_LABEL} contains control characters."; fi
 
+printf '%s\n' 'VPN transport:' '  1) Vision (default), TCP/443' '  2) XHTTP, TCP/443'
+if [[ "$INSTALL_MODE" == standalone && -z "$MIGRATION_DB" ]]; then
+  printf '%s\n' '  3) AmneziaWG, UDP' '  4) Hysteria 2, UDP/443'
+fi
+read -rp "Select transport [1]: " TRANSPORT_CHOICE
+case "${TRANSPORT_CHOICE:-1}" in
+  1) TRANSPORT=vision ;;
+  2) TRANSPORT=xhttp ;;
+  3) TRANSPORT=amneziawg ;;
+  4) TRANSPORT=hysteria2 ;;
+  *) die "Unknown transport choice: ${TRANSPORT_CHOICE}" ;;
+esac
+if ! xhttp_uses_panel; then
+  [[ "$INSTALL_MODE" != node ]] || die "Remote nodes require Vision or XHTTP."
+  [[ -z "$MIGRATION_DB" ]] || die "3x-ui client import requires Vision or XHTTP."
+fi
+UDP_PORT=''
+HY_PASSWORD=''
+INBOUND_TAG=''
+PANEL_ACCESS_MODE=''
+PANEL_ALLOWED_IP=''
+TWO_FACTOR_GUIDE=0
+ENABLE_WARP=0
+SUB_ENCRYPT_LINKS=''
+if xhttp_uses_panel; then
+INBOUND_TAG="$(xhttp_inbound_tag_for "$TRANSPORT")"
 cat <<'EOF'
 Panel access:
-  1) Public Internet (default)
+  1) Public Internet
      Open the panel from any device.
   2) Trusted IPv4 only
      For a fixed administrator or main-panel IP.
-  3) Localhost only
+  3) Localhost only (default)
      Connect through an SSH tunnel or Tailscale.
 EOF
-read -rp "Select panel access [1]: " PANEL_ACCESS_CHOICE
-PANEL_ACCESS_CHOICE="${PANEL_ACCESS_CHOICE:-1}"
+read -rp "Select panel access [3]: " PANEL_ACCESS_CHOICE
+PANEL_ACCESS_CHOICE="${PANEL_ACCESS_CHOICE:-3}"
 PANEL_ALLOWED_IP=""
 case "$PANEL_ACCESS_CHOICE" in
   1)
@@ -331,21 +398,14 @@ case "$TWO_FACTOR_CHOICE" in
   *) die "Unknown 2FA choice: ${TWO_FACTOR_CHOICE}" ;;
 esac
 
-cat <<'EOF'
-VPN transport on TCP/443:
-  1) Vision (default)
-     Fast and mature TCP transport.
-  2) XHTTP
-     Alternative HTTP transport with XMUX.
-EOF
-read -rp "Select transport [1]: " TRANSPORT_CHOICE
-TRANSPORT_CHOICE="${TRANSPORT_CHOICE:-1}"
-case "$TRANSPORT_CHOICE" in
-  1) TRANSPORT="vision" ;;
-  2) TRANSPORT="xhttp" ;;
-  *) die "Unknown transport choice: ${TRANSPORT_CHOICE}" ;;
-esac
-INBOUND_TAG="$(xhttp_inbound_tag_for "$TRANSPORT")"
+if [[ "$INSTALL_MODE" == standalone ]]; then
+  read -rp "Generate encrypted HAPP and INCY subscription links? [Y/n]: " ENCRYPT_LINKS_CHOICE
+  case "${ENCRYPT_LINKS_CHOICE,,}" in
+    ''|y|yes) SUB_ENCRYPT_LINKS=true ;;
+    n|no) SUB_ENCRYPT_LINKS=false ;;
+    *) die "Enter yes or no for encrypted subscription links." ;;
+  esac
+fi
 
 read -rp "Use Cloudflare WARP as an extra exit for Russian resources (domains and IPs)? [Y/n]: " WARP_ANSWER
 WARP_ANSWER="${WARP_ANSWER//$'\r'/}"
@@ -361,6 +421,21 @@ case "${WARP_ANSWER:-y}" in
     die "Expected yes/y or no/n for Cloudflare WARP routing; received ${SHOWN_WARP_ANSWER}. Press Enter for yes."
     ;;
 esac
+else
+  [[ -r "$UDP_SCRIPT" ]] || die "Place xhttp-vps-udp.sh alongside this installer."
+  case "$TRANSPORT" in
+    amneziawg)
+      [[ ! -e /etc/amnezia/amneziawg/awg-vps.conf && ! -e /etc/xhttp-vps-awg ]] || die "An unmanaged AmneziaWG configuration already exists."
+      UDP_PORT="$(xhttp_udp_random_port)" || die "Could not select a free UDP port."
+      ;;
+    hysteria2)
+      [[ ! -e /etc/xhttp-vps-hysteria.yaml && ! -e /etc/systemd/system/xhttp-vps-hysteria.service && ! -e /usr/local/bin/xhttp-vps-hysteria ]] || die "An unmanaged Hysteria configuration already exists."
+      UDP_PORT=443
+      HY_PASSWORD="$(random_hex 32)"
+      ;;
+  esac
+  xhttp_udp_port_busy "$UDP_PORT" && die "UDP/${UDP_PORT} is already occupied."
+fi
 
 cat <<'EOF'
 Cover-site design:
@@ -491,6 +566,22 @@ case "$MAINTENANCE_CHOICE" in
 esac
 
 
+PANEL_PORT=''
+SUB_PORT=''
+FALLBACK_PORT=''
+PANEL_PATH=''
+SUB_PATH=''
+PANEL_USERNAME=''
+PANEL_PASSWORD=''
+PANEL_API_TOKEN=''
+NODE_API_TOKEN=''
+CLIENT_UUID=''
+CLIENT_SUB_ID=''
+CLIENT_EMAIL=''
+SUB_JSON_PATH=''
+SUB_CLASH_PATH=''
+MIHOMO_ROUTING_PATH=''
+if xhttp_uses_panel; then
 PANEL_PORT="$(random_port)"
 while :; do SUB_PORT="$(random_port)"; [[ "$SUB_PORT" != "$PANEL_PORT" ]] && break; done
 while :; do FALLBACK_PORT="$(random_port)"; [[ "$FALLBACK_PORT" != "$PANEL_PORT" && "$FALLBACK_PORT" != "$SUB_PORT" ]] && break; done
@@ -510,9 +601,11 @@ if [[ "$INSTALL_MODE" == "standalone" ]]; then
   CLIENT_UUID="$(cat /proc/sys/kernel/random/uuid)"
   CLIENT_SUB_ID="$(random_hex 8)"
   CLIENT_EMAIL="${INSTANCE_NAME}-primary"
+  if [[ -n "$MIGRATION_DB" ]]; then CLIENT_EMAIL="probe-$(random_hex 8)-primary"; fi
   SUB_JSON_PATH="json-$(random_hex 10)"
   SUB_CLASH_PATH="mihomo-$(random_hex 10)"
   MIHOMO_ROUTING_PATH="mihomo-routing-$(random_hex 10).yaml"
+fi
 fi
 SAFE_INSTANCE="$(printf '%s' "$INSTANCE_NAME" | tr -cs 'A-Za-z0-9_-' '_')"
 if [[ "$INSTALL_MODE" == "node" ]]; then
@@ -527,6 +620,7 @@ PREV_CC="$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || echo cub
 PREV_IPV6_ALL="$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 0)"
 PREV_IPV6_DEFAULT="$(cat /proc/sys/net/ipv6/conf/default/disable_ipv6 2>/dev/null || echo 0)"
 PREV_IPV6_LO="$(cat /proc/sys/net/ipv6/conf/lo/disable_ipv6 2>/dev/null || echo 0)"
+PREV_IPV4_FORWARD="$(sysctl -n net.ipv4.ip_forward)"
 UFW_WAS_ACTIVE=0
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
   UFW_WAS_ACTIVE=1
@@ -542,7 +636,7 @@ SWAP_CREATED_BY_SCRIPT=0
 if command -v ufw >/dev/null; then
   ufw status 2>/dev/null | grep -Eq "(^|[[:space:]])80/tcp([[:space:]]|$)" && UFW_HTTP_RULE_EXISTED=1
   ufw status 2>/dev/null | grep -Eq "(^|[[:space:]])443/tcp([[:space:]]|$)" && UFW_HTTPS_RULE_EXISTED=1
-  ufw status 2>/dev/null | grep -Eq "(^|[[:space:]])${PANEL_PORT}/tcp([[:space:]]|$)" && UFW_PANEL_RULE_EXISTED=1
+  if [[ -n "$PANEL_PORT" ]] && ufw status 2>/dev/null | grep -Eq "(^|[[:space:]])${PANEL_PORT}/tcp([[:space:]]|$)"; then UFW_PANEL_RULE_EXISTED=1; fi
 fi
 
 fi
@@ -551,6 +645,17 @@ install_recovery_script() {
   local temporary_file source_file
   if [[ "$COMMON_SCRIPT" != /root/xhttp-vps-common.sh ]]; then
     install -m 700 "$COMMON_SCRIPT" /root/xhttp-vps-common.sh
+  fi
+  if [[ "$UDP_SCRIPT" != /root/xhttp-vps-udp.sh && -r "$UDP_SCRIPT" ]]; then
+    install -m 700 "$UDP_SCRIPT" /root/xhttp-vps-udp.sh
+  fi
+  if [[ "$MIGRATION_SCRIPT" != /root/xhttp-vps-migrate.sh && -r "$MIGRATION_SCRIPT" ]]; then
+    install -m 700 "$MIGRATION_SCRIPT" /root/xhttp-vps-migrate.sh
+  fi
+  local installer
+  installer="$(readlink -f "$0")"
+  if [[ "$installer" != /root/install-xhttp-vps.sh ]]; then
+    install -m 700 "$installer" /root/install-xhttp-vps.sh
   fi
   temporary_file="${RECOVERY_SCRIPT}.new"
   source_file="$(dirname "$(readlink -f "$0")")/finish-xhttp-vps.sh"
@@ -623,7 +728,7 @@ INSTALL_PHASE=${INSTALL_PHASE:-bootstrap}
 MANAGED_BACKUP=${MANAGED_BACKUP:-}
 SAFE_INSTANCE=${SAFE_INSTANCE}
 COVER_LABEL=$(printf '%q' "${COVER_LABEL:-Cover site}")
-XUI_VERSION=${XUI_VERSION:-}
+ACME_CLIENT=${ACME_CLIENT}
 DOMAIN=${DOMAIN}
 PUBLIC_IP=${PUBLIC_IP}
 PANEL_PORT=${PANEL_PORT}
@@ -632,7 +737,11 @@ PANEL_ACCESS_MODE=${PANEL_ACCESS_MODE}
 PANEL_ALLOWED_IP=${PANEL_ALLOWED_IP}
 TWO_FACTOR_GUIDE=${TWO_FACTOR_GUIDE}
 TRANSPORT=${TRANSPORT}
-INBOUND_TAG=${INBOUND_TAG}
+UDP_PORT=${UDP_PORT}
+HY_PASSWORD=${HY_PASSWORD}
+MIGRATION_DB=$(printf '%q' "$MIGRATION_DB")
+MIGRATION_INBOUND=${MIGRATION_INBOUND}
+INBOUND_TAG=${INBOUND_TAG:-}
 ADMIN_USER=${ADMIN_USER}
 ADMIN_KEYS_B64=${ADMIN_KEYS_B64}
 ADMIN_KEY_FINGERPRINTS=${ADMIN_KEY_FINGERPRINTS}
@@ -644,6 +753,7 @@ SUB_PORT=${SUB_PORT}
 SUB_PATH=${SUB_PATH}
 SUB_JSON_PATH=${SUB_JSON_PATH}
 SUB_CLASH_PATH=${SUB_CLASH_PATH}
+SUB_ENCRYPT_LINKS=${SUB_ENCRYPT_LINKS}
 MIHOMO_ROUTING_PATH=${MIHOMO_ROUTING_PATH}
 FALLBACK_PORT=${FALLBACK_PORT}
 PANEL_USERNAME=${PANEL_USERNAME}
@@ -663,6 +773,7 @@ PREV_CC=${PREV_CC}
 PREV_IPV6_ALL=${PREV_IPV6_ALL}
 PREV_IPV6_DEFAULT=${PREV_IPV6_DEFAULT}
 PREV_IPV6_LO=${PREV_IPV6_LO}
+PREV_IPV4_FORWARD=${PREV_IPV4_FORWARD:-0}
 UFW_WAS_ACTIVE=${UFW_WAS_ACTIVE}
 SSH_PORT=${SSH_PORT}
 UFW_SSH_RULE_EXISTED=${UFW_SSH_RULE_EXISTED}
@@ -692,14 +803,24 @@ Configuration summary
   SSH login:     ${ADMIN_USER}${ADMIN_KEY_FINGERPRINTS:+ (${ADMIN_KEY_FINGERPRINTS})}
   SSH policy:    $(xhttp_ssh_access_label "$SSH_ACCESS_MODE")
   Transport:     $(xhttp_transport_label "$TRANSPORT")
+EOF
+if xhttp_uses_panel; then
+cat <<EOF
   Panel port:    ${PANEL_PORT}
   Panel access:  ${PANEL_ACCESS_MODE}$([[ -n "$PANEL_ALLOWED_IP" ]] && printf ' (%s only)' "$PANEL_ALLOWED_IP")
   Subscription:  ${SUB_PORT} (local only)
   Self-steal:    127.0.0.1:${FALLBACK_PORT}
-  Cover site:    ${COVER_LABEL}
   WARP for RU:   $([[ "$ENABLE_WARP" -eq 1 ]] && echo yes || echo no)
+EOF
+else
+  printf '  VPN port:      %s/UDP\n' "$UDP_PORT"
+fi
+cat <<EOF
+  Cover site:    ${COVER_LABEL}
   Maintenance:   $(xhttp_maintenance_label "$MAINTENANCE_MODE")
 EOF
+if [[ -n "$MIGRATION_DB" ]]; then printf '  User backup:   %s\n' "$MIGRATION_DB"; fi
+if [[ -n "$SUB_ENCRYPT_LINKS" ]]; then printf '  Encrypted links: %s\n' "$SUB_ENCRYPT_LINKS"; fi
 read -rp "Start installation? [y/N]: " CONFIRM
 [[ "$CONFIRM" =~ ^[Yy]$ ]] || die "Cancelled."
 MANAGED_BACKUP="$(mktemp -d /root/xhttp-managed.XXXXXXXX)"
@@ -709,7 +830,26 @@ xhttp_record_ownership
 INSTALL_PHASE=bootstrap
 write_state
 fi
+if [[ "$ACME_CLIENT" == acme.sh && ! -x /root/.acme.sh/acme.sh ]]; then
+  ACME_CLIENT=certbot
+  write_state
+fi
 xhttp_record_ownership || die "Could not validate or extend the managed-file ownership journal."
+
+if [[ "$REPAIRING_UDP" == 1 ]]; then
+  [[ -r "$UDP_SCRIPT" ]] || die "UDP transport helpers are missing."
+  log "Repairing $(xhttp_transport_label "$TRANSPORT")"
+  xhttp_install_nginx
+  systemctl enable --now nginx
+  systemctl reload nginx
+  xhttp_configure_automatic_updates
+  xhttp_install_cert_renewal
+  xhttp_install_fail2ban_sshd
+  if [[ "$SSH_HARDENING" == 1 ]]; then xhttp_harden_sshd; fi
+  xhttp_udp_finish
+  write_state
+  exit 0
+fi
 
 log "Repairing package state and fully upgrading the fresh Ubuntu system"
 export DEBIAN_FRONTEND=noninteractive
@@ -724,7 +864,11 @@ UBUNTU_UPGRADE_OK=1
 
 log "Checking availability and installing required packages"
 
-REQUIRED_PACKAGES=(ca-certificates cron curl fail2ban iproute2 jq nginx openssh-server openssl procps socat sqlite3 sudo tar ufw unattended-upgrades unzip util-linux wget wireguard-tools)
+REQUIRED_PACKAGES=(ca-certificates cron curl fail2ban iproute2 jq nginx openssh-server openssl procps sudo tar ufw unattended-upgrades util-linux)
+if xhttp_uses_panel; then REQUIRED_PACKAGES+=(socat sqlite3 unzip wget wireguard-tools); fi
+if [[ "$SUB_ENCRYPT_LINKS" == true ]]; then REQUIRED_PACKAGES+=(nodejs); fi
+if [[ "$ACME_CLIENT" == certbot ]]; then REQUIRED_PACKAGES+=(certbot); fi
+if [[ "$TRANSPORT" == amneziawg ]]; then REQUIRED_PACKAGES+=(gnupg iptables); fi
 OPTIONAL_PACKAGES=(htop lsof)
 INSTALL_PACKAGES=()
 MISSING_PACKAGES=()
@@ -763,8 +907,22 @@ done
 write_state
 apt-get -o DPkg::Lock::Timeout=300 install -y --no-install-recommends "${INSTALL_PACKAGES[@]}"
 write_state
+if [[ -n "$MIGRATION_DB" && ! -s "$MANAGED_BACKUP/migration.json" ]]; then
+  log "Reading the SQLite client backup"
+  [[ -r "$MIGRATION_SCRIPT" ]] || die "SQLite migration helpers are missing."
+  while :; do
+    if xhttp_migration_snapshot "$MIGRATION_DB" "$MIGRATION_INBOUND" "$(xhttp_transport_flow "$TRANSPORT")" "$MANAGED_BACKUP/migration.json"; then
+      break
+    else
+      [[ "$?" == 2 && -t 0 ]] || die "Could not read clients from the SQLite backup."
+    fi
+    read -rp "Source VLESS inbound ID: " MIGRATION_INBOUND
+    [[ "$MIGRATION_INBOUND" =~ ^[1-9][0-9]{0,9}$ ]] || die "Invalid source inbound ID."
+    write_state
+  done
+fi
 
-for command in curl dig fail2ban-client flock ip jq nginx openssl sshd ssh-keygen ss sqlite3 sudo sysctl systemctl ufw visudo wg; do
+for command in curl dig fail2ban-client flock ip jq nginx openssl sshd ssh-keygen ss sudo sysctl systemctl ufw visudo; do
   command -v "$command" >/dev/null || die "Package installation completed, but required command '${command}' is missing."
 done
 if [[ "$SSH_ACCESS_MODE" == admin ]]; then
@@ -807,6 +965,10 @@ if dig +short AAAA "$DOMAIN" | grep -q .; then
 fi
 
 log "Configuring UFW"
+if [[ -L /etc/nginx/sites-enabled/default ]]; then
+  rm -f /etc/nginx/sites-enabled/default
+  if systemctl is-active --quiet nginx; then systemctl reload nginx; fi
+fi
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow "$SSH_PORT"/tcp comment 'SSH - preserve remote access'
@@ -816,79 +978,51 @@ fi
 ufw allow 443/tcp comment "xhttp-vps:${SAFE_INSTANCE} VPN"
 ufw --force enable
 
-log "Installing or resuming 3x-ui"
-if [[ ! -x /usr/local/x-ui/x-ui || ! -s /etc/x-ui/install-result.env ]]; then
-if [[ ! -x /root/.acme.sh/acme.sh ]]; then
-  log "Installing pinned acme.sh ${XHTTP_ACME_SH_VERSION}"
-  ACME_ARCHIVE="$(mktemp /tmp/acme-sh.XXXXXXXX.tar.gz)"
-  ACME_SOURCE_DIR="$(mktemp -d /tmp/acme-sh.XXXXXXXX)"
-  trap 'rm -f "${ACME_ARCHIVE:-}"; rm -rf "${ACME_SOURCE_DIR:-}"' EXIT
-  xhttp_download_verified \
-    "https://github.com/acmesh-official/acme.sh/archive/${XHTTP_ACME_SH_COMMIT}.tar.gz" \
-    "$XHTTP_ACME_SH_SHA256" "$ACME_ARCHIVE" \
-    || die "The pinned acme.sh archive could not be downloaded or failed SHA-256 verification."
-  tar -xzf "$ACME_ARCHIVE" -C "$ACME_SOURCE_DIR" --strip-components=1
-  (cd "$ACME_SOURCE_DIR" && ./acme.sh --install --home /root/.acme.sh \
-    --config-home /root/.acme.sh --cert-home /root/.acme.sh --no-profile)
-  [[ -x /root/.acme.sh/acme.sh ]] || die "Pinned acme.sh installation did not create /root/.acme.sh/acme.sh."
-  rm -f "$ACME_ARCHIVE"
-  rm -rf "$ACME_SOURCE_DIR"
-  trap - EXIT
-fi
-systemctl stop nginx || true
-if [[ "$RESUMING" == 1 ]]; then systemctl stop x-ui 2>/dev/null || true; fi
-port_busy 80 && die "TCP/80 is occupied."
-for p in "$PANEL_PORT" "$SUB_PORT" 443 "$FALLBACK_PORT"; do port_busy "$p" && die "TCP/${p} is occupied."; done
-if [[ -n "${XUI_VERSION:-}" && "$XUI_VERSION" != "$XHTTP_XUI_VERSION" ]]; then
-  die "Interrupted state requests 3x-ui ${XUI_VERSION}, but this installer is pinned to ${XHTTP_XUI_VERSION}. Restore the matching installer version."
-fi
-XUI_VERSION="$XHTTP_XUI_VERSION"
-write_state
-INSTALLER="$(mktemp /tmp/3x-ui-install.XXXXXXXX.sh)"
-trap 'rm -f "$INSTALLER"' EXIT
-xhttp_download_verified \
-  "https://raw.githubusercontent.com/MHSanaei/3x-ui/${XUI_VERSION}/install.sh" \
-  "$XHTTP_XUI_INSTALL_SHA256" "$INSTALLER" \
-  || die "The pinned 3x-ui installer could not be downloaded or failed SHA-256 verification."
-chmod 700 "$INSTALLER"
-XUI_NONINTERACTIVE=1 XUI_SERVER_IP="$PUBLIC_IP" XUI_USERNAME="$PANEL_USERNAME" \
-  XUI_PASSWORD="$PANEL_PASSWORD" XUI_PANEL_PORT="$PANEL_PORT" XUI_WEB_BASE_PATH="$PANEL_PATH" \
-  XUI_DB_TYPE=sqlite XUI_SSL_MODE=none \
-  bash "$INSTALLER" "$XUI_VERSION"
-if [[ "$TLS_MODE" != "production" ]]; then
-  log "Creating a 30-day self-signed TLS certificate for test mode"
-  install -d -m 700 "$CERT_DIR"
-  openssl req -x509 -newkey rsa:3072 -sha256 -nodes -days 30 \
-    -keyout "$CERT_DIR/privkey.pem" -out "$CERT_DIR/fullchain.pem" \
-    -subj "/CN=${DOMAIN}" -addext "subjectAltName=DNS:${DOMAIN}" >/dev/null 2>&1
-  chmod 600 "$CERT_DIR/privkey.pem"
-  chmod 644 "$CERT_DIR/fullchain.pem"
-  /usr/local/x-ui/x-ui cert -webCert "$CERT_DIR/fullchain.pem" -webCertKey "$CERT_DIR/privkey.pem" >/dev/null
-fi
-
+if xhttp_uses_panel && [[ ! -x /usr/local/x-ui/x-ui || ( -z "$PANEL_API_TOKEN" && ! -s /etc/x-ui/install-result.env ) ]]; then
+  log "Installing 3x-ui from its latest stable release"
+  for p in "$PANEL_PORT" "$SUB_PORT" 443 "$FALLBACK_PORT"; do port_busy "$p" && die "TCP/${p} is occupied."; done
+  if [[ ! -x /usr/local/x-ui/x-ui ]]; then xhttp_install_panel; fi
+  /usr/local/x-ui/x-ui setting -username "$PANEL_USERNAME" -password "$PANEL_PASSWORD" \
+    -port "$PANEL_PORT" -webBasePath "$PANEL_PATH" -listenIP 127.0.0.1 >/dev/null
+  PANEL_API_TOKEN="$(/usr/local/x-ui/x-ui setting -getApiToken 2>/dev/null \
+    | awk -F': ' '/^apiToken:/{gsub(/[[:space:]]/, "", $2); print $2}')"
+  [[ -n "$PANEL_API_TOKEN" ]] || die "Could not create the panel API token."
+  write_state
 fi
 if [[ ! -s "$CERT_DIR/fullchain.pem" || ! -s "$CERT_DIR/privkey.pem" ]]; then
-  [[ -x /root/.acme.sh/acme.sh ]] || die "ACME bootstrap is incomplete. Restore /root/.acme.sh/acme.sh from the official 3x-ui installation."
-  [[ "$TLS_MODE" == "production" ]] || die "The test TLS certificate is missing. Resume bootstrap to recreate it."
+  [[ "$TLS_MODE" == "production" ]] || die "Missing legacy test certificate."
   log "Issuing the TLS certificate through the persistent Nginx webroot"
   install -d -m 700 "$CERT_DIR"
   install -d -m 755 /var/www/3xui-cover/.well-known/acme-challenge
   rm -f /etc/nginx/sites-enabled/default
   xhttp_install_acme_nginx || die "Could not install the temporary ACME webroot virtual host."
   systemctl enable --now nginx
+  systemctl reload nginx
   ACME_PROBE="$(random_hex 12)"
   printf '%s\n' "$ACME_PROBE" > "/var/www/3xui-cover/.well-known/acme-challenge/${ACME_PROBE}"
   [[ "$(curl -fsS -H "Host: ${DOMAIN}" "http://127.0.0.1/.well-known/acme-challenge/${ACME_PROBE}")" == "$ACME_PROBE" ]] \
     || die "The local Nginx ACME webroot probe failed."
   rm -f "/var/www/3xui-cover/.well-known/acme-challenge/${ACME_PROBE}"
-  /root/.acme.sh/acme.sh --issue -d "$DOMAIN" --webroot /var/www/3xui-cover \
-    --server letsencrypt --keylength ec-256
-  /root/.acme.sh/acme.sh --install-cert -d "$DOMAIN" --ecc \
-    --key-file "$CERT_DIR/privkey.pem" --fullchain-file "$CERT_DIR/fullchain.pem" \
-    --reloadcmd "systemctl reload nginx"
-  /usr/local/x-ui/x-ui cert -webCert "$CERT_DIR/fullchain.pem" -webCertKey "$CERT_DIR/privkey.pem" >/dev/null
+  if [[ "$ACME_CLIENT" == certbot ]]; then
+    certbot certonly --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring \
+      --config-dir /etc/xhttp-vps-acme --work-dir /var/lib/xhttp-vps-acme --logs-dir /var/log/xhttp-vps-acme \
+      --webroot --webroot-path /var/www/3xui-cover --cert-name "$DOMAIN" -d "$DOMAIN"
+    ln -sfn "/etc/xhttp-vps-acme/live/$DOMAIN/fullchain.pem" "$CERT_DIR/fullchain.pem"
+    ln -sfn "/etc/xhttp-vps-acme/live/$DOMAIN/privkey.pem" "$CERT_DIR/privkey.pem"
+  else
+    if [[ ! -s "/root/.acme.sh/${DOMAIN}_ecc/fullchain.cer" ]]; then
+      /root/.acme.sh/acme.sh --issue -d "$DOMAIN" --webroot /var/www/3xui-cover \
+        --server letsencrypt --keylength ec-256
+    fi
+    /root/.acme.sh/acme.sh --install-cert -d "$DOMAIN" --ecc \
+      --key-file "$CERT_DIR/privkey.pem" --fullchain-file "$CERT_DIR/fullchain.pem" \
+      --reloadcmd "systemctl reload nginx"
+  fi
 fi
 
+if xhttp_uses_panel; then
+[[ -s "$CERT_DIR/fullchain.pem" && -s "$CERT_DIR/privkey.pem" ]] || die "TLS certificate deployment failed."
+/usr/local/x-ui/x-ui cert -webCert "$CERT_DIR/fullchain.pem" -webCertKey "$CERT_DIR/privkey.pem" >/dev/null
 # The installer's result file is authoritative. Reading it also protects us
 # from future installer-side normalization of the port or web base path.
 if [[ -r /etc/x-ui/install-result.env ]]; then
@@ -913,8 +1047,9 @@ fi
 # two-factor setting: enrollment and recovery codes belong to the administrator.
 /usr/local/x-ui/x-ui setting -listenIP 127.0.0.1 >/dev/null
 [[ -n "$PANEL_API_TOKEN" ]] || die "The official 3x-ui installer did not provide an API token in /etc/x-ui/install-result.env."
+fi
 
-log "Creating the TLS self-steal site"
+log "Creating the public HTTPS site"
 install -d -m 755 /var/www/3xui-cover
 DOMAIN_ROOT="${DOMAIN%%.*}"
 DOMAIN_ROOT="$(printf '%s' "$DOMAIN_ROOT" | tr '-' ' ' | awk '{for(i=1;i<=NF;i++){$i=toupper(substr($i,1,1)) substr($i,2)} print}')"
@@ -968,16 +1103,21 @@ esac
 PHOTO_PAGE="https://unsplash.com/photos/${PHOTO_ID}"
 PHOTO_FILE="/var/www/3xui-cover/hero.jpg"
 REPO_ASSET_BASE="${REPO_ASSET_BASE:-https://raw.githubusercontent.com/yazmann/xhttp-vps-setup/main/assets}"
-if ! curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 \
-  "${REPO_ASSET_BASE}/${PHOTO_ASSET}" -o "$PHOTO_FILE" 2>/dev/null; then
-  warn "Photo is not present in GitHub assets yet; downloading the licensed Unsplash original."
-  rm -f "$PHOTO_FILE"
-  curl -fsSL --retry 3 --connect-timeout 10 --max-time 90 \
-    "https://unsplash.com/photos/${PHOTO_ID}/download?force=true&w=1800&fm=jpg" -o "$PHOTO_FILE"
+PHOTO_MARKUP=''
+PHOTO_TEMP="$(mktemp /var/www/3xui-cover/.photo.XXXXXXXX)"
+if curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time 15 \
+    "${REPO_ASSET_BASE}/${PHOTO_ASSET}" -o "$PHOTO_TEMP" 2>/dev/null ||
+   curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time 15 \
+    "https://unsplash.com/photos/${PHOTO_ID}/download?force=true&w=1800&fm=jpg" -o "$PHOTO_TEMP" 2>/dev/null; then
+  if [[ "$(od -An -N 3 -tx1 "$PHOTO_TEMP" | tr -d ' \n')" == ffd8ff ]]; then
+    chmod 644 "$PHOTO_TEMP"
+    mv -T "$PHOTO_TEMP" "$PHOTO_FILE"
+  fi
 fi
-[[ -s "$PHOTO_FILE" && "$(stat -c '%s' "$PHOTO_FILE")" -gt 50000 ]] \
-  || die "The licensed cover photo could not be downloaded correctly."
-chmod 644 "$PHOTO_FILE"
+rm -f -- "$PHOTO_TEMP"
+if [[ -s "$PHOTO_FILE" ]]; then
+  PHOTO_MARKUP="<img src=\"/hero.jpg\" alt=\"\" fetchpriority=\"high\"><a class=\"credit\" href=\"${PHOTO_PAGE}\" rel=\"noreferrer\">Photo: ${PHOTO_CREDIT} / Unsplash</a>"
+fi
 cat > /var/www/3xui-cover/index.html <<HTML
 <!doctype html>
 <html lang="en" data-theme="${MODE}">
@@ -1000,7 +1140,7 @@ cat > /var/www/3xui-cover/index.html <<HTML
 <body>
   <header><div class="shell"><nav><a class="brand" href="#"><span class="mark"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 17.5 12 4l8 13.5M7 14h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span>${BRAND}</a><div class="links"><a href="#capabilities">Capabilities</a><a href="#approach">Approach</a><a href="#about">About</a></div></nav></div></header>
   <main>
-    <div class="shell hero"><div><div class="eyebrow">${KICKER}</div><h1>${HEADLINE}</h1><p class="intro">${INTRO}</p><a class="action" href="#capabilities">Explore our capabilities <span>→</span></a></div><figure class="visual"><img src="/hero.jpg" alt="${KICKER}" width="900" height="1100"><a class="credit" href="${PHOTO_PAGE}" rel="noreferrer">Photo: ${PHOTO_CREDIT} / Unsplash</a><figcaption class="visual-note"><strong>Measured, collaborative, accountable.</strong>Clear technical thinking and decisions grounded in the realities of delivery.</figcaption></figure></div>
+    <div class="shell hero"><div><div class="eyebrow">${KICKER}</div><h1>${HEADLINE}</h1><p class="intro">${INTRO}</p><a class="action" href="#capabilities">Explore our capabilities <span>→</span></a></div><figure class="visual">${PHOTO_MARKUP}<figcaption class="visual-note"><strong>Measured, collaborative, accountable.</strong>Clear technical thinking and decisions grounded in the realities of delivery.</figcaption></figure></div>
     <div class="band"><div class="shell band-row"><span><i class="dot"></i>Independent practice</span><span>Planning & coordination</span><span>Documentation & delivery</span></div></div>
     <section id="capabilities"><div class="shell"><div class="section-head"><div class="label">What we do</div><p>Focused support at the points where good information and careful coordination have the greatest impact on project outcomes.</p></div><div class="services"><article class="service"><div class="num">01</div><h2>${S1}</h2><p>${D1}</p></article><article class="service"><div class="num">02</div><h2>${S2}</h2><p>${D2}</p></article><article class="service"><div class="num">03</div><h2>${S3}</h2><p>${D3}</p></article></div></div></section>
     <section id="approach"><div class="shell approach"><div><div class="label">How we work</div><h2>Useful detail.<br>Decisive progress.</h2></div><div class="steps"><div class="step"><div><strong>Understand the context</strong><span>Define the real constraints, responsibilities and measures of success.</span></div></div><div class="step"><div><strong>Make the work visible</strong><span>Turn complex information into an organised, reviewable plan.</span></div></div><div class="step"><div><strong>Follow through</strong><span>Keep decisions, documentation and delivery aligned as the work develops.</span></div></div></div></div></section>
@@ -1014,22 +1154,34 @@ rm -f /etc/nginx/sites-enabled/default
 ln -sfn /etc/nginx/sites-available/3xui-self-steal.conf /etc/nginx/sites-enabled/3xui-self-steal.conf
 nginx -t
 systemctl enable --now nginx
+systemctl reload nginx
+if [[ "$ACME_CLIENT" == certbot ]]; then xhttp_install_cert_renewal; fi
+if ! xhttp_uses_panel; then
+  [[ -r "$UDP_SCRIPT" ]] || die "UDP transport helpers are missing."
+  log "Starting $(xhttp_transport_label "$TRANSPORT")"
+  xhttp_install_fail2ban_sshd || die "Fail2ban could not load the sshd jail."
+  if [[ "$SSH_HARDENING" == 1 ]]; then xhttp_harden_sshd; fi
+  xhttp_udp_finish
+  INSTALL_PHASE=complete
+  write_state
+  exit 0
+fi
 systemctl enable x-ui
 systemctl restart x-ui
-if [[ "$TLS_MODE" == "production" ]]; then
+if [[ "$TLS_MODE" == "production" && "$ACME_CLIENT" != certbot ]]; then
   /root/.acme.sh/acme.sh --install-cert -d "$DOMAIN" --ecc --key-file "$CERT_DIR/privkey.pem" \
     --fullchain-file "$CERT_DIR/fullchain.pem" --reloadcmd "systemctl reload nginx && systemctl restart x-ui"
 fi
 
-INSTALL_PHASE=service-ready
+INSTALL_PHASE='service-ready'
 write_state
 if [[ "$RESUMING" == 1 ]]; then exec "$RECOVERY_SCRIPT"; fi
 
-API_BASE="https://127.0.0.1:${PANEL_PORT}/${PANEL_PATH}"
+API_BASE="https://${DOMAIN}:${PANEL_PORT}/${PANEL_PATH}"
 API_HEADER_FILE="$(xhttp_create_api_header_file "$PANEL_API_TOKEN")" \
   || die "The panel API token is empty or contains invalid control characters."
-API_AUTH=(-H "@${API_HEADER_FILE}")
-trap 'rm -f "${INSTALLER:-}" "${API_HEADER_FILE:-}"' EXIT
+API_AUTH=(--noproxy '*' --resolve "${DOMAIN}:${PANEL_PORT}:127.0.0.1" -H "@${API_HEADER_FILE}")
+trap 'rm -f "${API_HEADER_FILE:-}"' EXIT
 
 build_warp_outbound() {
   local data_json="$1" config_json="$2" private_key client_id peer_key endpoint addresses reserved
@@ -1070,7 +1222,7 @@ if [[ "$API_READY" -ne 1 ]]; then
 fi
 
 log "Enabling and configuring subscriptions"
-RESPONSE="$(curl -kfsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/setting/all")"
+RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/setting/all")"
 SETTINGS="$(jq -c '.obj | if type == "string" then fromjson else . end' <<<"$RESPONSE")"
 SETTINGS="$(jq -c --arg d "$DOMAIN" --arg title "$VPN_NAME" --argjson p "$SUB_PORT" --arg path "/${SUB_PATH}/" --arg cert "$CERT_DIR/fullchain.pem" --arg key "$CERT_DIR/privkey.pem" '
   .subEnable=true | .subEncrypt=true | .subListen="127.0.0.1" | .subDomain=$d | .subPort=$p | .subPath=$path
@@ -1078,8 +1230,12 @@ SETTINGS="$(jq -c --arg d "$DOMAIN" --arg title "$VPN_NAME" --argjson p "$SUB_PO
 ' <<<"$SETTINGS")"
 CLIENT_ROUTING_CONFIGURED=0; MIHOMO_CONFIGURED=0
 if [[ "$INSTALL_MODE" == "standalone" ]]; then
-  HAPP_ROUTING="$(xhttp_fetch_verified_text "https://raw.githubusercontent.com/hydraponique/roscomvpn-routing/${XHTTP_ROUTING_COMMIT}/HAPP/DEFAULT.DEEPLINK" "$XHTTP_HAPP_SHA256" 2>/dev/null || true)"
-  INCY_ROUTING="$(xhttp_fetch_verified_text "https://raw.githubusercontent.com/hydraponique/roscomvpn-routing/${XHTTP_ROUTING_COMMIT}/INCY/DEFAULT.DEEPLINK" "$XHTTP_INCY_SHA256" 2>/dev/null || true)"
+  if [[ -n "$SUB_ENCRYPT_LINKS" ]]; then
+    SETTINGS="$(jq -c --argjson enabled "$SUB_ENCRYPT_LINKS" '.happLinkEnable=$enabled' <<<"$SETTINGS")"
+  fi
+  ROUTING_REVISION="$(xhttp_routing_revision || true)"
+  HAPP_ROUTING="$(xhttp_fetch_routing "$ROUTING_REVISION" HAPP/DEFAULT.DEEPLINK 2>/dev/null || true)"
+  INCY_ROUTING="$(xhttp_fetch_routing "$ROUTING_REVISION" INCY/DEFAULT.DEEPLINK 2>/dev/null || true)"
   if [[ "$HAPP_ROUTING" == happ://routing/onadd/* && "$INCY_ROUTING" == incy://routing/onadd/* ]]; then
     SETTINGS="$(jq -c --arg happ "$HAPP_ROUTING" --arg incy "$INCY_ROUTING" \
       --arg jsonPath "/${SUB_JSON_PATH}/" --arg clashPath "/${SUB_CLASH_PATH}/" \
@@ -1096,7 +1252,7 @@ if [[ "$INSTALL_MODE" == "standalone" ]]; then
     warn "RoscomVPN routing profiles could not be downloaded; HAPP/INCY routing and Mihomo endpoint are left disabled."
   fi
 fi
-RESPONSE="$(curl -kfsS "${API_AUTH[@]}" -H 'Content-Type: application/json' -X POST "$API_BASE/panel/api/setting/update" --data-binary "$SETTINGS")"
+RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -H 'Content-Type: application/json' -X POST "$API_BASE/panel/api/setting/update" --data-binary "$SETTINGS")"
 jq -e '.success == true' <<<"$RESPONSE" >/dev/null || die "Subscription configuration failed: ${RESPONSE}"
 SUBSCRIPTION_CONFIGURED=1
 
@@ -1104,7 +1260,7 @@ if [[ "$INSTALL_MODE" == "standalone" ]]; then
   log "Creating Mihomo subscription with RoscomVPN routing"
   MIHOMO_PROVIDER_URL="https://${DOMAIN}/${SUB_CLASH_PATH}/${CLIENT_SUB_ID}"
   MIHOMO_ROUTING_URL="https://${DOMAIN}/${MIHOMO_ROUTING_PATH}"
-  MIHOMO_TEMPLATE="$(xhttp_fetch_verified_text "https://raw.githubusercontent.com/hydraponique/roscomvpn-routing/${XHTTP_ROUTING_COMMIT}/MIHOMO/default.yaml" "$XHTTP_MIHOMO_SHA256" 2>/dev/null || true)"
+  MIHOMO_TEMPLATE="$(xhttp_fetch_routing "$ROUTING_REVISION" MIHOMO/default.yaml 2>/dev/null || true)"
   if grep -Fq '<ВВЕДИТЕ URL ПОДПИСКИ>' <<<"$MIHOMO_TEMPLATE"; then
     printf '%s\n' "$MIHOMO_TEMPLATE" | sed "s|<ВВЕДИТЕ URL ПОДПИСКИ>|${MIHOMO_PROVIDER_URL}|g" > "/var/www/3xui-cover/${MIHOMO_ROUTING_PATH}"
     chmod 644 "/var/www/3xui-cover/${MIHOMO_ROUTING_PATH}"
@@ -1117,7 +1273,7 @@ if [[ "$INSTALL_MODE" == "standalone" ]]; then
 fi
 
 log "Creating $(xhttp_transport_label "$TRANSPORT") inbound on TCP/443"
-RESPONSE="$(curl -kfsS "${API_AUTH[@]}" "$API_BASE/panel/api/server/getNewX25519Cert")"
+RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" "$API_BASE/panel/api/server/getNewX25519Cert")"
 jq -e '.success == true' <<<"$RESPONSE" >/dev/null || die "Reality key generation failed: ${RESPONSE}"
 REALITY_PRIVATE="$(jq -r '.obj.privateKey // .obj.private // empty' <<<"$RESPONSE")"
 REALITY_PUBLIC="$(jq -r '.obj.publicKey // .obj.public // empty' <<<"$RESPONSE")"
@@ -1139,36 +1295,40 @@ INBOUND="$(jq -nc --arg remark "${VPN_NAME}" --arg settings "$INBOUND_SETTINGS" 
   {up:0,down:0,total:0,remark:$remark,enable:true,expiryTime:0,trafficReset:"never",listen:"",port:443,
    protocol:"vless",settings:$settings,streamSettings:$stream,tag:$tag,sniffing:$sniff}
 ')"
-RESPONSE="$(curl -kfsS "${API_AUTH[@]}" -H 'Content-Type: application/json' \
+RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -H 'Content-Type: application/json' \
   -X POST "$API_BASE/panel/api/inbounds/add" --data-binary "$INBOUND")"
 jq -e '.success == true' <<<"$RESPONSE" >/dev/null || die "Inbound creation failed: ${RESPONSE}"
-RESPONSE="$(curl -kfsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/server/restartXrayService")"
+RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/server/restartXrayService")"
 jq -e '.success == true' <<<"$RESPONSE" >/dev/null || die "Xray restart after inbound creation failed: ${RESPONSE}"
 INBOUND_CONFIGURED=1
 write_state
 
 log "Applying the low-memory Xray profile"
 xhttp_memory_apply "$INBOUND_TAG" "$TRANSPORT"
+if [[ -n "$MIGRATION_DB" ]]; then
+  log "Importing VLESS users and usage"
+  xhttp_import_migrated_clients
+fi
 
 if [[ "$ENABLE_WARP" -eq 1 ]]; then
   log "Creating built-in WARP and RU routing"
-  RESPONSE="$(curl -kfsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/data")"
+  RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/data")"
   if ! jq -e '.success == true and .obj != null and .obj != ""' <<<"$RESPONSE" >/dev/null; then
     PRIVATE_KEY="$(wg genkey)"; PUBLIC_KEY="$(printf '%s' "$PRIVATE_KEY" | wg pubkey)"
-    RESPONSE="$(curl -kfsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/reg" --data-urlencode "privateKey=$PRIVATE_KEY" --data-urlencode "publicKey=$PUBLIC_KEY")"
+    RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/reg" --data-urlencode "privateKey=$PRIVATE_KEY" --data-urlencode "publicKey=$PUBLIC_KEY")"
     if ! jq -e '.success == true' <<<"$RESPONSE" >/dev/null; then
       die "WARP registration failed. WARP was requested, so installation cannot continue. Panel response: ${RESPONSE}"
     fi
   fi
   if [[ "$ENABLE_WARP" -eq 1 ]]; then
-    WARP_DATA_RESPONSE="$(curl -kfsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/data")"
-    WARP_CONFIG_RESPONSE="$(curl -kfsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/config")"
+    WARP_DATA_RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/data")"
+    WARP_CONFIG_RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/config")"
     WARP_DATA="$(jq -c '.obj | if type=="string" then fromjson else . end' <<<"$WARP_DATA_RESPONSE")"
     WARP_CONFIG="$(jq -c '.obj | if type=="string" then fromjson else . end' <<<"$WARP_CONFIG_RESPONSE")"
     if ! build_warp_outbound "$WARP_DATA" "$WARP_CONFIG"; then
       die "WARP account data is incomplete. WARP was requested, so installation cannot continue."
     else
-      RESPONSE="$(curl -kfsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/")"
+      RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/")"
       jq -e '.success == true and .obj != null' <<<"$RESPONSE" >/dev/null || die "Could not read Xray configuration: $RESPONSE"
       XRAY="$(jq -c '.obj | if type=="string" then fromjson else . end | .xraySetting | if type=="string" then fromjson else . end' <<<"$RESPONSE")"
       jq -e 'type=="object" and (.outbounds|type=="array")' <<<"$XRAY" >/dev/null || die "Xray configuration has an unexpected format."
@@ -1176,9 +1336,9 @@ if [[ "$ENABLE_WARP" -eq 1 ]]; then
       sqlite3 /etc/x-ui/x-ui.db ".timeout 5000" ".backup '$WARP_BACKUP/x-ui.db'"
       XRAY="$(xhttp_warp_config "$WARP_OUT" <<<"$XRAY")"
       xhttp_validate_warp_routes <<<"$XRAY" || die "Required Russian routing datasets are unavailable."
-      RESPONSE="$(curl -kfsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/update" --data-urlencode "xraySetting=$XRAY" --data-urlencode 'outboundTestUrl=https://www.cloudflare.com/cdn-cgi/trace')"
+      RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/update" --data-urlencode "xraySetting=$XRAY" --data-urlencode 'outboundTestUrl=https://www.cloudflare.com/cdn-cgi/trace')"
       if jq -e '.success == true' <<<"$RESPONSE" >/dev/null; then
-        VERIFY_WARP_RESPONSE="$(curl -kfsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/")"
+        VERIFY_WARP_RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/")"
         VERIFY_WARP="$(jq -c '.obj | if type=="string" then fromjson else . end | .xraySetting | if type=="string" then fromjson else . end' <<<"$VERIFY_WARP_RESPONSE")"
         jq -e 'type=="object" and any(.outbounds[]?; .tag=="warp") and any(.routing.rules[]?; .ruleTag=="xhttp-vps-warp-ru-domain" and .domain==["domain:ru","domain:su","domain:xn--p1ai","geosite:category-ru"] and .outboundTag=="warp") and any(.routing.rules[]?; .ruleTag=="xhttp-vps-warp-ru-ip" and .ip==["geoip:ru"] and .outboundTag=="warp") and .routing.domainStrategy=="IPOnDemand"' <<<"$VERIFY_WARP" >/dev/null || die "WARP configuration could not be verified after saving."
         WARP_CONFIGURED=1
@@ -1195,7 +1355,7 @@ systemctl restart x-ui
 sleep 1
 API_READY=0; RESPONSE=""
 for _ in $(seq 1 15); do
-  RESPONSE="$(curl -kfsS "${API_AUTH[@]}" --connect-timeout 2 --max-time 5 "$API_BASE/panel/api/server/status" 2>&1 || true)"
+  RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" --connect-timeout 2 --max-time 5 "$API_BASE/panel/api/server/status" 2>&1 || true)"
   if jq -e '.success == true' <<<"$RESPONSE" >/dev/null 2>&1; then API_READY=1; break; fi
   sleep 1
 done
@@ -1211,10 +1371,10 @@ fi
 # Verify the saved configuration through the panel API, not only the TCP port.
 INBOUND_VERIFIED=0; CLIENT_VERIFIED=0; SUBSCRIPTION_VERIFIED=0; PUBLIC_SELF_STEAL_VERIFIED=0
 CLIENT_ROUTING_VERIFIED=0; MIHOMO_VERIFIED=0; PANEL_SETTINGS_VERIFIED=0
-SETTING_VERIFY_RESPONSE="$(curl -kfsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/setting/all" || true)"
+SETTING_VERIFY_RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/setting/all" || true)"
 if jq -e '.success == true and ((.obj | if type=="string" then fromjson else . end) | type=="object")' \
   <<<"$SETTING_VERIFY_RESPONSE" >/dev/null 2>&1; then PANEL_SETTINGS_VERIFIED=1; fi
-VERIFY_RESPONSE="$(curl -kfsS "${API_AUTH[@]}" "$API_BASE/panel/api/inbounds/list" || true)"
+VERIFY_RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" "$API_BASE/panel/api/inbounds/list" || true)"
 if jq -e --arg d "$DOMAIN" --arg dest "127.0.0.1:${FALLBACK_PORT}" --arg transport "$TRANSPORT" --arg tag "$INBOUND_TAG" '
   .success == true and
   ((.obj | if type=="string" then fromjson else . end) | any(
@@ -1232,7 +1392,7 @@ if jq -e --arg d "$DOMAIN" --arg dest "127.0.0.1:${FALLBACK_PORT}" --arg transpo
   INBOUND_VERIFIED=1
 fi
 for _ in $(seq 1 20); do
-  COVER_RESPONSE="$(curl -kfsS --resolve "${DOMAIN}:443:127.0.0.1" --max-time 5 "https://${DOMAIN}/" 2>/dev/null || true)"
+  COVER_RESPONSE="$(curl -fsS --noproxy '*' --resolve "${DOMAIN}:443:127.0.0.1" --max-time 5 "https://${DOMAIN}/" 2>/dev/null || true)"
   if grep -Fq "$DOMAIN" <<<"$COVER_RESPONSE"; then PUBLIC_SELF_STEAL_VERIFIED=1; break; fi
   sleep 1
 done
@@ -1396,12 +1556,12 @@ if nginx -t >/dev/null 2>&1 && systemctl is-enabled --quiet nginx && systemctl i
 if [[ "$PANEL_HTTPS_VERIFIED" -eq 1 ]]; then status_line "Panel web interface" OK "domain TLS and base path"; else status_line "Panel web interface" ERROR; fi
 if curl -kfsSI --resolve "$DOMAIN:$FALLBACK_PORT:127.0.0.1" "https://$DOMAIN:$FALLBACK_PORT/" >/dev/null; then status_line "Cover website" OK; else status_line "Cover website" ERROR; fi
 if [[ "$PUBLIC_SELF_STEAL_VERIFIED" -eq 1 ]]; then status_line "Public self-steal website" OK "normal TLS through TCP 443"; else status_line "Public self-steal website" ERROR; fi
-if xhttp_probe_foreign_sni; then status_line "Foreign SNI behavior" OK "cover site only; panel hidden"; else status_line "Foreign SNI behavior" ERROR; fi
-if xhttp_probe_no_sni; then status_line "Missing SNI behavior" OK "cover site only; panel hidden"; else status_line "Missing SNI behavior" ERROR; fi
+if xhttp_probe_foreign_sni; then status_line "Foreign SNI behavior" OK "site certificate withheld"; else status_line "Foreign SNI behavior" ERROR; fi
+if xhttp_probe_no_sni; then status_line "Missing SNI behavior" OK "site certificate withheld"; else status_line "Missing SNI behavior" ERROR; fi
 if xhttp_probe_h2_alpn; then status_line "Fallback ALPN" OK "HTTP/2 negotiated"; else status_line "Fallback ALPN" ERROR; fi
 HTTP_REDIRECT_HEADERS="$(curl -fsSI --resolve "${DOMAIN}:80:127.0.0.1" "http://${DOMAIN}/" 2>/dev/null || true)"
 if grep -Eiq "^location:[[:space:]]*https://${DOMAIN}/" <<<"$HTTP_REDIRECT_HEADERS"; then status_line "HTTP / ACME webroot" OK "port 80 redirects; challenge path retained"; else status_line "HTTP / ACME webroot" ERROR; fi
-if [[ -s /var/www/3xui-cover/hero.jpg && "$(stat -c '%s' /var/www/3xui-cover/hero.jpg)" -gt 50000 ]]; then status_line "Licensed cover photo" OK "$PHOTO_CREDIT / Unsplash"; else status_line "Licensed cover photo" ERROR; fi
+if [[ -n "$PHOTO_MARKUP" ]]; then status_line "Licensed cover photo" OK "$PHOTO_CREDIT / Unsplash"; else status_line "Licensed cover photo" SKIP "site available without image"; fi
 if [[ "${INBOUND_CONFIGURED:-0}" -eq 1 && "$INBOUND_VERIFIED" -eq 1 ]] && port_busy 443; then status_line "VPN Reality self-steal" OK "$(xhttp_transport_label "$TRANSPORT"); TCP 443 → 127.0.0.1:$FALLBACK_PORT"; else status_line "VPN Reality self-steal" ERROR; fi
 if [[ "${SUBSCRIPTION_CONFIGURED:-0}" -eq 1 ]] && port_busy "$SUB_PORT"; then status_line "Subscription service" OK "127.0.0.1:$SUB_PORT"; else status_line "Subscription service" ERROR; fi
 if [[ "$INSTALL_MODE" == "standalone" ]]; then
@@ -1450,8 +1610,10 @@ fi
 if [[ "$INSTALL_MODE" == "standalone" ]]; then
   SUBSCRIPTION_URL="https://${DOMAIN}/${SUB_PATH}/${CLIENT_SUB_ID}"
   MIHOMO_SUBSCRIPTION_URL="$MIHOMO_ROUTING_URL"
-  printf -v MODE_DETAILS 'FIRST CLIENT: %s\nHAPP / INCY SUBSCRIPTION: %s\nMIHOMO SUBSCRIPTION:      %s\n\n%s' \
-    "$CLIENT_EMAIL" "$SUBSCRIPTION_URL" "$MIHOMO_SUBSCRIPTION_URL" "$STANDALONE_STATUS_MESSAGE"
+  SUBSCRIPTION_DISPLAY="$(xhttp_subscription_links "$SUBSCRIPTION_URL" "$CLIENT_EMAIL")" \
+    || die "Could not generate the selected HAPP and INCY subscription links."
+  printf -v MODE_DETAILS 'FIRST CLIENT: %s\n%s\nMIHOMO SUBSCRIPTION: %s\n\n%s' \
+    "$CLIENT_EMAIL" "$SUBSCRIPTION_DISPLAY" "$MIHOMO_SUBSCRIPTION_URL" "$STANDALONE_STATUS_MESSAGE"
 else
   printf -v MODE_DETAILS 'NODE TOKEN:  %s\n\n%s\nThe local inbound is already created; do not deploy a duplicate on port 443.' "${NODE_API_TOKEN:-not created}" "$NODE_STATUS_MESSAGE"
 fi
@@ -1491,7 +1653,8 @@ umask 077
     printf 'Panel URL: %s\n' "$PANEL_DISPLAY_URL"
     printf 'Panel login: %s\n' "$PANEL_USERNAME"
     printf 'Panel password: %s\n' "$PANEL_PASSWORD"
-    printf 'HAPP / INCY subscription: %s\n' "$SUBSCRIPTION_URL"
+    printf '%s\n' "$SUBSCRIPTION_DISPLAY"
+    if [[ -s "$MANAGED_BACKUP/migration.done" ]]; then printf 'Imported VLESS clients: %s\n' "$(cat "$MANAGED_BACKUP/migration.done")"; fi
     printf 'Mihomo subscription: %s\n' "$MIHOMO_SUBSCRIPTION_URL"
     printf '%s\n' '---------------------------------------------------------------'
   else
@@ -1547,7 +1710,7 @@ if [[ "$INSTALL_MODE" == "standalone" ]]; then
   printf 'Panel URL: %s\n' "$PANEL_DISPLAY_URL"
   printf 'Panel login: %s\n' "$PANEL_USERNAME"
   printf 'Panel password: %s\n' "$PANEL_PASSWORD"
-  printf 'HAPP / INCY subscription: %s\n' "$SUBSCRIPTION_URL"
+  printf '%s\n' "$SUBSCRIPTION_DISPLAY"
   printf 'Mihomo subscription: %s\n' "$MIHOMO_SUBSCRIPTION_URL"
   printf '%b---------------------------------------------------------------%b\n' "$yellow" "$plain"
   printf '%bRouting:%b HAPP and INCY RoscomVPN routing profiles are included.\n\n' "$cyan" "$plain"

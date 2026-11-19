@@ -29,11 +29,17 @@ COMMON_SCRIPT="$(dirname "$(readlink -f "$0")")/xhttp-vps-common.sh"
 [[ -r "$COMMON_SCRIPT" ]] || die "Place xhttp-vps-common.sh alongside this repair script."
 # shellcheck source=xhttp-vps-common.sh
 source "$COMMON_SCRIPT"
+MIGRATION_SCRIPT="$(dirname "$COMMON_SCRIPT")/xhttp-vps-migrate.sh"
+if [[ -r "$MIGRATION_SCRIPT" ]]; then
+  # shellcheck source=xhttp-vps-migrate.sh
+  source "$MIGRATION_SCRIPT"
+fi
+xhttp_lock || die "Another setup or repair is already running."
 mapfile -t STATE_FILES < <(find /root -maxdepth 1 -type f \( -name '3xui-vps-*.env' -o -name '3xui-node-*.env' \) -print)
 [[ ${#STATE_FILES[@]} -eq 1 ]] || die "Expected exactly one 3x-ui installer state file in /root; found ${#STATE_FILES[@]}."
 # shellcheck disable=SC1090
 source "${STATE_FILES[0]}"
-if [[ "${INSTALL_PHASE:-}" == bootstrap ]]; then
+if [[ "${INSTALL_PHASE:-}" == bootstrap ]] || ! xhttp_uses_panel; then
   exec "$(dirname "$(readlink -f "$0")")/install-xhttp-vps.sh" --resume
 fi
 if [[ ! -x /usr/local/x-ui/x-ui || ! -s "/root/cert/${DOMAIN}/fullchain.pem" || ! -s /etc/nginx/sites-available/3xui-self-steal.conf ]]; then
@@ -57,6 +63,7 @@ fi
 : "${MAINTENANCE_TIMEZONE:=Europe/Moscow}"
 : "${MAINTENANCE_MODE:=weekly}"
 : "${TWO_FACTOR_GUIDE:=0}"
+: "${SUB_ENCRYPT_LINKS:=}"
 : "${SSH_HARDENING:=0}"
 if [[ -z "${SSH_ACCESS_MODE:-}" ]]; then
   if [[ "$SSH_HARDENING" == 1 ]]; then SSH_ACCESS_MODE='admin'; else SSH_ACCESS_MODE='existing'; fi
@@ -114,11 +121,12 @@ if [[ -e "$NGINX_CONFIG" ]]; then cp -a "$NGINX_CONFIG" "$REPAIR_BACKUP/nginx.co
 xhttp_install_nginx
 systemctl enable --now nginx
 systemctl reload nginx
+if [[ "${ACME_CLIENT:-}" == certbot ]]; then xhttp_install_cert_renewal; fi
 
-API_BASE="https://127.0.0.1:${PANEL_PORT}/${PANEL_PATH}"
+API_BASE="https://${DOMAIN}:${PANEL_PORT}/${PANEL_PATH}"
 API_HEADER_FILE="$(xhttp_create_api_header_file "$PANEL_API_TOKEN")" \
   || die "The panel API token is empty or contains invalid control characters."
-API_AUTH=(-H "@${API_HEADER_FILE}")
+API_AUTH=(--noproxy '*' --resolve "${DOMAIN}:${PANEL_PORT}:127.0.0.1" -H "@${API_HEADER_FILE}")
 trap 'rm -f "${API_HEADER_FILE:-}"' EXIT
 
 build_warp_outbound() {
@@ -186,7 +194,7 @@ configure_warp_swap() {
 systemctl restart x-ui
 READY=0; R=""
 for _ in $(seq 1 15); do
-  R="$(curl -kfsS "${API_AUTH[@]}" --connect-timeout 2 --max-time 5 "$API_BASE/panel/api/server/status" 2>&1 || true)"
+  R="$(curl -q -fsS "${API_AUTH[@]}" --connect-timeout 2 --max-time 5 "$API_BASE/panel/api/server/status" 2>&1 || true)"
   if jq -e '.success==true' <<<"$R" >/dev/null 2>&1; then READY=1; break; fi
   sleep 1
 done
@@ -198,11 +206,11 @@ if [[ "$READY" -eq 0 && "$R" == *'error: 401'* ]]; then
     rm -f "$API_HEADER_FILE"
     API_HEADER_FILE="$(xhttp_create_api_header_file "$PANEL_API_TOKEN")" \
       || die "The replacement API token contains invalid control characters."
-    API_AUTH=(-H "@${API_HEADER_FILE}")
+    API_AUTH=(--noproxy '*' --resolve "${DOMAIN}:${PANEL_PORT}:127.0.0.1" -H "@${API_HEADER_FILE}")
     printf '\nPANEL_API_TOKEN=%q\n' "$PANEL_API_TOKEN" >> "${STATE_FILES[0]}"
     READY=0
     for _ in $(seq 1 15); do
-      R="$(curl -kfsS "${API_AUTH[@]}" --connect-timeout 2 --max-time 5 "$API_BASE/panel/api/server/status" 2>&1 || true)"
+      R="$(curl -q -fsS "${API_AUTH[@]}" --connect-timeout 2 --max-time 5 "$API_BASE/panel/api/server/status" 2>&1 || true)"
       if jq -e '.success==true' <<<"$R" >/dev/null 2>&1; then READY=1; break; fi
       sleep 1
     done
@@ -212,7 +220,7 @@ fi
 
 CURRENT_STEP='configuring subscription service'
 printf '\n%b[STEP]%b %s\n' "$cyan" "$plain" "$CURRENT_STEP"
-R="$(curl -kfsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/setting/all")"
+R="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/setting/all")"
 jq -e '.success==true and .obj!=null' <<<"$R" >/dev/null || die "Could not read panel settings: $R"
 S="$(jq -c '.obj|if type=="string" then fromjson else . end' <<<"$R")"
 jq -e 'type=="object"' <<<"$S" >/dev/null || die "Panel settings have an unexpected format."
@@ -222,14 +230,18 @@ S="$(jq -c --arg d "$DOMAIN" --arg title "$VPN_NAME" --argjson p "$SUB_PORT" --a
   |.subCertFile=$cert|.subKeyFile=$key|.subURI=("https://"+$d+$path)|.subTitle=$title' <<<"$S")"
 ROUTING_CONFIGURED=0; MIHOMO_CONFIGURED=0
 if [[ "$INSTALL_MODE" == "standalone" ]]; then
-  HAPP_ROUTING="$(xhttp_fetch_verified_text "https://raw.githubusercontent.com/hydraponique/roscomvpn-routing/${XHTTP_ROUTING_COMMIT}/HAPP/DEFAULT.DEEPLINK" "$XHTTP_HAPP_SHA256" 2>/dev/null || true)"
-  INCY_ROUTING="$(xhttp_fetch_verified_text "https://raw.githubusercontent.com/hydraponique/roscomvpn-routing/${XHTTP_ROUTING_COMMIT}/INCY/DEFAULT.DEEPLINK" "$XHTTP_INCY_SHA256" 2>/dev/null || true)"
+  if [[ -n "$SUB_ENCRYPT_LINKS" ]]; then
+    S="$(jq -c --argjson enabled "$SUB_ENCRYPT_LINKS" '.happLinkEnable=$enabled' <<<"$S")"
+  fi
+  ROUTING_REVISION="$(xhttp_routing_revision || true)"
+  HAPP_ROUTING="$(xhttp_fetch_routing "$ROUTING_REVISION" HAPP/DEFAULT.DEEPLINK 2>/dev/null || true)"
+  INCY_ROUTING="$(xhttp_fetch_routing "$ROUTING_REVISION" INCY/DEFAULT.DEEPLINK 2>/dev/null || true)"
   if [[ "$HAPP_ROUTING" == happ://routing/onadd/* && "$INCY_ROUTING" == incy://routing/onadd/* ]]; then
     S="$(jq -c --arg happ "$HAPP_ROUTING" --arg incy "$INCY_ROUTING" --arg jp "/${SUB_JSON_PATH}/" --arg cp "/${SUB_CLASH_PATH}/" --arg ju "https://${DOMAIN}/${SUB_JSON_PATH}/" --arg cu "https://${DOMAIN}/${SUB_CLASH_PATH}/" '.subEnableRouting=true|.subRoutingRules=$happ|.subIncyEnableRouting=true|.subIncyRoutingRules=$incy|.subJsonEnable=true|.subJsonPath=$jp|.subJsonURI=$ju|.subClashEnable=true|.subClashPath=$cp|.subClashURI=$cu|.subClashEnableRouting=false' <<<"$S")"
     ROUTING_CONFIGURED=1; MIHOMO_CONFIGURED=1
   fi
 fi
-R="$(curl -kfsS "${API_AUTH[@]}" -H 'Content-Type: application/json' \
+R="$(curl -q -fsS "${API_AUTH[@]}" -H 'Content-Type: application/json' \
   -X POST "$API_BASE/panel/api/setting/update" --data-binary "$S")"
 jq -e '.success==true' <<<"$R" >/dev/null || die "Subscription setup failed: $R"
 if [[ "$INSTALL_MODE" == "standalone" ]]; then
@@ -237,7 +249,7 @@ if [[ "$INSTALL_MODE" == "standalone" ]]; then
   printf '\n%b[STEP]%b %s\n' "$cyan" "$plain" "$CURRENT_STEP"
   MIHOMO_PROVIDER_URL="https://${DOMAIN}/${SUB_CLASH_PATH}/${CLIENT_SUB_ID}"
   MIHOMO_ROUTING_URL="https://${DOMAIN}/${MIHOMO_ROUTING_PATH}"
-  MIHOMO_TEMPLATE="$(xhttp_fetch_verified_text "https://raw.githubusercontent.com/hydraponique/roscomvpn-routing/${XHTTP_ROUTING_COMMIT}/MIHOMO/default.yaml" "$XHTTP_MIHOMO_SHA256" 2>/dev/null || true)"
+  MIHOMO_TEMPLATE="$(xhttp_fetch_routing "$ROUTING_REVISION" MIHOMO/default.yaml 2>/dev/null || true)"
   if grep -Fq '<ВВЕДИТЕ URL ПОДПИСКИ>' <<<"$MIHOMO_TEMPLATE"; then
     printf '%s\n' "$MIHOMO_TEMPLATE" | sed "s|<ВВЕДИТЕ URL ПОДПИСКИ>|${MIHOMO_PROVIDER_URL}|g" > "/var/www/3xui-cover/${MIHOMO_ROUTING_PATH}"
     chmod 644 "/var/www/3xui-cover/${MIHOMO_ROUTING_PATH}"
@@ -251,7 +263,7 @@ fi
 
 CURRENT_STEP="creating or repairing $(xhttp_transport_label "$TRANSPORT") inbound"
 printf '\n%b[STEP]%b %s\n' "$cyan" "$plain" "$CURRENT_STEP"
-R="$(curl -kfsS "${API_AUTH[@]}" "$API_BASE/panel/api/inbounds/list")"
+R="$(curl -q -fsS "${API_AUTH[@]}" "$API_BASE/panel/api/inbounds/list")"
 jq -e '.success==true and .obj!=null' <<<"$R" >/dev/null || die "Could not read inbounds: $R"
 INBOUNDS="$(jq -c '.obj|if type=="string" then fromjson else . end' <<<"$R")"
 jq -e 'type=="array"' <<<"$INBOUNDS" >/dev/null || die "Inbound list has an unexpected format."
@@ -268,11 +280,11 @@ if [[ -n "$EXISTING_INBOUND" ]]; then
   EXISTING_STREAM="$(jq -c '.streamSettings|fromjson' <<<"$IB")"
   PUB_R="$(jq -r '.realitySettings.settings.publicKey' <<<"$EXISTING_STREAM")"
   SID="$(jq -r '.realitySettings.shortIds[0]' <<<"$EXISTING_STREAM")"
-  R="$(curl -kfsS "${API_AUTH[@]}" -H 'Content-Type: application/json' -X POST "$API_BASE/panel/api/inbounds/update/${INBOUND_ID}" --data-binary "$IB")"
+  R="$(curl -q -fsS "${API_AUTH[@]}" -H 'Content-Type: application/json' -X POST "$API_BASE/panel/api/inbounds/update/${INBOUND_ID}" --data-binary "$IB")"
   jq -e '.success==true' <<<"$R" >/dev/null || die "Inbound repair failed: $R"
   REALITY_PUBLIC="$PUB_R"; SHORT_ID="$SID"
 else
-  R="$(curl -kfsS "${API_AUTH[@]}" "$API_BASE/panel/api/server/getNewX25519Cert")"
+  R="$(curl -q -fsS "${API_AUTH[@]}" "$API_BASE/panel/api/server/getNewX25519Cert")"
   PRIV_R="$(jq -r '.obj.privateKey//.obj.private//empty' <<<"$R")"; PUB_R="$(jq -r '.obj.publicKey//.obj.public//empty' <<<"$R")"
   [[ -n "$PRIV_R" && -n "$PUB_R" ]] || die "Reality key generation failed: $R"
   SID="$(od -An -N 8 -tx1 /dev/urandom|tr -d ' \n')"
@@ -288,7 +300,7 @@ else
     || die "Could not build ${TRANSPORT} stream settings."
   SN="$(jq -nc '{enabled:true,destOverride:["http","tls","quic"],metadataOnly:false,routeOnly:false}')"
   IB="$(jq -nc --arg r "${VPN_NAME}" --arg s "$IS" --arg t "$ST" --arg n "$SN" --arg tag "$INBOUND_TAG" '{up:0,down:0,total:0,remark:$r,enable:true,expiryTime:0,trafficReset:"never",listen:"",port:443,protocol:"vless",settings:$s,streamSettings:$t,tag:$tag,sniffing:$n}')"
-  R="$(curl -kfsS "${API_AUTH[@]}" -H 'Content-Type: application/json' -X POST "$API_BASE/panel/api/inbounds/add" --data-binary "$IB")"
+  R="$(curl -q -fsS "${API_AUTH[@]}" -H 'Content-Type: application/json' -X POST "$API_BASE/panel/api/inbounds/add" --data-binary "$IB")"
   jq -e '.success==true' <<<"$R" >/dev/null || die "Inbound creation failed: $R"
   REALITY_PUBLIC="$PUB_R"; SHORT_ID="$SID"
   {
@@ -299,29 +311,34 @@ fi
 
 CURRENT_STEP='applying the low-memory Xray profile'
 xhttp_memory_apply "$INBOUND_TAG" "$TRANSPORT"
+if [[ -n "${MIGRATION_DB:-}" ]]; then
+  CURRENT_STEP='importing VLESS users and usage'
+  [[ -r "$MIGRATION_SCRIPT" ]] || die "SQLite migration helpers are missing."
+  xhttp_import_migrated_clients
+fi
 
 WARP_CONFIGURED=0
 if [[ "${ENABLE_WARP:-0}" -eq 1 ]]; then
   CURRENT_STEP='configuring built-in WARP and RU routing'
   printf '\n%b[STEP]%b %s\n' "$cyan" "$plain" "$CURRENT_STEP"
-  R="$(curl -kfsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/data")"
+  R="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/data")"
   if ! jq -e '.success==true and .obj!=null and .obj!=""' <<<"$R" >/dev/null; then
     PRIV="$(wg genkey)"; PUB="$(printf '%s' "$PRIV"|wg pubkey)"
-    R="$(curl -kfsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/reg" \
+    R="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/reg" \
       --data-urlencode "privateKey=$PRIV" --data-urlencode "publicKey=$PUB")"
     if ! jq -e '.success==true' <<<"$R" >/dev/null; then
       die "WARP registration failed. WARP was requested, so repair cannot continue. Panel response: ${R}"
     fi
   fi
   if [[ "$ENABLE_WARP" -eq 1 ]]; then
-    WARP_DATA_RESPONSE="$(curl -kfsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/data")"
-    WARP_CONFIG_RESPONSE="$(curl -kfsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/config")"
+    WARP_DATA_RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/data")"
+    WARP_CONFIG_RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/config")"
     WARP_DATA="$(jq -c '.obj|if type=="string" then fromjson else . end' <<<"$WARP_DATA_RESPONSE")"
     WARP_CONFIG="$(jq -c '.obj|if type=="string" then fromjson else . end' <<<"$WARP_CONFIG_RESPONSE")"
     if ! build_warp_outbound "$WARP_DATA" "$WARP_CONFIG"; then
       die "WARP account data is incomplete. WARP was requested, so repair cannot continue."
     else
-      R="$(curl -kfsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/")"
+      R="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/")"
       jq -e '.success==true and .obj!=null' <<<"$R" >/dev/null || die "Could not read Xray configuration: $R"
       X="$(jq -c '.obj|if type=="string" then fromjson else . end|.xraySetting|if type=="string" then fromjson else . end' <<<"$R")"
       jq -e 'type=="object" and (.outbounds|type=="array")' <<<"$X" >/dev/null || die "Xray configuration has an unexpected format."
@@ -329,7 +346,7 @@ if [[ "${ENABLE_WARP:-0}" -eq 1 ]]; then
       sqlite3 /etc/x-ui/x-ui.db ".timeout 5000" ".backup '$WARP_BACKUP/x-ui.db'"
       X="$(xhttp_warp_config "$WARP_OUT" <<<"$X")"
       xhttp_validate_warp_routes <<<"$X" || die "Required Russian routing datasets are unavailable."
-      R="$(curl -kfsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/update" \
+      R="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/update" \
         --data-urlencode "xraySetting=$X" --data-urlencode 'outboundTestUrl=https://www.cloudflare.com/cdn-cgi/trace')"
       if ! jq -e '.success==true' <<<"$R" >/dev/null; then
         die "WARP routing could not be saved. WARP was requested, so repair cannot continue. Panel response: ${R}"
@@ -343,7 +360,7 @@ fi
 systemctl restart x-ui; sleep 2
 READY=0; R=""
 for _ in $(seq 1 40); do
-  R="$(curl -kfsS "${API_AUTH[@]}" --connect-timeout 2 --max-time 5 "$API_BASE/panel/api/server/status" 2>&1 || true)"
+  R="$(curl -q -fsS "${API_AUTH[@]}" --connect-timeout 2 --max-time 5 "$API_BASE/panel/api/server/status" 2>&1 || true)"
   if jq -e '.success==true' <<<"$R" >/dev/null 2>&1; then READY=1; break; fi
   sleep 1
 done
@@ -355,7 +372,7 @@ if [[ "$INSTALL_MODE" == "node" && -z "${NODE_API_TOKEN:-}" ]]; then
   printf '\nNODE_API_TOKEN=%q\n' "$NODE_API_TOKEN" >> "${STATE_FILES[0]}"
 fi
 INBOUND_OK=0; CLIENT_OK=0; SUB_OK=0; SELF_STEAL_OK=0; ROUTING_OK=0; MIHOMO_OK=0
-R="$(curl -kfsS "${API_AUTH[@]}" "$API_BASE/panel/api/inbounds/list" || true)"
+R="$(curl -q -fsS "${API_AUTH[@]}" "$API_BASE/panel/api/inbounds/list" || true)"
 if jq -e --arg d "$DOMAIN" --arg t "127.0.0.1:${FALLBACK_PORT}" --arg transport "$TRANSPORT" --arg tag "$INBOUND_TAG" '
   .success==true and ((.obj|if type=="string" then fromjson else . end)|any(
     .port==443 and .protocol=="vless" and .enable==true and .tag==$tag and
@@ -367,7 +384,7 @@ if jq -e --arg d "$DOMAIN" --arg t "127.0.0.1:${FALLBACK_PORT}" --arg transport 
        else $s.network=="xhttp" and $s.xhttpSettings.host==$d and $s.xhttpSettings.path=="/" end))))
 ' <<<"$R" >/dev/null 2>&1; then INBOUND_OK=1; fi
 for _ in $(seq 1 20); do
-  COVER_DATA="$(curl -kfsS --resolve "${DOMAIN}:443:127.0.0.1" --max-time 5 "https://${DOMAIN}/" 2>/dev/null || true)"
+  COVER_DATA="$(curl -fsS --noproxy '*' --resolve "${DOMAIN}:443:127.0.0.1" --max-time 5 "https://${DOMAIN}/" 2>/dev/null || true)"
   if grep -Fq "$DOMAIN" <<<"$COVER_DATA"; then SELF_STEAL_OK=1; break; fi
   sleep 1
 done
@@ -536,6 +553,10 @@ fi
 
 umask 077
 RESULT_FILE="${RESULT_FILE:-/root/xhttp-vps-result-${INSTANCE_NAME}.txt}"
+if [[ "$INSTALL_MODE" == standalone && -n "${CLIENT_UUID:-}" && -n "${CLIENT_SUB_ID:-}" ]]; then
+  SUBSCRIPTION_DISPLAY="$(xhttp_subscription_links "https://${DOMAIN}/${SUB_PATH}/${CLIENT_SUB_ID}" "$CLIENT_EMAIL")" \
+    || die "Could not generate the selected HAPP and INCY subscription links."
+fi
 RESULT_TEMP="$(mktemp "${RESULT_FILE}.XXXXXXXX")"
 case "$PANEL_ACCESS_MODE" in
   private)
@@ -564,7 +585,8 @@ printf '  %bLogin:%b    %s\n' "$yellow" "$plain" "$PANEL_USERNAME"
 printf '  %bPassword:%b %s\n\n' "$yellow" "$plain" "$PANEL_PASSWORD"
 if [[ "$INSTALL_MODE" == "standalone" && -n "${CLIENT_UUID:-}" && -n "${CLIENT_SUB_ID:-}" ]]; then
   printf '%bCLIENT SUBSCRIPTIONS%b\n' "$cyan" "$plain"
-  printf '  %bHAPP / INCY:%b https://%s/%s/%s\n' "$yellow" "$plain" "$DOMAIN" "$SUB_PATH" "$CLIENT_SUB_ID"
+  printf '%s\n' "$SUBSCRIPTION_DISPLAY"
+  if [[ -s "$MANAGED_BACKUP/migration.done" ]]; then printf 'Imported VLESS clients: %s\n' "$(cat "$MANAGED_BACKUP/migration.done")"; fi
   printf '  %bMihomo:%b      %s\n' "$yellow" "$plain" "$MIHOMO_ROUTING_URL"
   printf '  %bRouting:%b     HAPP and INCY RoscomVPN routing profiles are included.\n\n' "$yellow" "$plain"
 fi

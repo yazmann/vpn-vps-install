@@ -8,6 +8,9 @@
 
 - [3x-ui](https://github.com/MHSanaei/3x-ui) — сторонняя панель, которую скрипт загружает из официального репозитория проекта. Лицензия: [GNU GPL v3](https://github.com/MHSanaei/3x-ui/blob/master/LICENSE). Авторы этого установщика не заявляют авторских прав на 3x-ui.
 - [Xray-core](https://github.com/XTLS/Xray-core) — стороннее сетевое ядро, используемое 3x-ui. Лицензия: [Mozilla Public License 2.0](https://github.com/XTLS/Xray-core/blob/main/LICENSE).
+- [AmneziaWG](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module) — модуль ядра и утилиты из официального PPA Amnezia.
+- [Hysteria 2](https://github.com/apernet/hysteria) — отдельная служба QUIC. Лицензия [MIT](https://github.com/apernet/hysteria/blob/master/LICENSE).
+- [INCY link encoder](https://github.com/INCY-DEV/incy-link-encoder) описывает совместимый формат crypt1 и публикует общий ключ приложения. Установщик использует этот формат с системной библиотекой Node.js.
 - [Cloudflare WARP](https://www.cloudflare.com/application/terms/) — сторонний сервис Cloudflare. Этот проект лишь автоматизирует настройку поддерживаемой 3x-ui интеграции и не связан с Cloudflare. Пользователь самостоятельно отвечает за соблюдение применимых условий сервиса и его доступность в своей юрисдикции.
 - [NGINX](https://github.com/nginx/nginx), Ubuntu и системные пакеты устанавливаются из репозиториев операционной системы и сохраняют собственные лицензии и условия распространения.
 - Фотографии для сайта-заглушки предоставляются отдельно на условиях [Unsplash License](https://unsplash.com/license). Авторы и исходные страницы перечислены в [PHOTO_ATTRIBUTION.md](PHOTO_ATTRIBUTION.md).

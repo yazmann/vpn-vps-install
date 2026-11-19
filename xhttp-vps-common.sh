@@ -2,20 +2,6 @@
 # SPDX-License-Identifier: GPL-3.0-only
 # Shared lifecycle and verification functions. No actions on source.
 
-# Audited upstream inputs. Updating any URL requires updating its SHA-256 in the
-# same commit after reviewing the upstream diff.
-# These constants are consumed by the scripts that source this file.
-# shellcheck disable=SC2034
-readonly XHTTP_XUI_VERSION='v3.8.5' \
-  XHTTP_XUI_INSTALL_SHA256='4e3fe7fe00ef8e904ce6a0e9c36fd8a0c7179fe5e786f23e31801aee84c6347d' \
-  XHTTP_ACME_SH_VERSION='3.1.6' \
-  XHTTP_ACME_SH_COMMIT='807da6498377ee5e0cf43a78091f46f12dc59a89' \
-  XHTTP_ACME_SH_SHA256='ddbe1bcbd1a44a2623a2af167ebdc678669e6e2eb396742f2d1d28e02dc14220' \
-  XHTTP_ROUTING_COMMIT='8c141f103a50e3ed6c7034be360291cdeb5685f3' \
-  XHTTP_HAPP_SHA256='337156e3601abda728b5133932e46ca74bf363f638bc6b1a2e85954823e4e950' \
-  XHTTP_INCY_SHA256='b5f1e4bcac2f68731c83d42444266f7247eff1ced88fb9f6b36227efd3f31096' \
-  XHTTP_MIHOMO_SHA256='515f05be855342380fc5291f0e1bdaf43f0ce71a2584e0cf07d087fc2026003c'
-
 xhttp_valid_ipv4() {
   local value="$1" octet
   local -a parts
@@ -53,8 +39,70 @@ xhttp_transport_label() {
   case "$1" in
     vision) printf '%s' 'VLESS + TCP + XTLS Vision + REALITY' ;;
     xhttp) printf '%s' 'VLESS + XHTTP + REALITY' ;;
+    amneziawg) printf '%s' 'AmneziaWG' ;;
+    hysteria2) printf '%s' 'Hysteria 2' ;;
     *) return 1 ;;
   esac
+}
+
+xhttp_uses_panel() { [[ "${TRANSPORT:-xhttp}" == vision || "${TRANSPORT:-xhttp}" == xhttp ]]; }
+
+xhttp_service_name() {
+  case "${TRANSPORT:-xhttp}" in
+    vision|xhttp) printf '%s\n' x-ui ;;
+    amneziawg) printf '%s\n' awg-quick@awg-vps ;;
+    hysteria2) printf '%s\n' xhttp-vps-hysteria ;;
+    *) return 1 ;;
+  esac
+}
+
+xhttp_incy_subscription() {
+  # Public crypt1 interoperability key from the official INCY link encoder.
+  node -e '
+    const {createCipheriv, randomBytes} = require("crypto");
+    const url = require("fs").readFileSync(0, "utf8").trim();
+    if (!url.startsWith("https://") || /\s/.test(url)) process.exit(1);
+    const key = Buffer.from("f6d40ea0c8a8899d7c682d09ba0d4165dfe2b3dd45e6bb3e25cb233cf00c2462", "hex");
+    const iv = randomBytes(12);
+    const cipher = createCipheriv("aes-256-gcm", key, iv);
+    const payload = JSON.stringify({url, v: 1});
+    const encoded = Buffer.concat([iv, cipher.update(payload, "utf8"), cipher.final(), cipher.getAuthTag()])
+      .toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    process.stdout.write("incy://crypt1/" + encoded + "\n");
+  '
+}
+
+xhttp_subscription_links() {
+  local url="$1" email="$2" response email_path client_id happ incy
+  if [[ "${SUB_ENCRYPT_LINKS:-}" != true ]]; then
+    printf 'HAPP / INCY subscription: %s\n' "$url"
+    return 0
+  fi
+  email_path="$(jq -rn --arg email "$email" '$email|@uri')" || return 1
+  response="$(xhttp_memory_api "/panel/api/clients/get/$email_path")" || return 1
+  client_id="$(jq -er '.obj.client.id | select(type=="number" and .>0 and floor==.)' <<<"$response")" || return 1
+  response="$(xhttp_memory_api "/panel/api/clients/happLink/$client_id" -X POST)" || return 1
+  happ="$(jq -er '.obj.encryptedLink | select(test("^happ://crypt[0-9]*/[a-zA-Z0-9_+=/-]+$"))' <<<"$response")" || return 1
+  incy="$(printf '%s\n' "$url" | xhttp_incy_subscription)" || return 1
+  printf 'HAPP subscription: %s\nINCY subscription: %s\n' "$happ" "$incy"
+}
+
+xhttp_lock() {
+  local lock=/run/xhttp-vps-setup.lock
+  if [[ ! /proc/$$/fd/9 -ef "$lock" ]]; then exec 9>"$lock"; fi
+  flock -n 9
+}
+
+xhttp_delete_firewall_rules() {
+  local marker="$1" listing number
+  listing="$(ufw status numbered)" || return 1
+  while IFS= read -r number; do
+    ufw --force delete "$number" || return 1
+  done < <(awk -v tag="# $marker" '
+    index($0,tag) && (length($0)==index($0,tag)+length(tag)-1 || substr($0,index($0,tag)+length(tag),1)==" ") {
+      sub(/^\[[[:space:]]*/, ""); sub(/\].*$/, ""); print
+    }
+  ' <<<"$listing" | sort -rn)
 }
 
 xhttp_ssh_access_label() {
@@ -424,14 +472,15 @@ EOF
 }
 
 xhttp_install_maintenance() {
-  local temporary
+  local temporary service
+  service="$(xhttp_service_name)" || return 1
   [[ "$MAINTENANCE_TIMEZONE" =~ ^([A-Za-z0-9_+-]+/)*[A-Za-z0-9_+-]+$ ]] || return 1
   [[ -f "/usr/share/zoneinfo/$MAINTENANCE_TIMEZONE" ]] || return 1
   cat > /usr/local/sbin/xhttp-vps-maintenance <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-exec 9>/run/lock/xhttp-vps-maintenance.lock
-flock -w 1800 9
+exec 9>/run/xhttp-vps-setup.lock
+flock -n 9 || exit 0
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 apt-get -o DPkg::Lock::Timeout=1800 update
@@ -439,7 +488,7 @@ apt-get -o DPkg::Lock::Timeout=1800 -y -o Dpkg::Options::="--force-confold" upgr
 apt-get check
 [[ -z "$(dpkg --audit)" ]]
 nginx -t
-for service in ssh x-ui nginx; do
+for service in ssh nginx "$1"; do
   systemctl is-active --quiet "$service"
 done
 if [[ -f /var/run/reboot-required ]]; then
@@ -450,7 +499,7 @@ else
 fi
 EOF
   chmod 700 /usr/local/sbin/xhttp-vps-maintenance
-  cat > /etc/systemd/system/xhttp-vps-maintenance.service <<'EOF'
+  cat > /etc/systemd/system/xhttp-vps-maintenance.service <<EOF
 [Unit]
 Description=Install weekly Ubuntu updates and reboot only when required
 Wants=network-online.target
@@ -458,7 +507,7 @@ After=network-online.target apt-daily.service apt-daily-upgrade.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/xhttp-vps-maintenance
+ExecStart=/usr/local/sbin/xhttp-vps-maintenance $service
 Nice=10
 IOSchedulingClass=idle
 UMask=0027
@@ -520,7 +569,7 @@ EOF
 
 xhttp_download_verified() {
   local url="$1" expected="$2" output="$3" actual
-  curl -fL --retry 3 --connect-timeout 10 --max-time 120 "$url" -o "$output" || {
+  curl -q -fL --proto '=https' --proto-redir '=https' --retry 3 --connect-timeout 10 --max-time 120 "$url" -o "$output" || {
     rm -f -- "$output"
     return 1
   }
@@ -532,16 +581,119 @@ xhttp_download_verified() {
   fi
 }
 
-xhttp_fetch_verified_text() {
-  local url="$1" expected="$2" temporary
-  temporary="$(mktemp /tmp/xhttp-download.XXXXXXXX)"
-  if ! xhttp_download_verified "$url" "$expected" "$temporary"; then
-    rm -f -- "$temporary"
-    return 1
-  fi
-  cat -- "$temporary"
-  rm -f -- "$temporary"
+xhttp_latest_release_asset() {
+  local repo="$1" asset="$2" output="$3" release record url digest
+  release="$(curl -q -fsSL --proto '=https' --proto-redir '=https' --retry 3 --connect-timeout 10 --max-time 30 \
+    "https://api.github.com/repos/$repo/releases/latest")" || return 1
+  record="$(jq -er --arg asset "$asset" '
+    select(.draft == false and .prerelease == false)
+    | [.assets[] | select(.name == $asset and .state == "uploaded"
+         and ((.digest // "") | test("^sha256:[a-f0-9]{64}$")))]
+    | select(length == 1) | .[0] | [.browser_download_url, (.digest | ltrimstr("sha256:"))] | @tsv
+  ' <<<"$release")" || return 1
+  IFS=$'\t' read -r url digest <<<"$record"
+  [[ "$url" == "https://github.com/$repo/releases/download/"*"/$asset" ]] || return 1
+  xhttp_download_verified "$url" "$digest" "$output"
 }
+
+xhttp_release_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf '%s\n' amd64 ;;
+    aarch64|arm64) printf '%s\n' arm64 ;;
+    armv7l) printf '%s\n' armv7 ;;
+    s390x) printf '%s\n' s390x ;;
+    *) return 1 ;;
+  esac
+}
+
+xhttp_install_panel() (
+  set -Eeuo pipefail
+  umask 077
+  local stage arch xray_arch archive
+  arch="$(xhttp_release_arch)"
+  case "$arch" in
+    amd64) xray_arch=64 ;;
+    arm64) xray_arch=arm64-v8a ;;
+    armv7) xray_arch=arm32-v7a ;;
+    s390x) xray_arch=s390x ;;
+  esac
+  stage="$(mktemp -d /usr/local/.xhttp-panel.XXXXXXXX)"
+  trap 'rm -rf -- "$stage"' EXIT
+  archive="$stage/panel.tar.gz"
+  xhttp_latest_release_asset MHSanaei/3x-ui "x-ui-linux-$arch.tar.gz" "$archive"
+  tar -xzf "$archive" --no-same-owner -C "$stage"
+  [[ -x "$stage/x-ui/x-ui" && -x "$stage/x-ui/bin/xray-linux-$arch" ]]
+  xhttp_latest_release_asset XTLS/Xray-core "Xray-linux-$xray_arch.zip" "$stage/xray.zip"
+  unzip -p "$stage/xray.zip" xray > "$stage/x-ui/bin/xray-linux-$arch"
+  chmod 755 "$stage/x-ui/bin/xray-linux-$arch"
+  "$stage/x-ui/bin/xray-linux-$arch" version >/dev/null
+  install -m 700 "$stage/x-ui/x-ui.sh" /usr/bin/x-ui
+  install -m 644 "$stage/x-ui/x-ui.service.debian" /etc/systemd/system/x-ui.service
+  systemctl daemon-reload
+  mv -T "$stage/x-ui" /usr/local/x-ui
+)
+
+xhttp_install_cert_renewal() {
+  local reload='systemctl reload nginx'
+  case "${TRANSPORT:-xhttp}" in
+    vision|xhttp) reload+=' && systemctl try-restart x-ui' ;;
+    hysteria2) reload+=' && systemctl try-restart xhttp-vps-hysteria' ;;
+  esac
+  cat > /etc/systemd/system/xhttp-vps-cert-renew.service <<EOF
+[Unit]
+Description=Renew the VPN site's Let's Encrypt certificate
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/usr/bin/certbot renew --quiet --config-dir /etc/xhttp-vps-acme --work-dir /var/lib/xhttp-vps-acme --logs-dir /var/log/xhttp-vps-acme --deploy-hook "$reload"
+EOF
+  cat > /etc/systemd/system/xhttp-vps-cert-renew.timer <<'EOF'
+[Unit]
+Description=Check the VPN site's certificate twice daily
+
+[Timer]
+OnCalendar=*-*-* 00,12:00:00
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  chmod 644 /etc/systemd/system/xhttp-vps-cert-renew.{service,timer}
+  systemctl daemon-reload
+  systemctl enable --now xhttp-vps-cert-renew.timer
+}
+
+xhttp_routing_revision() {
+  curl -q -fsS --proto '=https' --retry 2 --connect-timeout 5 --max-time 15 \
+    https://api.github.com/repos/hydraponique/roscomvpn-routing/git/ref/heads/main \
+    | jq -er '.object.sha | select(type=="string" and test("^[a-f0-9]{40}$"))'
+}
+
+xhttp_fetch_routing() (
+  local revision="$1" path="$2"
+  case "$path" in HAPP/DEFAULT.DEEPLINK|INCY/DEFAULT.DEEPLINK|MIHOMO/default.yaml) ;; *) exit 1 ;; esac
+  xhttp_fetch_repo_text hydraponique/roscomvpn-routing "$revision" "$path"
+)
+
+xhttp_fetch_repo_text() (
+  set -Eeuo pipefail
+  local repo="$1" revision="$2" path="$3" response temporary sha blob
+  [[ "$repo" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ && "$revision" =~ ^[a-f0-9]{40}$ ]] || exit 1
+  [[ "$path" =~ ^[a-zA-Z0-9_./-]+$ && "$path" != *..* ]] || exit 1
+  temporary="$(mktemp)" || exit 1
+  trap 'rm -f -- "$temporary"' EXIT
+  response="$(curl -q -fsS --proto '=https' --retry 2 --connect-timeout 5 --max-time 20 \
+    "https://api.github.com/repos/$repo/contents/$path?ref=$revision")" || exit 1
+  sha="$(jq -er '.sha | select(type=="string" and test("^[a-f0-9]{40}$"))' <<<"$response")" || exit 1
+  jq -er 'select(.type=="file" and .encoding=="base64") | .content' <<<"$response" | base64 -d > "$temporary" || exit 1
+  blob="$({ printf 'blob %s\0' "$(stat -c '%s' "$temporary")"; cat "$temporary"; } | sha1sum)" || exit 1
+  [[ "${blob%% *}" == "$sha" ]] || exit 1
+  cat "$temporary"
+)
 
 xhttp_create_api_header_file() {
   local token="$1" file
@@ -554,6 +706,13 @@ xhttp_create_api_header_file() {
 
 xhttp_render_acme_nginx() {
 cat <<EOF
+server {
+    listen 80 default_server;
+    server_name _;
+    server_tokens off;
+    access_log off;
+    return 404;
+}
 server {
     listen 80;
     server_name ${DOMAIN};
@@ -590,11 +749,21 @@ xhttp_install_acme_nginx() (
   fi
 )
 
-xhttp_render_nginx_http2() {
+xhttp_nginx_version() {
   local version
   version="${XHTTP_NGINX_VERSION_OVERRIDE:-$(nginx -v 2>&1 | sed -n 's#^nginx version: nginx/\([0-9][0-9.]*\).*#\1#p')}"
-  [[ -n "$version" ]] || return 1
-  if [[ "$(printf '%s\n' 1.25.1 "$version" | sort -V | head -n 1)" == 1.25.1 ]]; then
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  printf '%s\n' "$version"
+}
+
+xhttp_version_at_least() {
+  [[ "$(printf '%s\n' "$1" "$2" | sort -V | head -n 1)" == "$2" ]]
+}
+
+xhttp_render_nginx_http2() {
+  local version
+  version="$(xhttp_nginx_version)" || return 1
+  if xhttp_version_at_least "$version" 1.25.1; then
     printf '    listen 127.0.0.1:%s ssl;\n    http2 on;\n' "$FALLBACK_PORT"
   else
     printf '    listen 127.0.0.1:%s ssl http2;\n' "$FALLBACK_PORT"
@@ -603,13 +772,21 @@ xhttp_render_nginx_http2() {
 
 xhttp_install_nginx() (
   set -Eeuo pipefail
-  local staging target=/etc/nginx/sites-available/3xui-self-steal.conf
+  local staging version target=/etc/nginx/sites-available/3xui-self-steal.conf
   local link=/etc/nginx/sites-enabled/3xui-self-steal.conf
   staging="$(mktemp -d /etc/nginx/xhttp-config.XXXXXXXX)"
-  trap 'rm -f "$staging/new" "$staging/previous" "$staging/link"; rmdir "$staging"' EXIT
+  trap 'rm -f "$staging/new" "$staging/previous" "$staging/link" "$staging/default.pem" "$staging/default-key.pem"; rmdir "$staging"' EXIT
   [[ ! -d "$target" && ! -d "$link" ]] || return 1
   if [[ -e "$target" || -L "$target" ]]; then cp -a "$target" "$staging/previous"; fi
   if [[ -e "$link" || -L "$link" ]]; then cp -a "$link" "$staging/link"; fi
+  version="$(xhttp_nginx_version)" || return 1
+  if ! xhttp_version_at_least "$version" 1.19.4 &&
+     [[ ! -s "$CERT_DIR/default.pem" || ! -s "$CERT_DIR/default-key.pem" ]]; then
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
+      -subj '/CN=localhost' -keyout "$staging/default-key.pem" -out "$staging/default.pem" >/dev/null 2>&1 || return 1
+    install -m 600 "$staging/default-key.pem" "$CERT_DIR/default-key.pem" || return 1
+    install -m 644 "$staging/default.pem" "$CERT_DIR/default.pem" || return 1
+  fi
   xhttp_render_nginx > "$staging/new"
   chmod 644 "$staging/new"
   mv -T "$staging/new" "$target"
@@ -623,10 +800,38 @@ xhttp_install_nginx() (
 )
 
 xhttp_render_nginx() {
+local listener default_listener default_tls version subscriptions='' FALLBACK_PORT="${FALLBACK_PORT:-}"
+if xhttp_uses_panel; then
+  listener="$(xhttp_render_nginx_http2)" || return 1
+  subscriptions="$(xhttp_render_subscription_locations)" || return 1
+else
+  FALLBACK_PORT=443
+  listener="$(xhttp_render_nginx_http2)" || return 1
+  listener="${listener/127.0.0.1:/0.0.0.0:}"
+fi
+default_listener="${listener/;/ default_server;}"
+if [[ "${TRANSPORT:-}" == hysteria2 ]]; then
+  listener+=$'\n    add_header Alt-Svc \'h3=":443"; ma=86400\' always;'
+fi
+version="$(xhttp_nginx_version)" || return 1
+if xhttp_version_at_least "$version" 1.19.4; then
+  default_tls='    ssl_reject_handshake on;'
+else
+  printf -v default_tls '    ssl_certificate %s/default.pem;\n    ssl_certificate_key %s/default-key.pem;' "$CERT_DIR" "$CERT_DIR"
+fi
 xhttp_render_acme_nginx
 cat <<EOF
 server {
-$(xhttp_render_nginx_http2)
+$default_listener
+    server_name _;
+    server_tokens off;
+    access_log off;
+    ssl_protocols TLSv1.2 TLSv1.3;
+$default_tls
+    return 421;
+}
+server {
+$listener
     server_name ${DOMAIN};
     server_tokens off;
     access_log off;
@@ -635,70 +840,62 @@ $(xhttp_render_nginx_http2)
     ssl_protocols TLSv1.2 TLSv1.3;
     root /var/www/3xui-cover;
     index index.html;
-    location ^~ /${SUB_PATH}/ {
-        proxy_pass https://127.0.0.1:${SUB_PORT};
-        proxy_ssl_verify off;
-        proxy_ssl_server_name on;
-        proxy_ssl_name ${DOMAIN};
-        proxy_set_header Host ${DOMAIN};
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-    }
-    location ^~ /${SUB_JSON_PATH:-disabled-json}/ {
-        proxy_pass https://127.0.0.1:${SUB_PORT};
-        proxy_ssl_verify off;
-        proxy_ssl_server_name on;
-        proxy_ssl_name ${DOMAIN};
-        proxy_set_header Host ${DOMAIN};
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-    }
-    location ^~ /${SUB_CLASH_PATH:-disabled-mihomo}/ {
-        proxy_pass https://127.0.0.1:${SUB_PORT};
-        proxy_ssl_verify off;
-        proxy_ssl_server_name on;
-        proxy_ssl_name ${DOMAIN};
-        proxy_set_header Host ${DOMAIN};
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-    }
-    location / { try_files \$uri \$uri/ /index.html; }
+$subscriptions
+    location / { try_files \$uri \$uri/ =404; }
 }
 EOF
 }
 
+xhttp_render_subscription_locations() {
+local path
+for path in "$SUB_PATH" "${SUB_JSON_PATH:-}" "${SUB_CLASH_PATH:-}"; do
+[[ -n "$path" ]] || continue
+cat <<EOF
+    location ^~ /${path}/ {
+        proxy_pass https://127.0.0.1:${SUB_PORT};
+        proxy_ssl_verify on;
+        proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+        proxy_ssl_verify_depth 3;
+        proxy_ssl_server_name on;
+        proxy_ssl_name ${DOMAIN};
+        proxy_set_header Host ${DOMAIN};
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+EOF
+done
+}
+
 xhttp_probe_foreign_sni() {
-  local response
-  response="$(
-    printf 'GET / HTTP/1.1\r\nHost: unrelated.invalid\r\nConnection: close\r\n\r\n' \
-      | timeout 12 openssl s_client -quiet -connect 127.0.0.1:443 \
-          -servername unrelated.invalid -alpn http/1.1 2>/dev/null || true
-  )"
-  grep -Fq "$DOMAIN" <<<"$response" \
-    && ! grep -Eiq '3x-ui|x-ui|panel/api|<title>.*login' <<<"$response"
+  xhttp_probe_rejected_sni -servername unrelated.invalid
 }
 
 xhttp_probe_no_sni() {
-  local response
+  xhttp_probe_rejected_sni -noservername
+}
+
+xhttp_probe_rejected_sni() {
+  local response version fingerprint peer
   response="$(
-    printf 'GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$DOMAIN" \
-      | timeout 12 openssl s_client -quiet -connect 127.0.0.1:443 \
-          -noservername -alpn http/1.1 2>/dev/null || true
+    timeout 12 openssl s_client -connect 127.0.0.1:443 -tls1_3 "$@" </dev/null 2>&1 || true
   )"
-  grep -Fq "$DOMAIN" <<<"$response" \
-    && ! grep -Eiq '3x-ui|x-ui|panel/api|<title>.*login' <<<"$response"
+  if grep -Eiq 'unrecognized name|alert number 112' <<<"$response"; then return 0; fi
+  version="$(xhttp_nginx_version)" || return 1
+  if xhttp_version_at_least "$version" 1.19.4; then return 1; fi
+  fingerprint="$(openssl x509 -noout -fingerprint -sha256 -in "$CERT_DIR/default.pem")" || return 1
+  peer="$(openssl x509 -noout -fingerprint -sha256 <<<"$response" 2>/dev/null)" || return 1
+  [[ "$peer" == "$fingerprint" ]]
 }
 
 xhttp_probe_h2_alpn() {
   local response
   response="$(
-    printf '' | timeout 12 openssl s_client -connect 127.0.0.1:443 \
-      -servername "$DOMAIN" -alpn 'h2,http/1.1' 2>&1 || true
+    timeout 12 openssl s_client -connect 127.0.0.1:443 -tls1_3 \
+      -servername "$DOMAIN" -verify_hostname "$DOMAIN" -verify_return_error \
+      -alpn 'h2,http/1.1' </dev/null 2>&1 || true
   )"
-  grep -Fq 'ALPN protocol: h2' <<<"$response"
+  grep -Fq 'ALPN protocol: h2' <<<"$response" && grep -Fq 'Verify return code: 0 (ok)' <<<"$response"
 }
 
 random_hex() { od -An -N "$1" -tx1 /dev/urandom | tr -d ' \n'; }
@@ -760,17 +957,32 @@ xhttp_validate_warp_routes() (
 )
 
 xhttp_managed_paths() {
-  printf '%s\n' /etc/systemd/system/x-ui.service /usr/lib/systemd/system/x-ui.service \
-    /usr/bin/x-ui /etc/default/x-ui /usr/local/x-ui /etc/x-ui /var/log/x-ui \
-    /etc/nginx/sites-available/3xui-self-steal.conf /etc/nginx/sites-enabled/3xui-self-steal.conf \
+  if xhttp_uses_panel; then
+    printf '%s\n' /etc/systemd/system/x-ui.service /usr/lib/systemd/system/x-ui.service \
+      /usr/bin/x-ui /etc/default/x-ui /usr/local/x-ui /etc/x-ui /var/log/x-ui \
+      /etc/fail2ban/filter.d/xhttp-vps-panel.conf /etc/fail2ban/jail.d/xhttp-vps-panel.local \
+      /etc/systemd/system/x-ui.service.d/10-xui-sandbox.conf
+  fi
+  printf '%s\n' /etc/nginx/sites-available/3xui-self-steal.conf /etc/nginx/sites-enabled/3xui-self-steal.conf \
     /etc/nginx/sites-enabled/default /var/www/3xui-cover \
     /etc/modules-load.d/bbr.conf /etc/sysctl.d/99-xhttp-vps-network.conf \
     /etc/apt/apt.conf.d/52xhttp-vps-auto-upgrades /etc/apt/apt.conf.d/53xhttp-vps-unattended-upgrades \
     /etc/fail2ban/jail.d/xhttp-vps-sshd.local \
-    /etc/fail2ban/filter.d/xhttp-vps-panel.conf /etc/fail2ban/jail.d/xhttp-vps-panel.local \
     /usr/local/sbin/xhttp-vps-maintenance /etc/systemd/system/xhttp-vps-maintenance.service \
     /etc/systemd/system/xhttp-vps-maintenance.timer \
     "/root/cert/$DOMAIN" "$RESULT_FILE"
+  if [[ "${ACME_CLIENT:-}" == certbot ]]; then
+    printf '%s\n' /etc/xhttp-vps-acme /var/lib/xhttp-vps-acme /var/log/xhttp-vps-acme \
+      /etc/systemd/system/xhttp-vps-cert-renew.service /etc/systemd/system/xhttp-vps-cert-renew.timer
+  fi
+  case "${TRANSPORT:-xhttp}" in
+    amneziawg) printf '%s\n' /etc/amnezia/amneziawg/awg-vps.conf /etc/xhttp-vps-awg \
+      /usr/local/sbin/xhttp-vps-awg-firewall /etc/sysctl.d/99-xhttp-vps-awg.conf \
+      /etc/apt/keyrings/xhttp-vps-amnezia.gpg /etc/apt/sources.list.d/xhttp-vps-amnezia.sources \
+      /etc/apt/preferences.d/xhttp-vps-amnezia ;;
+    hysteria2) printf '%s\n' /etc/xhttp-vps-hysteria.yaml /root/xhttp-vps-hysteria.uri \
+      /usr/local/bin/xhttp-vps-hysteria /etc/systemd/system/xhttp-vps-hysteria.service ;;
+  esac
 }
 
 xhttp_validate_ssh_access_state() {
@@ -801,7 +1013,21 @@ xhttp_validate_state() {
   [[ "$RESULT_FILE" =~ ^/root/xhttp-vps-result-[A-Za-z0-9_-]+\.txt$ ]] || return 1
   [[ "${MANAGED_BACKUP:-}" =~ ^/root/xhttp-managed\.[A-Za-z0-9]+$ ]] || return 1
   [[ -d "$MANAGED_BACKUP" && ! -L "$MANAGED_BACKUP" ]] || return 1
-  case "${TRANSPORT:-xhttp}" in vision|xhttp) ;; *) return 1 ;; esac
+  [[ "${SAFE_INSTANCE:-}" =~ ^[A-Za-z0-9_-]+$ || -z "${SAFE_INSTANCE:-}" ]] || return 1
+  case "${ACME_CLIENT:-acme.sh}" in certbot|acme.sh) ;; *) return 1 ;; esac
+  case "${SUB_ENCRYPT_LINKS:-}" in true|false|'') ;; *) return 1 ;; esac
+  case "${TRANSPORT:-xhttp}" in
+    vision|xhttp) ;;
+    amneziawg|hysteria2)
+      [[ "${INSTALL_MODE:-}" == standalone && "${UDP_PORT:-}" =~ ^[1-9][0-9]{0,4}$ ]] || return 1
+      (( UDP_PORT <= 65535 )) || return 1
+      xhttp_valid_ipv4 "${PUBLIC_IP:-}" || return 1
+      if [[ "$TRANSPORT" == hysteria2 ]]; then
+        [[ "$UDP_PORT" == 443 && "${HY_PASSWORD:-}" =~ ^[a-f0-9]{64}$ ]] || return 1
+      fi
+      ;;
+    *) return 1 ;;
+  esac
   case "${MAINTENANCE_MODE:-weekly}" in security|weekly|none) ;; *) return 1 ;; esac
   case "${TWO_FACTOR_GUIDE:-0}" in 0|1) ;; *) return 1 ;; esac
   xhttp_validate_ssh_access_state
@@ -829,22 +1055,24 @@ xhttp_record_ownership() (
       grep -Fxq -- "$path" < <(cut -f2- "$MANAGED_BACKUP/paths") && continue
       index=$((index+1))
       if [[ -e "$path" || -L "$path" ]]; then
-        cp -a -- "$path" "$MANAGED_BACKUP/original-$index"
+        rm -rf -- "$MANAGED_BACKUP/original-$index.new" || return 1
+        cp -a -- "$path" "$MANAGED_BACKUP/original-$index.new" || return 1
+        mv -T -- "$MANAGED_BACKUP/original-$index.new" "$MANAGED_BACKUP/original-$index" || return 1
       fi
-      printf '%s\t%s\n' "$index" "$path" >> "$MANAGED_BACKUP/paths"
+      printf '%s\t%s\n' "$index" "$path" >> "$MANAGED_BACKUP/paths" || return 1
     done < <(xhttp_managed_paths)
     return 0
   fi
   # A failed initial snapshot is never trusted.
-  : > "$MANAGED_BACKUP/paths.new"
+  : > "$MANAGED_BACKUP/paths.new" || return 1
   while IFS= read -r path; do
     index=$((index+1))
     if [[ -e "$path" || -L "$path" ]]; then
-      cp -a -- "$path" "$MANAGED_BACKUP/original-$index"
+      cp -a -- "$path" "$MANAGED_BACKUP/original-$index" || return 1
     fi
-    printf '%s\t%s\n' "$index" "$path" >> "$MANAGED_BACKUP/paths.new"
+    printf '%s\t%s\n' "$index" "$path" >> "$MANAGED_BACKUP/paths.new" || return 1
   done < <(xhttp_managed_paths)
-  mv "$MANAGED_BACKUP/paths.new" "$MANAGED_BACKUP/paths"
+  mv "$MANAGED_BACKUP/paths.new" "$MANAGED_BACKUP/paths" || return 1
   touch "$MANAGED_BACKUP/ready"
 )
 
@@ -859,14 +1087,14 @@ xhttp_restore_owned_files() (
   while IFS=$'\t' read -r index path; do
     [[ "$index" =~ ^[0-9]+$ ]] || return 1
     if [[ -e "$path" || -L "$path" ]]; then
-      rm -rf -- "$path"
+      rm -rf -- "$path" || return 1
     fi
     if [[ -e "$MANAGED_BACKUP/original-$index" || -L "$MANAGED_BACKUP/original-$index" ]]; then
-      mkdir -p -- "$(dirname "$path")"
-      mv -- "$MANAGED_BACKUP/original-$index" "$path"
+      mkdir -p -- "$(dirname "$path")" || return 1
+      cp -a -- "$MANAGED_BACKUP/original-$index" "$path" || return 1
     fi
   done < "$MANAGED_BACKUP/paths"
-  rm -rf -- "$MANAGED_BACKUP"
+  rm -rf -- "$MANAGED_BACKUP" || return 1
   printf '%s\n' 'Managed VPN files were permanently deleted; pre-existing files were restored.'
 )
 

@@ -23,12 +23,20 @@ jobs:
           bash -n tests/lifecycle.sh
           bash -n tests/api-tokens.sh
           bash -n tests/fake-xray.sh
+          bash -n xhttp-vps-udp.sh
+          bash -n tests/transports.sh
+          bash -n xhttp-vps-migrate.sh
+          bash -n tests/migration.sh
       - name: Test memory profile preservation and idempotence
         run: bash tests/memory-profile.sh
       - name: Test routing, ownership and traffic probe configs
         run: bash tests/lifecycle.sh
       - name: Test least-privilege node token lifecycle
         run: bash tests/api-tokens.sh
+      - name: Test UDP profiles and upstream release verification
+        run: bash tests/transports.sh
+      - name: Test SQLite client migration
+        run: bash tests/migration.sh
       - name: Check 3x-ui schema compatibility
         run: |
           if grep -Fq 'tgId:""' install-xhttp-vps.sh finish-xhttp-vps.sh; then
@@ -43,12 +51,12 @@ jobs:
             echo 'Install and repair flows must not disable or reset panel 2FA.'
             exit 1
           fi
-          if grep -Fq 'roscomvpn-routing/refs/heads/main' install-xhttp-vps.sh finish-xhttp-vps.sh; then
-            echo 'Routing inputs must use the pinned commit and verified checksums.'
+          if grep -Fq 'raw.githubusercontent.com/hydraponique/roscomvpn-routing' install-xhttp-vps.sh finish-xhttp-vps.sh; then
+            echo 'Routing inputs must use one resolved revision and verified Git blobs.'
             exit 1
           fi
-          if grep -Eq 'MHSanaei/3x-ui/releases/latest|get\.acme\.sh' install-xhttp-vps.sh finish-xhttp-vps.sh xhttp-vps-common.sh; then
-            echo 'Root-level bootstrap dependencies must not use mutable latest/get endpoints.'
+          if grep -Eq 'raw\.githubusercontent\.com/MHSanaei/3x-ui/.*/install\.sh|get\.acme\.sh' install-xhttp-vps.sh finish-xhttp-vps.sh xhttp-vps-common.sh; then
+            echo 'Use verified release archives for 3x-ui and APT for Certbot.'
             exit 1
           fi
           if grep -Fq 'API_AUTH=(-H "Authorization: Bearer' install-xhttp-vps.sh finish-xhttp-vps.sh optimize-xhttp-memory.sh; then
@@ -93,7 +101,7 @@ jobs:
         ubuntu: ['22.04', '24.04']
     steps:
       - name: Install test dependencies
-        run: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y bash ca-certificates coreutils findutils git grep jq openssh-client sed sqlite3
+        run: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y bash ca-certificates coreutils findutils git grep jq nodejs openssh-client sed sqlite3
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Check scripts and compatibility helpers
         shell: bash
@@ -102,3 +110,5 @@ jobs:
           bash tests/memory-profile.sh
           bash tests/lifecycle.sh
           bash tests/api-tokens.sh
+          bash tests/transports.sh
+          bash tests/migration.sh

@@ -1,16 +1,24 @@
-# VLESS VPS Setup
+# VPN VPS Setup
 
-Установка VLESS VPN на Ubuntu VPS: Vision и XHTTP — оба с REALITY Self-steal.
+Установщик VPN для Ubuntu VPS с четырьмя транспортами.
+
+| Пункт | Транспорт | Порт | Режим |
+|---|---|---|---|
+| 1 | Vision + REALITY Self-steal | TCP/443 | Самостоятельный сервер или нода 3x-ui |
+| 2 | XHTTP + REALITY Self-steal | TCP/443 | Самостоятельный сервер или нода 3x-ui |
+| 3 | AmneziaWG с поддержкой протокола 3.1 и новее | Выбранный установщиком UDP-порт | Самостоятельный сервер |
+| 4 | Hysteria 2 | UDP/443 | Самостоятельный сервер |
 
 ## Что входит
 
-- 3x-ui и Xray-core: самостоятельный сервер или удалённая нода.
-- Vision или XHTTP с REALITY Self-steal на TCP/443.
+- Последние стабильные релизы 3x-ui, Xray-core и Hysteria 2 загружаются при установке с проверкой SHA-256. AmneziaWG и системные пакеты устанавливаются через APT.
 - Nginx cover-site и сертификат Let's Encrypt.
 - Полное обновление всех установленных пакетов свежего Ubuntu VPS перед настройкой VPN.
 - UFW, Fail2ban, BBR, выбираемая SSH-политика и обновления безопасности.
-- Подписки HAPP, INCY и Mihomo с правилами RoscomVPN.
-- Опциональный Cloudflare WARP для российских ресурсов.
+- Для Vision и XHTTP доступны подписки HAPP, INCY и Mihomo, опциональный WARP и панель с доступом через localhost по умолчанию.
+- Ссылки HAPP и INCY формируются в зашифрованных форматах приложений по умолчанию. Этот выбор можно изменить в мастере.
+- Пункт `Install standalone VPN and import VLESS users from a 3x-ui SQLite backup` переносит пользователей выбранного VLESS inbound на новый VPS.
+- Для AmneziaWG и Hysteria 2 установщик создаёт отдельный клиентский профиль.
 - Проверка/восстановление, удаление без архива и профиль снижения расхода памяти.
 
 ## Требования
@@ -21,28 +29,23 @@
 - Root-доступ, публичный IPv4 и доступ VPS в Интернет.
 - Домен с единственной прямой A-записью на IPv4 VPS, без AAAA и DNS-прокси.
 - Свободные и доступные извне TCP/80, TCP/443 и текущий порт SSH.
+- Для Hysteria 2 откройте UDP/443 в firewall провайдера. Для AmneziaWG откройте UDP-порт, указанный в итоговых настройках. Ядро VPS должно поддерживать загрузку модуля DKMS AmneziaWG и иметь доступные заголовки.
 - Отсутствие установленных 3x-ui, Nginx, ACME и настроенного UFW.
+- Git для получения исходников установщика.
 
 Опционально: SSH-ключ нужен только для key-only режима; доверенный IPv4 — только для allowlist панели; WARP и Tailscale не обязательны.
 
 ## Установка
 
-Выполните от `root`:
+Клонируйте репозиторий и проверьте загруженный коммит. Затем запустите установщик от `root`.
 
 ```bash
 set -euo pipefail
 cd /root
-readonly REV='v0.5.0'
-base="https://raw.githubusercontent.com/yazmann/xhttp-vps-setup/${REV}"
-curl -fsSLO "$base"/{install-xhttp-vps.sh,finish-xhttp-vps.sh,optimize-xhttp-memory.sh,xhttp-vps-common.sh}
-printf '%s\n' \
-  'a57bae37db62f4cd8f61008ce1219caf37de6f91d1561a34476a97ff812313dd  install-xhttp-vps.sh' \
-  '71cadfd1c5b487b33996958b8f1dfda525b16dcf491e3ffc72cd7b715d27564f  finish-xhttp-vps.sh' \
-  '6001886a100e88218d7de950d8078f7d6c72af5e49d102d53ab4b588dbbbeff1  optimize-xhttp-memory.sh' \
-  '5287fc164472f3310c30361bbd3e573d6c7efcd8cfb60e994d4c790026edc9c4  xhttp-vps-common.sh' \
-  | sha256sum -c -
-chmod 700 ./{install-xhttp-vps.sh,finish-xhttp-vps.sh,optimize-xhttp-memory.sh,xhttp-vps-common.sh}
-./install-xhttp-vps.sh
+git clone https://github.com/yazmann/xhttp-vps-setup.git
+cd xhttp-vps-setup
+git log -1 --oneline
+bash ./install-xhttp-vps.sh
 ```
 
 ## Команды
@@ -54,7 +57,7 @@ sudo /root/install-xhttp-vps.sh
 # Продолжить или восстановить установку
 sudo /root/finish-xhttp-vps.sh
 
-# Применить профиль снижения расхода памяти
+# Применить профиль снижения расхода памяти для Vision или XHTTP
 sudo bash /root/optimize-xhttp-memory.sh
 ```
 

@@ -30,7 +30,7 @@ xhttp_memory_api() {
   local path="$1"
   shift
   # Only the loopback panel is used. Do not put credentials in diagnostics.
-  curl -kfsS --connect-timeout 3 --max-time 30 "${API_AUTH[@]}" \
+  curl -q -fsS --connect-timeout 3 --max-time 30 "${API_AUTH[@]}" \
     "$API_BASE$path" "$@" | jq -ce '
       if .success == true then . else error("Panel API rejected the operation") end
     '
@@ -56,9 +56,12 @@ xhttp_memory_apply() (
   [[ "$transport" == xhttp || "$transport" == vision ]] || {
     printf 'Unsupported transport for memory profile: %s\n' "$transport" >&2; return 1;
   }
-  [[ "$API_BASE" =~ ^https://127\.0\.0\.1:[0-9]+/ ]] || {
-    printf 'Memory update requires a loopback HTTPS panel URL.\n' >&2; return 1;
-  }
+  if ! [[ "$API_BASE" =~ ^https://127\.0\.0\.1:[0-9]+/ ]] &&
+     ! [[ "${DOMAIN:-}" =~ ^[a-z0-9.-]+$ && "${PANEL_PORT:-}" =~ ^[0-9]+$ &&
+          "$API_BASE" == "https://${DOMAIN}:${PANEL_PORT}/${PANEL_PATH:-}" ]]; then
+    printf 'Memory update requires a loopback HTTPS panel URL.\n' >&2
+    return 1
+  fi
   response="$(xhttp_memory_api /panel/api/xray/ -X POST)" || return 1
   template="$(jq -ce '.obj | if type=="string" then fromjson else . end' <<<"$response")" || return 1
   test_url="$(jq -r '.outboundTestUrl // "https://www.cloudflare.com/cdn-cgi/trace"' <<<"$template")"
@@ -160,14 +163,18 @@ xhttp_memory_main() (
   [[ ${#states[@]} -eq 1 ]] || { printf 'Expected one installer state file in /root.\n' >&2; return 1; }
   # shellcheck disable=SC1090
   source "${states[0]}"
-  : "${PANEL_PORT:?}" "${PANEL_PATH:?}" "${PANEL_API_TOKEN:?}"
   : "${TRANSPORT:=xhttp}"
+  case "$TRANSPORT" in
+    vision|xhttp) ;;
+    *) printf 'The Xray memory profile is available for Vision and XHTTP.\n' >&2; return 1 ;;
+  esac
+  : "${PANEL_PORT:?}" "${PANEL_PATH:?}" "${PANEL_API_TOKEN:?}"
   : "${INBOUND_TAG:=$(printf 'in-443-%s-reality' "$TRANSPORT")}"
-  API_BASE="https://127.0.0.1:${PANEL_PORT}/${PANEL_PATH}"
+  API_BASE="https://${DOMAIN}:${PANEL_PORT}/${PANEL_PATH}"
   API_HEADER_FILE="$(xhttp_memory_create_api_header_file "$PANEL_API_TOKEN")" \
     || { printf 'The panel API token contains invalid control characters.\n' >&2; return 1; }
   trap 'rm -f "${API_HEADER_FILE:-}"' EXIT
-  API_AUTH=(-H "@${API_HEADER_FILE}")
+  API_AUTH=(--noproxy '*' --resolve "${DOMAIN}:${PANEL_PORT}:127.0.0.1" -H "@${API_HEADER_FILE}")
   xhttp_memory_apply "$INBOUND_TAG" "$TRANSPORT"
 )
 
