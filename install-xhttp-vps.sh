@@ -93,6 +93,8 @@ remove_installation() {
     systemctl stop xhttp-vps-cert-renew.service
   fi
   systemctl disable --now xhttp-vps-maintenance.timer 2>/dev/null || true
+  systemctl disable --now xhttp-vps-reboot.timer 2>/dev/null || true
+  rm -f -- /run/xhttp-vps-maintenance.ok
   if [[ "${TRANSPORT:-}" == amneziawg && -x /usr/local/sbin/xhttp-vps-awg-firewall ]]; then
     /usr/local/sbin/xhttp-vps-awg-firewall down
   fi
@@ -541,11 +543,11 @@ fi
 
 cat <<'EOF'
 Automatic maintenance:
-  1) Security updates only (default)
+  1) Weekly package maintenance (default)
+     Daily security updates, package updates and cleanup on Sunday at 05:00.
+     Reboot at 05:30 when required and maintenance has completed.
+  2) Security updates only
      Installed daily without automatic reboot.
-  2) Weekly Ubuntu maintenance
-     Updates Sunday at 05:00; reboot only when required.
-     3x-ui and Xray are NOT updated automatically.
   3) No automatic updates
      Updates and reboot are performed manually.
 EOF
@@ -553,14 +555,14 @@ read -rp "Select maintenance [1]: " MAINTENANCE_CHOICE
 MAINTENANCE_CHOICE="${MAINTENANCE_CHOICE:-1}"
 MAINTENANCE_TIMEZONE=Europe/Moscow
 case "$MAINTENANCE_CHOICE" in
-  1) MAINTENANCE_MODE=security ;;
-  2)
+  1)
     MAINTENANCE_MODE=weekly
-    read -rp "Timezone for Sunday 05:00 maintenance [Europe/Moscow]: " MAINTENANCE_TIMEZONE
+    read -rp "Timezone for Sunday maintenance and reboot [Europe/Moscow]: " MAINTENANCE_TIMEZONE
     MAINTENANCE_TIMEZONE="${MAINTENANCE_TIMEZONE:-Europe/Moscow}"
     [[ "$MAINTENANCE_TIMEZONE" =~ ^([A-Za-z0-9_+-]+/)*[A-Za-z0-9_+-]+$ && -f "/usr/share/zoneinfo/$MAINTENANCE_TIMEZONE" ]] \
       || die "Unknown IANA timezone: ${MAINTENANCE_TIMEZONE}. Example: Europe/Moscow or Etc/UTC."
     ;;
+  2) MAINTENANCE_MODE=security ;;
   3) MAINTENANCE_MODE=none ;;
   *) die "Unknown maintenance choice: ${MAINTENANCE_CHOICE}" ;;
 esac
@@ -843,6 +845,7 @@ if [[ "$REPAIRING_UDP" == 1 ]]; then
   systemctl enable --now nginx
   systemctl reload nginx
   xhttp_configure_automatic_updates
+  xhttp_verify_automatic_updates
   xhttp_install_cert_renewal
   xhttp_install_fail2ban_sshd
   if [[ "$SSH_HARDENING" == 1 ]]; then xhttp_harden_sshd; fi
@@ -935,6 +938,7 @@ fi
 xhttp_install_ssh_access || die "Could not prepare the selected SSH access policy. The current root SSH access has not been disabled."
 log "Configuring automatic Ubuntu maintenance"
 xhttp_configure_automatic_updates || die "Could not apply the selected automatic-update policy."
+xhttp_verify_automatic_updates || die "The active automatic-update policy does not match the selected mode."
 log "Enabling BBR and disabling IPv6"
 cat > /etc/modules-load.d/bbr.conf <<'EOF'
 tcp_bbr
@@ -1510,17 +1514,11 @@ else
 fi
 if [[ "${UBUNTU_UPGRADE_OK:-0}" -eq 1 ]] && apt-get check >/dev/null 2>&1 && [[ -z "$(dpkg --audit)" ]]; then status_line "Ubuntu package upgrade" OK "Ubuntu $UBUNTU_VERSION"; else status_line "Ubuntu package upgrade" ERROR; fi
 if apt-get check >/dev/null 2>&1 && [[ -z "$(dpkg --audit)" ]]; then status_line "Required packages" OK; else status_line "Required packages" ERROR; fi
-case "$MAINTENANCE_MODE" in
-  security)
-    if apt-config dump | grep -F 'APT::Periodic::Unattended-Upgrade "1"' >/dev/null && ! systemctl is-enabled --quiet xhttp-vps-maintenance.timer 2>/dev/null; then status_line "Automatic maintenance" OK "security updates only; no automatic reboot"; else status_line "Automatic maintenance" ERROR; fi
-    ;;
-  weekly)
-    if apt-config dump | grep -F 'APT::Periodic::Unattended-Upgrade "1"' >/dev/null && systemctl is-enabled --quiet xhttp-vps-maintenance.timer && systemd-analyze calendar "Sun *-*-* 05:00:00 ${MAINTENANCE_TIMEZONE}" >/dev/null 2>&1; then status_line "Automatic maintenance" OK "Sunday 05:00 ${MAINTENANCE_TIMEZONE}; conditional reboot; panel/Xray excluded"; else status_line "Automatic maintenance" ERROR; fi
-    ;;
-  none)
-    if apt-config dump | grep -F 'APT::Periodic::Enable "0"' >/dev/null && ! systemctl is-enabled --quiet xhttp-vps-maintenance.timer 2>/dev/null; then status_line "Automatic maintenance" OK "disabled by user"; else status_line "Automatic maintenance" ERROR; fi
-    ;;
-esac
+if xhttp_verify_automatic_updates; then
+  status_line "Automatic maintenance" OK "$(xhttp_maintenance_label "$MAINTENANCE_MODE")"
+else
+  status_line "Automatic maintenance" ERROR
+fi
 if [[ "$SSH_HARDENING" == 1 ]] && xhttp_verify_ssh_access; then
   status_line "Key-only SSH administration" OK "$(xhttp_ssh_access_label "$SSH_ACCESS_MODE")"
 elif [[ "$SSH_HARDENING" == 0 && "$SSH_ACCESS_MODE" == existing ]]; then

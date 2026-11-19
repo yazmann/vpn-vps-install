@@ -27,6 +27,7 @@ jobs:
           bash -n tests/transports.sh
           bash -n xhttp-vps-migrate.sh
           bash -n tests/migration.sh
+          bash -n tests/maintenance.sh
       - name: Test memory profile preservation and idempotence
         run: bash tests/memory-profile.sh
       - name: Test routing, ownership and traffic probe configs
@@ -37,6 +38,8 @@ jobs:
         run: bash tests/transports.sh
       - name: Test SQLite client migration
         run: bash tests/migration.sh
+      - name: Test weekly cleanup and conditional reboot
+        run: bash tests/maintenance.sh
       - name: Check 3x-ui schema compatibility
         run: |
           if grep -Fq 'tgId:""' install-xhttp-vps.sh finish-xhttp-vps.sh; then
@@ -71,7 +74,7 @@ jobs:
           grep -Fq 'SSH_ACCESS_MODE=root-key' install-xhttp-vps.sh
           grep -Fq 'SSH_ACCESS_MODE=existing' install-xhttp-vps.sh
           grep -Fq 'systemctl --no-block reboot' xhttp-vps-common.sh
-          grep -Fq 'if [[ -f /var/run/reboot-required ]]' xhttp-vps-common.sh
+          grep -Fq -- '-f /var/run/reboot-required' xhttp-vps-common.sh
           grep -Fq -- '--webroot /var/www/3xui-cover' install-xhttp-vps.sh
           grep -Fq 'location ^~ /.well-known/acme-challenge/' xhttp-vps-common.sh
           grep -Fq 'xhttp_probe_foreign_sni' install-xhttp-vps.sh
@@ -112,3 +115,4 @@ jobs:
           bash tests/api-tokens.sh
           bash tests/transports.sh
           bash tests/migration.sh
+          bash tests/maintenance.sh

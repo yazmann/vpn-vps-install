@@ -479,12 +479,8 @@ else
   fi
 fi
 if apt-get check >/dev/null 2>&1 && [[ -z "$(dpkg --audit)" ]]; then report "Package update/install" OK; else report "Package update/install" ERROR; fi
-if [[ "$MAINTENANCE_OK" -eq 1 ]]; then
-  case "$MAINTENANCE_MODE" in
-    security) if apt-config dump | grep -F 'APT::Periodic::Unattended-Upgrade "1"' >/dev/null && ! systemctl is-enabled --quiet xhttp-vps-maintenance.timer 2>/dev/null; then report "Security updates only" OK; else report "Security updates only" ERROR; fi ;;
-    weekly) if systemctl is-enabled --quiet xhttp-vps-maintenance.timer; then report "Weekly conditional reboot" OK; else report "Weekly conditional reboot" ERROR; fi ;;
-    none) if apt-config dump | grep -F 'APT::Periodic::Enable "0"' >/dev/null; then report "Automatic updates disabled" OK; else report "Automatic updates disabled" ERROR; fi ;;
-  esac
+if [[ "$MAINTENANCE_OK" -eq 1 ]] && xhttp_verify_automatic_updates; then
+  report "Automatic maintenance" OK "$(xhttp_maintenance_label "$MAINTENANCE_MODE")"
 else
   report "Automatic maintenance" ERROR
 fi
