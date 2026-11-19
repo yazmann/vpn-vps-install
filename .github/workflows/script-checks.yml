@@ -99,7 +99,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ubuntu: ['22.04', '24.04']
+        ubuntu: ['22.04', '24.04', '26.04']
     steps:
       - name: Ensure test dependencies are available
         run: |
