@@ -162,7 +162,7 @@ xhttp_wait_ssh_ports() {
 }
 
 xhttp_move_ssh_port() (
-  local old="$SSH_PORT" new="$SSH_TARGET_PORT" kind=daemon directory reply
+  local old="$SSH_PORT" new="$SSH_TARGET_PORT" kind=daemon directory reply sudo_command='sudo -n'
   local daemon_file=/etc/ssh/sshd_config.d/00-xhttp-vps-port.conf
   local socket_file=/etc/systemd/system/ssh.socket.d/99-xhttp-vps-port.conf
   local changed=0 committed=0
@@ -213,7 +213,8 @@ xhttp_move_ssh_port() (
   apply_ssh_ports "$old" "$new" && xhttp_wait_ssh_ports "$old" "$new" up || exit 1
   SSH_PORT="$new" xhttp_print_ssh_connection
   printf '\nAllow TCP/%s in the provider firewall. Connect in a separate SSH session on the new port and run:\n' "$new"
-  printf '  test "${SSH_CONNECTION##* }" = %s && test "$(id -un)" = %s && sudo -n touch %s/verified\n' "$new" "$ADMIN_USER" "$directory"
+  if [[ "$SSH_ACCESS_MODE" == existing ]]; then sudo_command=sudo; fi
+  printf '  test "${SSH_CONNECTION##* }" = %s && test "$(id -un)" = %s && %s touch %s/verified\n' "$new" "$ADMIN_USER" "$sudo_command" "$directory"
   until [[ -f "$directory/verified" ]]; do
     read -rp 'Press Enter once the new login succeeds, or type cancel to keep the original port: ' reply || exit 1
     [[ "$reply" != cancel ]] || exit 2
