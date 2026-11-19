@@ -191,7 +191,7 @@ configure_warp_swap() {
   printf '\nSWAP_CREATED_BY_SCRIPT=1\n' >> "${STATE_FILES[0]}"
 }
 
-systemctl restart x-ui
+xhttp_restart_vpn_service x-ui
 READY=0; R=""
 for _ in $(seq 1 15); do
   R="$(curl -q -fsS "${API_AUTH[@]}" --connect-timeout 2 --max-time 5 "$API_BASE/panel/api/server/status" 2>&1 || true)"
@@ -357,7 +357,8 @@ if [[ "${ENABLE_WARP:-0}" -eq 1 ]]; then
   fi
 fi
 
-systemctl restart x-ui; sleep 2
+xhttp_restart_vpn_service x-ui
+sleep 2
 READY=0; R=""
 for _ in $(seq 1 40); do
   R="$(curl -q -fsS "${API_AUTH[@]}" --connect-timeout 2 --max-time 5 "$API_BASE/panel/api/server/status" 2>&1 || true)"
@@ -423,7 +424,7 @@ if [[ "$PANEL_ACCESS_MODE" == "private" ]]; then
 else
   /usr/local/x-ui/x-ui setting -listenIP 0.0.0.0 >/dev/null
 fi
-systemctl restart x-ui
+xhttp_restart_vpn_service x-ui
 PANEL_WEB_OK=0
 for _ in $(seq 1 20); do
   if curl -kfsS --resolve "${DOMAIN}:${PANEL_PORT}:127.0.0.1" --connect-timeout 2 --max-time 5 \

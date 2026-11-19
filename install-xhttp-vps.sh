@@ -477,14 +477,14 @@ esac
 PACKAGES_INSTALLED_BY_SCRIPT=""
 if ! command -v curl >/dev/null; then
   export DEBIAN_FRONTEND=noninteractive
-    apt-get -o DPkg::Lock::Timeout=300 update
+  xhttp_apt_get -o APT::Update::Error-Mode=any update
   for package in ca-certificates curl; do
     dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'install ok installed' \
       || PACKAGES_INSTALLED_BY_SCRIPT+=" ${package}"
   done
-    apt-get -o DPkg::Lock::Timeout=300 install -y --no-install-recommends ca-certificates curl
+  xhttp_apt_apply install -y --no-install-recommends ca-certificates curl
 fi
-PUBLIC_IP="$(curl -4fsS --max-time 10 https://api4.ipify.org || true)"
+PUBLIC_IP="$(curl -q -4fsS --retry 2 --retry-all-errors --connect-timeout 5 --max-time 10 https://api4.ipify.org || true)"
 xhttp_valid_ipv4 "$PUBLIC_IP" || die "Could not detect a valid public IPv4."
 SSH_PORT="$(awk '{print $4}' <<<"${SSH_CONNECTION:-}" 2>/dev/null || true)"
 if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || (( SSH_PORT < 1 || SSH_PORT > 65535 )); then
@@ -867,11 +867,10 @@ fi
 log "Repairing package state and fully upgrading the fresh Ubuntu system"
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
-dpkg --configure -a
-apt-get -o DPkg::Lock::Timeout=300 -y -f install
-apt-get -o DPkg::Lock::Timeout=300 update
-apt-get -o DPkg::Lock::Timeout=300 -y -o Dpkg::Options::="--force-confold" dist-upgrade
-apt-get check
+xhttp_apt_get -o APT::Update::Error-Mode=any update
+xhttp_repair_apt || die "Could not repair Ubuntu package dependencies. Review the APT errors above."
+xhttp_apt_apply -y -o Dpkg::Options::="--force-confold" dist-upgrade
+xhttp_apt_get check
 [[ -z "$(dpkg --audit)" ]] || die "Ubuntu package database is not clean after the full upgrade. Review 'dpkg --audit' before retrying."
 UBUNTU_UPGRADE_OK=1
 
@@ -918,7 +917,7 @@ for package in "${INSTALL_PACKAGES[@]}"; do
     || PACKAGES_INSTALLED_BY_SCRIPT+=" ${package}"
 done
 write_state
-apt-get -o DPkg::Lock::Timeout=300 install -y --no-install-recommends "${INSTALL_PACKAGES[@]}"
+xhttp_apt_apply install -y --no-install-recommends "${INSTALL_PACKAGES[@]}"
 write_state
 if [[ -n "$MIGRATION_DB" && ! -s "$MANAGED_BACKUP/migration.json" ]]; then
   log "Reading the SQLite client backup"
@@ -1014,7 +1013,7 @@ if [[ ! -s "$CERT_DIR/fullchain.pem" || ! -s "$CERT_DIR/privkey.pem" ]]; then
   systemctl reload nginx
   ACME_PROBE="$(random_hex 12)"
   printf '%s\n' "$ACME_PROBE" > "/var/www/3xui-cover/.well-known/acme-challenge/${ACME_PROBE}"
-  [[ "$(curl -fsS -H "Host: ${DOMAIN}" "http://127.0.0.1/.well-known/acme-challenge/${ACME_PROBE}")" == "$ACME_PROBE" ]] \
+  [[ "$(curl -q -fsS --retry 3 --retry-connrefused --max-time 5 -H "Host: ${DOMAIN}" "http://127.0.0.1/.well-known/acme-challenge/${ACME_PROBE}")" == "$ACME_PROBE" ]] \
     || die "The local Nginx ACME webroot probe failed."
   rm -f "/var/www/3xui-cover/.well-known/acme-challenge/${ACME_PROBE}"
   if [[ "$ACME_CLIENT" == certbot ]]; then
@@ -1181,7 +1180,7 @@ if ! xhttp_uses_panel; then
   exit 0
 fi
 systemctl enable x-ui
-systemctl restart x-ui
+xhttp_restart_vpn_service x-ui
 if [[ "$TLS_MODE" == "production" && "$ACME_CLIENT" != certbot ]]; then
   /root/.acme.sh/acme.sh --install-cert -d "$DOMAIN" --ecc --key-file "$CERT_DIR/privkey.pem" \
     --fullchain-file "$CERT_DIR/fullchain.pem" --reloadcmd "systemctl reload nginx && systemctl restart x-ui"
@@ -1365,7 +1364,7 @@ if [[ "$ENABLE_WARP" -eq 1 ]]; then
 fi
 write_state
 
-systemctl restart x-ui
+xhttp_restart_vpn_service x-ui
 sleep 1
 API_READY=0; RESPONSE=""
 for _ in $(seq 1 15); do
@@ -1462,7 +1461,7 @@ else
   log "Enabling restricted panel IPv4 access after private configuration"
   /usr/local/x-ui/x-ui setting -listenIP 0.0.0.0 >/dev/null
 fi
-systemctl restart x-ui
+xhttp_restart_vpn_service x-ui
 PANEL_HTTPS_VERIFIED=0
 PANEL_LOCAL_URL="https://${DOMAIN}:${PANEL_PORT}/${PANEL_PATH}/"
 for _ in $(seq 1 20); do

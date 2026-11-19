@@ -479,6 +479,7 @@ EOF
 
 xhttp_render_maintenance_script() {
   printf '#!/usr/bin/env bash\n'
+  declare -f xhttp_apt_get xhttp_repair_apt xhttp_apt_apply xhttp_restart_vpn_service || return 1
   declare -f xhttp_download_verified xhttp_latest_release_asset xhttp_release_arch \
     xhttp_stage_panel_release xhttp_wait_for_vpn_service xhttp_update_panel xhttp_update_hysteria || return 1
   cat <<'EOF'
@@ -512,14 +513,26 @@ case "$phase" in
     today="$(date +%F)"
     export DEBIAN_FRONTEND=noninteractive
     export NEEDRESTART_MODE=a
-    apt-get -o APT::Update::Error-Mode=any update
-    apt-get -o DPkg::Lock::Timeout=1800 -y -o Dpkg::Options::="--force-confold" --with-new-pkgs upgrade
-    apt-get -o DPkg::Lock::Timeout=1800 -y autoremove
+    xhttp_apt_get -o APT::Update::Error-Mode=any update
+    xhttp_apt_apply -o DPkg::Lock::Timeout=1800 -y -o Dpkg::Options::="--force-confold" --with-new-pkgs upgrade
+    xhttp_apt_get -o DPkg::Lock::Timeout=1800 -y autoremove
     apt-get autoclean
     check_health
     case "$vpn_service" in
-      x-ui) xhttp_update_panel "$panel_port" ;;
-      xhttp-vps-hysteria) xhttp_update_hysteria ;;
+      x-ui|xhttp-vps-hysteria)
+        # A separate shell keeps errexit active even when the caller handles failure.
+        export -f xhttp_download_verified xhttp_latest_release_asset xhttp_release_arch \
+          xhttp_stage_panel_release xhttp_wait_for_vpn_service xhttp_update_panel xhttp_update_hysteria \
+          xhttp_restart_vpn_service
+        if bash -ec 'case "$1" in x-ui) xhttp_update_panel "$2" ;; *) xhttp_update_hysteria ;; esac' \
+          bash "$vpn_service" "$panel_port"; then
+          logger -t xhttp-vps-maintenance 'VPN release check completed.'
+        else
+          [[ "$?" != 70 ]] || exit 70
+          xhttp_wait_for_vpn_service "$vpn_service" "$panel_port"
+          logger -t xhttp-vps-maintenance 'VPN component update deferred. The existing service is healthy.'
+        fi
+        ;;
     esac
     printf '%s\n' "$today" > "$completed"
     logger -t xhttp-vps-maintenance 'Weekly package and VPN component updates completed.'
@@ -658,9 +671,33 @@ EOF
   esac
 }
 
+xhttp_apt_get() {
+  apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 "$@"
+}
+
+xhttp_repair_apt() {
+  if ! dpkg --force-confold --configure -a; then
+    printf '%s\n' 'dpkg could not finish pending packages. Trying to repair dependencies through APT.' >&2
+  fi
+  xhttp_apt_get -y --no-remove -o Dpkg::Options::="--force-confold" -f install || return 1
+  dpkg --force-confold --configure -a && xhttp_apt_get check
+}
+
+xhttp_apt_apply() {
+  if xhttp_apt_get "$@"; then return 0; fi
+  printf '%s\n' 'APT operation failed. Repairing pending packages and retrying once.' >&2
+  xhttp_repair_apt && xhttp_apt_get "$@"
+}
+
+xhttp_restart_vpn_service() {
+  local service="$1"
+  if systemctl restart "$service"; then return 0; fi
+  systemctl reset-failed "$service" && systemctl restart "$service"
+}
+
 xhttp_download_verified() {
   local url="$1" expected="$2" output="$3" actual
-  curl -q -fL --proto '=https' --proto-redir '=https' --retry 3 --connect-timeout 10 --max-time 120 "$url" -o "$output" || {
+  curl -q -fL --proto '=https' --proto-redir '=https' --retry 3 --retry-all-errors --connect-timeout 10 --max-time 120 "$url" -o "$output" || {
     rm -f -- "$output"
     return 1
   }
@@ -674,7 +711,7 @@ xhttp_download_verified() {
 
 xhttp_latest_release_asset() {
   local repo="$1" asset="$2" output="$3" current_digest="${4:-}" release record url digest
-  release="$(curl -q -fsSL --proto '=https' --proto-redir '=https' --retry 3 --connect-timeout 10 --max-time 30 \
+  release="$(curl -q -fsSL --proto '=https' --proto-redir '=https' --retry 3 --retry-all-errors --connect-timeout 10 --max-time 30 \
     "https://api.github.com/repos/$repo/releases/latest")" || return 1
   record="$(jq -er --arg asset "$asset" '
     select(.draft == false and .prerelease == false)
@@ -784,14 +821,14 @@ xhttp_update_panel() (
       sqlite3 -batch -bail -cmd '.timeout 5000' "$database" ".restore '$stage/x-ui.db'" || return 1
       if [[ "$cli_changed" == 1 ]]; then cp -aT "$stage/cli" "$cli" || return 1; fi
     fi
-    systemctl start x-ui && xhttp_wait_for_vpn_service x-ui "$port"
+    xhttp_restart_vpn_service x-ui && xhttp_wait_for_vpn_service x-ui "$port"
   }
   cleanup_panel_update() {
     local status="$?"
     if [[ "$status" != 0 && "$stopped" == 1 ]]; then
       if ! restore_panel; then
         printf '3x-ui rollback failed. Retained recovery files at %s\n' "$stage" >&2
-        return 1
+        exit 70
       fi
       printf '%s\n' '3x-ui/Xray update failed. The previous service was restored.' >&2
     fi
@@ -821,7 +858,7 @@ xhttp_update_panel() (
   fi
   mv -T "$panel" "$stage/previous"
   mv -T "$stage/x-ui" "$panel"
-  systemctl start x-ui
+  xhttp_restart_vpn_service x-ui
   xhttp_wait_for_vpn_service x-ui "$port"
   if [[ -f "$stage/cli" ]]; then
     cli_changed=1
@@ -843,10 +880,10 @@ xhttp_update_hysteria() (
     local status="$?"
     if [[ "$status" != 0 && "$deployed" == 1 ]]; then
       if ! cp -aT "$stage/previous" "$stage/restore" || ! mv -fT "$stage/restore" "$binary" ||
-        ! systemctl restart "$service" ||
+        ! xhttp_restart_vpn_service "$service" ||
         ! xhttp_wait_for_vpn_service "$service"; then
         printf 'Hysteria 2 rollback failed. Retained recovery files at %s\n' "$stage" >&2
-        return 1
+        exit 70
       fi
       printf '%s\n' 'Hysteria 2 update failed. The previous service was restored.' >&2
     fi
@@ -861,7 +898,7 @@ xhttp_update_hysteria() (
   cp -aT "$binary" "$stage/previous"
   deployed=1
   mv -fT "$stage/hysteria" "$binary"
-  systemctl restart "$service"
+  xhttp_restart_vpn_service "$service"
   xhttp_wait_for_vpn_service "$service"
   printf '%s\n' 'Hysteria 2 release applied and the UDP listener is ready.'
 )
