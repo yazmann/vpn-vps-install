@@ -127,6 +127,32 @@ if xhttp_validate_state; then exit 1; fi
 test_dir="$(mktemp -d)"
 trap 'rm -rf "$test_dir"' EXIT
 (
+  printf '%s\n' '<!doctype html><title>Personal site</title>' > "$test_dir/index.html"
+  curl() {
+    local output=''
+    [[ " $* " == *' --resolve example.com:443:127.0.0.1 '* && "${*: -1}" == https://example.com/ ]] || return 1
+    while (($#)); do
+      if [[ "$1" == --output ]]; then output="$2"; break; fi
+      shift
+    done
+    [[ -n "$output" ]] || return 1
+    if [[ "${BAD_BODY:-0}" == 1 ]]; then printf 'unexpected site\n' > "$output"; else cp "$test_dir/index.html" "$output"; fi
+    printf '%s' "${HTTP_STATUS:-200}"
+  }
+  xhttp_probe_cover_website "$test_dir/index.html"
+  if BAD_BODY=1 xhttp_probe_cover_website "$test_dir/index.html"; then exit 1; fi
+  if HTTP_STATUS=301 xhttp_probe_cover_website "$test_dir/index.html"; then exit 1; fi
+)
+(
+  ss() { printf '%s' "${LISTENERS:-}"; }
+  local_socket='LISTEN 0 4096 127.0.0.1:23456 0.0.0.0:*'
+  public_socket='LISTEN 0 4096 0.0.0.0:23456 0.0.0.0:*'
+  LISTENERS="$local_socket" xhttp_verify_loopback_listener 23456
+  if LISTENERS='' xhttp_verify_loopback_listener 23456; then exit 1; fi
+  if LISTENERS="$public_socket" xhttp_verify_loopback_listener 23456; then exit 1; fi
+  if LISTENERS="$local_socket"$'\n'"$public_socket" xhttp_verify_loopback_listener 23456; then exit 1; fi
+)
+(
   eval "$(declare -f xhttp_apply_ping_policy | sed "s#/etc/sysctl.d/99-xhttp-vps-ping.conf#$test_dir/ping.conf#")"
   sysctl() { [[ "$*" == '-w net.ipv4.icmp_echo_ignore_all=1' ]]; }
   DISABLE_PING=0 xhttp_apply_ping_policy

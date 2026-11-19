@@ -1513,8 +1513,7 @@ if jq -e --arg d "$DOMAIN" --arg dest "127.0.0.1:${FALLBACK_PORT}" --arg transpo
   INBOUND_VERIFIED=1
 fi
 for _ in $(seq 1 20); do
-  COVER_RESPONSE="$(curl -fsS --noproxy '*' --resolve "${DOMAIN}:443:127.0.0.1" --max-time 5 "https://${DOMAIN}/" 2>/dev/null || true)"
-  if grep -Fq "$DOMAIN" <<<"$COVER_RESPONSE"; then PUBLIC_SELF_STEAL_VERIFIED=1; break; fi
+  if xhttp_probe_cover_website 2>/dev/null; then PUBLIC_SELF_STEAL_VERIFIED=1; break; fi
   sleep 1
 done
 if [[ "$INSTALL_MODE" == "standalone" ]]; then
@@ -1682,7 +1681,11 @@ HTTP_REDIRECT_HEADERS="$(curl -fsSI --resolve "${DOMAIN}:80:127.0.0.1" "http://$
 if grep -Eiq "^location:[[:space:]]*https://${DOMAIN}/" <<<"$HTTP_REDIRECT_HEADERS"; then status_line "HTTP / ACME webroot" OK "port 80 redirects; challenge path retained"; else status_line "HTTP / ACME webroot" ERROR; fi
 if [[ -n "$PHOTO_MARKUP" ]]; then status_line "Licensed cover photo" OK "$PHOTO_CREDIT / Unsplash"; else status_line "Licensed cover photo" SKIP "site available without image"; fi
 if [[ "${INBOUND_CONFIGURED:-0}" -eq 1 && "$INBOUND_VERIFIED" -eq 1 ]] && port_busy 443; then status_line "VPN Reality self-steal" OK "$(xhttp_transport_label "$TRANSPORT"); TCP 443 → 127.0.0.1:$FALLBACK_PORT"; else status_line "VPN Reality self-steal" ERROR; fi
-if [[ "${SUBSCRIPTION_CONFIGURED:-0}" -eq 1 ]] && port_busy "$SUB_PORT"; then status_line "Subscription service" OK "127.0.0.1:$SUB_PORT"; else status_line "Subscription service" ERROR; fi
+if [[ "${SUBSCRIPTION_CONFIGURED:-0}" -eq 1 ]] && xhttp_verify_loopback_listener "$SUB_PORT"; then
+  status_line "Subscription service" OK "127.0.0.1:$SUB_PORT only"
+else
+  status_line "Subscription service" ERROR "expected a listener only on 127.0.0.1:$SUB_PORT"
+fi
 if [[ "$INSTALL_MODE" == "standalone" ]]; then
   if [[ "$CLIENT_VERIFIED" -eq 1 ]]; then status_line "First VLESS client" OK "$CLIENT_EMAIL"; else status_line "First VLESS client" ERROR; fi
   if [[ "$SUBSCRIPTION_VERIFIED" -eq 1 ]]; then status_line "Client subscription URL" OK "verified through TCP 443"; else status_line "Client subscription URL" ERROR; fi

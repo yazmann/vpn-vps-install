@@ -1442,6 +1442,25 @@ printf '    }\n'
 done
 }
 
+xhttp_probe_cover_website() (
+  local index="${1:-/var/www/3xui-cover/index.html}" response status
+  [[ -s "$index" ]] || return 1
+  response="$(mktemp)" || return 1
+  trap 'rm -f -- "$response"' EXIT
+  status="$(curl -q -fsS --noproxy '*' --resolve "${DOMAIN}:443:127.0.0.1" --max-time 5 \
+    --output "$response" --write-out '%{http_code}' "https://${DOMAIN}/")" || return 1
+  [[ "$status" == 200 ]] && cmp -s -- "$index" "$response"
+)
+
+xhttp_verify_loopback_listener() {
+  local port="$1" listeners
+  listeners="$(ss -H -ltn "sport = :$port")" || return 1
+  awk -v expected="127.0.0.1:$port" '
+    NF { if ($4 != expected) { wrong=1; exit }; seen=1 }
+    END { exit (!seen || wrong) }
+  ' <<<"$listeners"
+}
+
 xhttp_probe_foreign_sni() {
   xhttp_probe_rejected_sni -servername unrelated.invalid
 }
