@@ -56,9 +56,9 @@ jq -e '
 ' <<<"$rebuilt_vision" >/dev/null
 export MAINTENANCE_TIMEZONE=Europe/Moscow
 timer="$(xhttp_render_maintenance_timer)"
-grep -Fq 'OnCalendar=Sun *-*-* 05:00:00 Europe/Moscow' <<<"$timer"
+grep -Fq 'OnCalendar=*-*-* 05:30:00 Europe/Moscow' <<<"$timer"
 grep -Fq 'Persistent=false' <<<"$timer"
-[[ "$(xhttp_maintenance_label security)" == 'daily Ubuntu security updates; no automatic reboot' ]]
+[[ "$(xhttp_maintenance_label security)" == 'daily Ubuntu security updates at 05:30, no automatic reboot (Europe/Moscow)' ]]
 [[ "$(xhttp_maintenance_label none)" == 'no automatic updates or reboot' ]]
 export PANEL_PORT=54321
 panel_jail="$(xhttp_render_panel_fail2ban_jail)"

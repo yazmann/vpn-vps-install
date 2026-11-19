@@ -553,11 +553,11 @@ fi
 
 cat <<'EOF'
 Automatic maintenance:
-  1) Weekly package maintenance (default)
-     Daily security updates. APT and VPN component updates and cleanup on Sunday at 05:00.
-     Reboot at 05:30 when required and maintenance has completed.
+  1) Scheduled updates and conditional reboot (default)
+     Security updates every day at 05:30. Full updates and cleanup on Sundays at 05:30.
+     Reboot after maintenance if required.
   2) Security updates only
-     Installed daily without automatic reboot.
+     Installed daily at 05:30 without automatic reboot.
   3) No automatic updates
      Updates and reboot are performed manually.
 EOF
@@ -565,17 +565,17 @@ read -rp "Select maintenance [1]: " MAINTENANCE_CHOICE
 MAINTENANCE_CHOICE="${MAINTENANCE_CHOICE:-1}"
 MAINTENANCE_TIMEZONE=Europe/Moscow
 case "$MAINTENANCE_CHOICE" in
-  1)
-    MAINTENANCE_MODE=weekly
-    read -rp "Timezone for Sunday maintenance and reboot [Europe/Moscow]: " MAINTENANCE_TIMEZONE
-    MAINTENANCE_TIMEZONE="${MAINTENANCE_TIMEZONE:-Europe/Moscow}"
-    [[ "$MAINTENANCE_TIMEZONE" =~ ^([A-Za-z0-9_+-]+/)*[A-Za-z0-9_+-]+$ && -f "/usr/share/zoneinfo/$MAINTENANCE_TIMEZONE" ]] \
-      || die "Unknown IANA timezone: ${MAINTENANCE_TIMEZONE}. Example: Europe/Moscow or Etc/UTC."
-    ;;
+  1) MAINTENANCE_MODE=weekly ;;
   2) MAINTENANCE_MODE=security ;;
   3) MAINTENANCE_MODE=none ;;
   *) die "Unknown maintenance choice: ${MAINTENANCE_CHOICE}" ;;
 esac
+if [[ "$MAINTENANCE_MODE" != none ]]; then
+  read -rp "Timezone for scheduled maintenance at 05:30 [Europe/Moscow]: " MAINTENANCE_TIMEZONE
+  MAINTENANCE_TIMEZONE="${MAINTENANCE_TIMEZONE:-Europe/Moscow}"
+  [[ "$MAINTENANCE_TIMEZONE" =~ ^([A-Za-z0-9_+-]+/)*[A-Za-z0-9_+-]+$ && -f "/usr/share/zoneinfo/$MAINTENANCE_TIMEZONE" ]] \
+    || die "Unknown IANA timezone: ${MAINTENANCE_TIMEZONE}. Example: Europe/Moscow or Etc/UTC."
+fi
 
 
 PANEL_PORT=''
