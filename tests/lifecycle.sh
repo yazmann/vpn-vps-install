@@ -15,6 +15,30 @@ if xhttp_validate_single_dns_ipv4 203.0.113.7 <<<$'203.0.113.7\n198.51.100.2'; t
 if xhttp_validate_single_dns_ipv4 203.0.113.7 <<<'198.51.100.2'; then exit 1; fi
 if xhttp_validate_single_dns_ipv4 203.0.113.7 <<<$'origin.example.\n203.0.113.7'; then exit 1; fi
 (
+  dig() {
+    case "$4 $5" in
+      'A missing.example.') ;;
+      'A wrong.example.') printf '%s\n' 203.0.113.8 ;;
+      'A multiple.example.') printf '%s\n' 203.0.113.7 203.0.113.8 ;;
+      'A alias.example.') printf '%s\n' origin.example. 203.0.113.7 ;;
+      'A ipv6.example.'|'A vpn.example.com.'|'A timeout.example.') printf '%s\n' 203.0.113.7 ;;
+      'AAAA ipv6.example.') printf '%s\n' 2001:db8::1 ;;
+      'AAAA vpn.example.com.') ;;
+      'AAAA timeout.example.') return 9 ;;
+      *) return 99 ;;
+    esac
+  }
+  printf -v long_label '%064d' 0
+  label="${long_label:1}"
+  formatted_domain=$'\e[200~\xef\xbb\xbf  VPN.Example.COM \e[201~'
+  inputs=('' 'https://vpn.example.com' 'vpn..example.com' "${long_label}.example.com"
+    "${label}.${label}.${label}.${label}.com"
+    missing.example wrong.example multiple.example alias.example ipv6.example timeout.example "$formatted_domain")
+  xhttp_read_install_domain 203.0.113.7 2>/dev/null <<<"$(printf '%s\n' "${inputs[@]}")"
+  [[ "$REPLY" == vpn.example.com ]]
+  if xhttp_read_install_domain 203.0.113.7 </dev/null; then exit 1; fi
+)
+(
   DOMAIN=example.com
   CERT_DIR=/root/cert/example.com
   certbot() { printf '%s\n' "$@"; }
@@ -342,6 +366,22 @@ grep -Fq "proxy_ssl_trusted_certificate $CERT_DIR/staging-ca.pem;" <<<"$staging_
 grep -Fq 'proxy_ssl_verify on;' <<<"$staging_nginx"
 grep -Fq "add_header Cache-Control 'private, no-store' always;" <<<"$protected_nginx"
 grep -Fq "add_header Referrer-Policy 'no-referrer' always;" <<<"$protected_nginx"
+for answer in n N No $'\tN\r ' $'\xef\xbb\xbfN' $'\e[200~N\e[201~'; do
+  xhttp_read_yes_no 'Test question?' yes <<<"$answer"
+  [[ "$REPLY" == no ]]
+done
+for answer in y Y YES $' yes\r'; do
+  xhttp_read_yes_no 'Test question?' no <<<"$answer"
+  [[ "$REPLY" == yes ]]
+done
+for default_answer in yes no; do
+  xhttp_read_yes_no 'Test question?' "$default_answer" <<<''
+  [[ "$REPLY" == "$default_answer" ]]
+done
+xhttp_read_yes_no 'Test question?' yes 2>/dev/null <<<$'???\nN Y\nN'
+[[ "$REPLY" == no ]]
+if xhttp_read_yes_no 'Test question?' no </dev/null; then exit 1; fi
+
 profile='{"subProfileMode":"custom","subProfileUrl":"https://old.example/"}'
 [[ "$(xhttp_subscription_profile_settings <<<"$profile")" == "$profile" ]]
 SUB_PROFILE_MODE=none xhttp_subscription_profile_settings <<<"$profile" | jq -e '.subProfileMode=="none" and .subProfileUrl==""' >/dev/null

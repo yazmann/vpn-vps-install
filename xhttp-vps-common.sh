@@ -27,6 +27,66 @@ xhttp_validate_single_dns_ipv4() {
   [[ ${#addresses[@]} -eq 1 && "${addresses[0]}" == "$expected" ]]
 }
 
+xhttp_dns_package() {
+  local package
+  for package in dnsutils bind9-dnsutils; do
+    if apt-cache show "$package" >/dev/null 2>&1; then
+      printf '%s\n' "$package"
+      return
+    fi
+  done
+  return 1
+}
+
+xhttp_check_install_dns() {
+  local domain="$1" expected_ip="$2" records
+  if ! records="$(dig +time=3 +tries=2 +short A "${domain}.")"; then
+    printf 'Could not look up A records for %s. Check DNS and try again.\n' "$domain" >&2
+    return 1
+  fi
+  if ! xhttp_validate_single_dns_ipv4 "$expected_ip" <<<"$records"; then
+    printf '%s must have exactly one A record pointing to %s. Disable DNS proxying and remove stale records.\n' "$domain" "$expected_ip" >&2
+    return 1
+  fi
+  if ! records="$(dig +time=3 +tries=2 +short AAAA "${domain}.")"; then
+    printf 'Could not look up AAAA records for %s. Check DNS and try again.\n' "$domain" >&2
+    return 1
+  fi
+  if [[ -n "$records" ]]; then
+    printf 'Remove the AAAA record for %s and try again.\n' "$domain" >&2
+    return 1
+  fi
+}
+
+xhttp_read_install_domain() {
+  local expected_ip="$1" domain label LC_ALL=C
+  local -a labels
+  while IFS= read -rp 'Domain already pointed to this VPS (example: vpn.example.com): ' domain; do
+    xhttp_clean_prompt_input "$domain"
+    domain="${REPLY,,}"
+    if [[ ! "$domain" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]]; then
+      printf 'Invalid domain %q. Enter a domain such as vpn.example.com.\n' "$domain" >&2
+      continue
+    fi
+    if (( ${#domain} > 253 )); then
+      printf '%s\n' 'Domain is longer than the DNS limit (253 characters).' >&2
+      continue
+    fi
+    IFS='.' read -r -a labels <<<"$domain"
+    for label in "${labels[@]}"; do
+      if (( ${#label} > 63 )); then
+        printf '%s\n' 'A DNS label is longer than the DNS limit (63 characters).' >&2
+        continue 2
+      fi
+    done
+    if xhttp_check_install_dns "$domain" "$expected_ip"; then
+      REPLY="$domain"
+      return
+    fi
+  done
+  return 1
+}
+
 xhttp_transport_flow() {
   case "$1" in
     vision) printf '%s' 'xtls-rprx-vision' ;;
@@ -322,6 +382,33 @@ xhttp_enroll_panel_2fa() {
     if ! xhttp_panel_2fa_enabled; then printf '%s\n' 'The panel has not confirmed an active 2FA token yet.'; fi
   done
   printf '%s\n' '3x-ui confirmed that 2FA is enabled. Test it in a second browser session and store the authenticator backup separately.'
+}
+
+xhttp_clean_prompt_input() {
+  local answer="$1"
+  # Some terminals wrap pasted input in bracketed paste markers.
+  if [[ "$answer" == $'\e[200~'*$'\e[201~' ]]; then
+    answer="${answer#$'\e[200~'}"
+    answer="${answer%$'\e[201~'}"
+  fi
+  answer="${answer#$'\xef\xbb\xbf'}"
+  answer="${answer#"${answer%%[![:space:]]*}"}"
+  REPLY="${answer%"${answer##*[![:space:]]}"}"
+}
+
+xhttp_read_yes_no() {
+  local question="$1" default_answer="$2" answer options='y/N'
+  if [[ "$default_answer" == yes ]]; then options='Y/n'; fi
+  while IFS= read -rp "$question [$options]: " answer; do
+    xhttp_clean_prompt_input "$answer"
+    case "$REPLY" in
+      '') REPLY="$default_answer"; return ;;
+      [nN]|[nN][oO]) REPLY=no; return ;;
+      [yY]|[yY][eE][sS]) REPLY=yes; return ;;
+      *) printf 'Enter y or n, or press Enter for %s.\n' "$default_answer" >&2 ;;
+    esac
+  done
+  return 1
 }
 
 xhttp_subscription_profile_settings() {
