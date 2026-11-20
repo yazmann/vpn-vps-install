@@ -13,7 +13,18 @@
 - [INCY link encoder](https://github.com/INCY-DEV/incy-link-encoder) описывает совместимый формат crypt1 и публикует общий ключ приложения. Установщик использует этот формат с системной библиотекой Node.js.
 - [Cloudflare WARP](https://www.cloudflare.com/application/terms/) — сторонний сервис Cloudflare. Этот проект лишь автоматизирует настройку поддерживаемой 3x-ui интеграции и не связан с Cloudflare. Пользователь самостоятельно отвечает за соблюдение применимых условий сервиса и его доступность в своей юрисдикции.
 - [NGINX](https://github.com/nginx/nginx), Ubuntu и системные пакеты устанавливаются из репозиториев операционной системы и сохраняют собственные лицензии и условия распространения.
-- Фотографии для сайта-заглушки предоставляются отдельно на условиях [Unsplash License](https://unsplash.com/license). Авторы и исходные страницы перечислены в [PHOTO_ATTRIBUTION.md](PHOTO_ATTRIBUTION.md).
 - Профили клиентской маршрутизации HAPP и INCY загружаются при установке из независимого проекта [hydraponique/roscomvpn-routing](https://github.com/hydraponique/roscomvpn-routing). Этот установщик не является частью RoscomVPN и не заявляет авторских прав на его правила или списки.
 
 Сам установщик не изменяет лицензии сторонних компонентов. При изменении способа загрузки, включении сторонних файлов непосредственно в репозиторий или публичном распространении готовых образов следует повторно проверить требования соответствующих лицензий и условий сервисов.
+
+## Фотографии сайта-заглушки
+
+Установщик скачивает выбранную фотографию на VPS. Фотографии распространяются по [Unsplash License](https://unsplash.com/license).
+
+| Тема | Автор | Источник |
+|---|---|---|
+| Engineering consultancy | Dave Meckler | [Unsplash](https://unsplash.com/photos/xYeGSXRhV80) |
+| Digital infrastructure | Eric Stoynov | [Unsplash](https://unsplash.com/photos/k27hkqXuveo) |
+| Logistics and operations | Bernd Dittrich | [Unsplash](https://unsplash.com/photos/F2C_mSrb6iM) |
+| Architecture studio | Grigorii Shcheglov | [Unsplash](https://unsplash.com/photos/A9HNu8LiHQc) |
+| Industrial service | TECNIC Bioprocess Solutions | [Unsplash](https://unsplash.com/photos/VFrbWve7eAs) |

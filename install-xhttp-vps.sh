@@ -7,7 +7,7 @@ set -Eeuo pipefail
 # The script is interactive only during the initial questionnaire.
 # Independent automation project; not affiliated with or endorsed by 3x-ui,
 # XTLS/Xray or Cloudflare. Third-party names remain their owners' property.
-# See THIRD_PARTY_NOTICES.md in the project repository.
+# See docs/THIRD_PARTY_NOTICES.md in the project repository.
 
 green='\033[1;32m'; yellow='\033[1;33m'; red='\033[1;31m'; cyan='\033[1;36m'; blue='\033[1;34m'; plain='\033[0m'
 CURRENT_STEP='startup'
