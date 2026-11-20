@@ -222,4 +222,4 @@ journalctl -u xhttp-vps-maintenance.service --since '30 days ago'
 
 [3x-ui](https://github.com/MHSanaei/3x-ui) · [Xray-core](https://github.com/XTLS/Xray-core) · [NGINX](https://github.com/nginx/nginx) · [Let's Encrypt](https://letsencrypt.org/) · [UFW](https://launchpad.net/ufw) · [BBR](https://www.kernel.org/doc/html/latest/networking/bbr.html) · [Cloudflare WARP](https://www.cloudflare.com/warp/) · [HAPP](https://github.com/Happ-proxy/happ-desktop) · [INCY](https://incy.cc/) · [Mihomo](https://github.com/MetaCubeX/mihomo) · [RoscomVPN Routing](https://github.com/hydraponique/roscomvpn-routing)
 
-Сторонние компоненты и лицензии: [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
+Сторонние компоненты и лицензии описаны в [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
