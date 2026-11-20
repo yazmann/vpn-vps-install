@@ -385,6 +385,22 @@ LC_ALL=C xhttp_read_yes_no 'Test question?' no <<<'Да'
 [[ "$REPLY" == yes ]]
 if xhttp_read_yes_no 'Test question?' no </dev/null; then exit 1; fi
 (
+  verify_dir="$(mktemp -d)"
+  trap 'rm -f -- "$verify_dir/verified"; rmdir -- "$verify_dir"' EXIT
+  if xhttp_confirm_ssh_port_change "$verify_dir/verified" <<<$'1\ninvalid\n2' >/dev/null 2>&1; then
+    exit 1
+  else
+    [[ "$?" == 2 ]]
+  fi
+  touch "$verify_dir/verified"
+  xhttp_confirm_ssh_port_change "$verify_dir/verified" <<<'' >/dev/null
+  if xhttp_confirm_ssh_port_change "$verify_dir/verified" <<<'2' >/dev/null; then
+    exit 1
+  else
+    [[ "$?" == 2 ]]
+  fi
+)
+(
   installer=./install-xhttp-vps.sh
   warn() { :; }
   die() { printf '%s\n' "$*" >&2; exit 1; }
