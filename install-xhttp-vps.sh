@@ -50,6 +50,37 @@ ask_yes_no() {
   xhttp_read_yes_no "$@" || die "Input ended while waiting for an answer to: $1"
 }
 
+ask_setup_input() {
+  local prompt="$1" default_value="$2" hint="$3" validator="$4" answer
+  shift 4
+  while IFS= read -rp "$prompt" answer; do
+    xhttp_clean_prompt_input "$answer"
+    REPLY="${REPLY:-$default_value}"
+    if "$validator" "$REPLY" "$@"; then return; fi
+    warn "$hint"
+  done
+  die "Input ended while waiting for: $prompt"
+}
+
+input_matches() { [[ "$1" =~ $2 ]]; }
+valid_vpn_name() { [[ ${#1} -ge 1 && ${#1} -le 64 ]] && ! LC_ALL=C grep -q '[[:cntrl:]]' <<<"$1"; }
+valid_backup_file() {
+  [[ -f "$1" && -r "$1" ]] && head -c 16 -- "$1" | cmp -s - <(printf 'SQLite format 3\0')
+}
+valid_ssh_port() {
+  [[ "$1" =~ ^[1-9][0-9]{4}$ ]] && (( $1 <= 65535 )) && [[ "$1" != "$SSH_PORT" ]] && ! port_busy "$1"
+}
+valid_ssh_source() {
+  [[ -z "$1" ]] || { xhttp_valid_ipv4 "$1" && [[ -z "${SSH_CONNECTION:-}" || "${SSH_CONNECTION%% *}" == "$1" ]]; }
+}
+valid_maintenance_timezone() {
+  [[ "$1" =~ ^([A-Za-z0-9_+-]+/)*[A-Za-z0-9_+-]+$ && -f "/usr/share/zoneinfo/$1" ]]
+}
+valid_setup_key() {
+  [[ "$1" != *$'\r'* && "$1" != *$'\n'* ]] || return 1
+  "$2" "$(printf '%s\n' "$1" | base64 -w0)"
+}
+
 [[ ${EUID} -eq 0 ]] || die "Run as root."
 COMMON_SCRIPT="$(dirname "$(readlink -f "$0")")/xhttp-vps-common.sh"
 [[ -r "$COMMON_SCRIPT" ]] || die "Place xhttp-vps-common.sh alongside this installer."
@@ -235,9 +266,9 @@ fi
 printf '\nVPN VPS Install\n\n'
 if [[ ${#MENU_STATE_FILES[@]} -eq 1 ]]; then
   if [[ "$HAS_CURRENT_SETTINGS" -eq 1 ]]; then
-    printf 'Existing installation:\n1) Show current settings (default)\n2) Verify and repair\n3) Permanently remove VPN (no archive)\n4) Refresh automatic maintenance\n5) Export an encrypted recovery backup\n0) Exit\n'
-    read -rp "Select [1]: " ACTION
-    ACTION="${ACTION:-1}"
+    printf 'Existing installation\n1) Show settings (default)\n2) Check and repair\n3) Remove VPN without a backup\n4) Refresh automatic updates\n5) Export encrypted backup\n0) Exit\n'
+    ask_setup_input 'Select [1]: ' 1 'Choose a number from 0 to 5.' input_matches '^[0-5]$'
+    ACTION="$REPLY"
     case "$ACTION" in
       1) show_current_settings ;;
       2)
@@ -266,25 +297,23 @@ if [[ ${#MENU_STATE_FILES[@]} -eq 1 ]]; then
         exit 0
         ;;
       0) exit 0 ;;
-      *) die "Unknown menu item: $ACTION" ;;
     esac
   else
-    printf 'Interrupted installation:\n1) Continue and repair (default)\n2) Permanently remove VPN (no archive)\n0) Exit\n'
-    read -rp "Select [1]: " ACTION
-    ACTION="${ACTION:-1}"
+    printf 'Interrupted installation\n1) Resume setup (default)\n2) Remove VPN without a backup\n0) Exit\n'
+    ask_setup_input 'Select [1]: ' 1 'Choose 0, 1 or 2.' input_matches '^[0-2]$'
+    ACTION="$REPLY"
     case "$ACTION" in
       1) exec "$(readlink -f "$0")" --resume ;;
       2) remove_installation; exit 0 ;;
       0) exit 0 ;;
-      *) die "Unknown menu item: $ACTION" ;;
     esac
   fi
 elif [[ ${#MENU_STATE_FILES[@]} -gt 1 ]]; then
   die "Multiple installer state files were found in /root. Resolve them manually before continuing."
 else
-  printf 'New VPS:\n1) Install standalone VPN (default)\n2) Install remote node\n3) Install standalone VPN and import VLESS users from a 3x-ui SQLite backup\n0) Exit\n'
-  read -rp "Select [1]: " ACTION
-  ACTION="${ACTION:-1}"
+  printf 'New VPS\n1) Install VPN server (default)\n2) Install 3x-ui node\n3) Install VPN server and import VLESS users\n0) Exit\n'
+  ask_setup_input 'Select [1]: ' 1 'Choose a number from 0 to 3.' input_matches '^[0-3]$'
+  ACTION="$REPLY"
   MIGRATION_DB=''
   MIGRATION_INBOUND=''
   case "$ACTION" in
@@ -293,12 +322,10 @@ else
     3)
       INSTALL_MODE=standalone
       [[ -r "$MIGRATION_SCRIPT" ]] || die "Place xhttp-vps-migrate.sh alongside this installer."
-      read -rp "Path to the source 3x-ui SQLite backup: " MIGRATION_DB
-      MIGRATION_DB="$(realpath -e -- "$MIGRATION_DB")" || die "SQLite backup does not exist."
-      [[ -f "$MIGRATION_DB" && -r "$MIGRATION_DB" ]] || die "SQLite backup is not a readable file."
+      ask_setup_input '3x-ui SQLite backup path: ' '' 'Enter the path to a readable 3x-ui SQLite backup.' valid_backup_file
+      MIGRATION_DB="$(realpath -e -- "$REPLY")" || die "Could not resolve the backup path."
       ;;
     0) exit 0 ;;
-    *) die "Unknown menu item: $ACTION" ;;
   esac
 fi
 
@@ -382,32 +409,28 @@ INSTANCE_NAME="${DEFAULT_INSTANCE:-$([[ "$INSTALL_MODE" == "standalone" ]] && ec
 if [[ "$INSTALL_MODE" == "standalone" ]]; then
   DEFAULT_VPN_NAME="${DOMAIN%%.*} VPN"
   NAME_LABEL="VPN name"
-  read -rp "VPN name shown in subscriptions [${DEFAULT_VPN_NAME}]: " VPN_NAME
+  VPN_NAME_PROMPT="Subscription name [${DEFAULT_VPN_NAME}]: "
 else
   DEFAULT_VPN_NAME="${DOMAIN%%.*} Node"
   NAME_LABEL="Node name"
-  read -rp "Node name shown in the local 3x-ui panel [${DEFAULT_VPN_NAME}]: " VPN_NAME
+  VPN_NAME_PROMPT="Node name [${DEFAULT_VPN_NAME}]: "
 fi
-VPN_NAME="${VPN_NAME:-$DEFAULT_VPN_NAME}"
-[[ ${#VPN_NAME} -ge 1 && ${#VPN_NAME} -le 64 ]] || die "${NAME_LABEL} must contain 1-64 characters."
-if LC_ALL=C grep -q '[[:cntrl:]]' <<<"$VPN_NAME"; then die "${NAME_LABEL} contains control characters."; fi
+ask_setup_input "$VPN_NAME_PROMPT" "$DEFAULT_VPN_NAME" "${NAME_LABEL} must contain 1–64 characters and no control characters." valid_vpn_name
+VPN_NAME="$REPLY"
 
 printf '%s\n' 'VPN transport:' '  1) Vision (default), TCP/443' '  2) XHTTP, TCP/443'
 if [[ "$INSTALL_MODE" == standalone && -z "$MIGRATION_DB" ]]; then
   printf '%s\n' '  3) AmneziaWG, UDP' '  4) Hysteria 2, UDP/443'
+  ask_setup_input 'Select transport [1]: ' 1 'Choose a number from 1 to 4.' input_matches '^[1-4]$'
+else
+  ask_setup_input 'Select transport [1]: ' 1 'Choose 1 (Vision) or 2 (XHTTP).' input_matches '^[12]$'
 fi
-read -rp "Select transport [1]: " TRANSPORT_CHOICE
-case "${TRANSPORT_CHOICE:-1}" in
+case "$REPLY" in
   1) TRANSPORT=vision ;;
   2) TRANSPORT=xhttp ;;
   3) TRANSPORT=amneziawg ;;
   4) TRANSPORT=hysteria2 ;;
-  *) die "Unknown transport choice: ${TRANSPORT_CHOICE}" ;;
 esac
-if ! xhttp_uses_panel; then
-  [[ "$INSTALL_MODE" != node ]] || die "Remote nodes require Vision or XHTTP."
-  [[ -z "$MIGRATION_DB" ]] || die "3x-ui client import requires Vision or XHTTP."
-fi
 UDP_PORT=''
 HY_PASSWORD=''
 INBOUND_TAG=''
@@ -422,46 +445,41 @@ SUB_PRIVACY_HEADERS=''
 if xhttp_uses_panel; then
 INBOUND_TAG="$(xhttp_inbound_tag_for "$TRANSPORT")"
 cat <<'EOF'
-Panel access:
+Panel access
+  3) Localhost only. Use an SSH tunnel (default).
   1) Public Internet
-     Open the panel from any device.
-  2) Trusted IPv4 only
-     For a fixed administrator or main-panel IP.
-  3) Localhost only (default)
-     Connect through an SSH tunnel or Tailscale.
+  2) One trusted IPv4
 EOF
-read -rp "Select panel access [3]: " PANEL_ACCESS_CHOICE
-PANEL_ACCESS_CHOICE="${PANEL_ACCESS_CHOICE:-3}"
+ask_setup_input 'Select panel access [3]: ' 3 'Choose 1, 2 or 3.' input_matches '^[1-3]$'
 PANEL_ALLOWED_IP=""
-case "$PANEL_ACCESS_CHOICE" in
+case "$REPLY" in
   1)
     PANEL_ACCESS_MODE="public"
     warn "Public access selected. Keep the full panel URL private; 2FA is recommended for public access."
     ;;
   2)
     PANEL_ACCESS_MODE="allowlist"
-    read -rp "Trusted public IPv4 allowed to reach the panel: " PANEL_ALLOWED_IP
-    xhttp_valid_ipv4 "$PANEL_ALLOWED_IP" || die "Invalid trusted IPv4: ${PANEL_ALLOWED_IP}."
+    ask_setup_input 'Trusted IPv4 for panel access: ' '' 'Enter one valid IPv4 address.' xhttp_valid_ipv4
+    PANEL_ALLOWED_IP="$REPLY"
     ;;
   3) PANEL_ACCESS_MODE="private" ;;
-  *) die "Unknown panel access choice: ${PANEL_ACCESS_CHOICE}" ;;
 esac
 
-ask_yes_no 'Enable 3x-ui two-factor authentication during setup (requires an authenticator app)?' no
+ask_yes_no 'Enable panel 2FA (authenticator app)?' no
 if [[ "$REPLY" == yes ]]; then PANEL_2FA_ENROLL=1; fi
 
 if [[ "$INSTALL_MODE" == standalone ]]; then
-  ask_yes_no 'Generate encrypted HAPP and INCY subscription links?' yes
+  ask_yes_no 'Encrypt Happ and INCY subscription links?' yes
   if [[ "$REPLY" == yes ]]; then SUB_ENCRYPT_LINKS=true; else SUB_ENCRYPT_LINKS=false; fi
 fi
 
-printf '%s\n' 'The built-in profile page can expose subscription URLs and server settings to its visitors.'
-ask_yes_no 'Advertise the built-in subscription profile page?' no
+printf '%s\n' 'The profile page may show subscription links and server settings.'
+ask_yes_no 'Add a profile page link to subscriptions?' no
 if [[ "$REPLY" == yes ]]; then SUB_PROFILE_MODE=builtin; else SUB_PROFILE_MODE=none; fi
-ask_yes_no 'Disable caching and referrer sharing for subscription responses?' yes
+ask_yes_no 'Block subscription caching and referrer sharing?' yes
 if [[ "$REPLY" == yes ]]; then SUB_PRIVACY_HEADERS=true; else SUB_PRIVACY_HEADERS=false; fi
 
-ask_yes_no 'Use Cloudflare WARP over MASQUE as an extra exit for Russian resources (domains and IPs)?' yes
+ask_yes_no 'Route Russian sites and IPs via Cloudflare WARP?' yes
 if [[ "$REPLY" == yes ]]; then ENABLE_WARP=1; fi
 else
   [[ -r "$UDP_SCRIPT" ]] || die "Place xhttp-vps-udp.sh alongside this installer."
@@ -480,22 +498,21 @@ else
 fi
 
 cat <<'EOF'
-Cover-site design:
-  1) Automatic (stable selection based on domain)
+Cover-site design
+  1) Automatic (default)
   2) Engineering consultancy
   3) Digital infrastructure
   4) Logistics and operations
   5) Architecture studio
   6) Industrial service
 EOF
-read -rp "Select cover design [1]: " COVER_CHOICE
-COVER_CHOICE="${COVER_CHOICE:-1}"
+ask_setup_input 'Select cover design [1]: ' 1 'Choose a number from 1 to 6.' input_matches '^[1-6]$'
+COVER_CHOICE="$REPLY"
 if [[ "$COVER_CHOICE" == 1 ]]; then
   COVER_STYLE=$(( $(printf '%s' "$DOMAIN" | cksum | awk '{print $1}') % 5 + 2 ))
 else
   COVER_STYLE="$COVER_CHOICE"
 fi
-[[ "$COVER_STYLE" =~ ^[2-6]$ ]] || die "Unknown cover design: ${COVER_CHOICE}"
 case "$COVER_STYLE" in
   2) COVER_LABEL="Engineering consultancy" ;;
   3) COVER_LABEL="Digital infrastructure" ;;
@@ -510,31 +527,25 @@ if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || (( SSH_PORT < 1 || SSH_PORT > 65535 )); th
 fi
 [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || SSH_PORT=22
 SSH_TARGET_PORT=''
-ask_yes_no "Move SSH from port $SSH_PORT to a high port?" no
+ask_yes_no "Change SSH port (current: $SSH_PORT)?" no
 if [[ "$REPLY" == yes ]]; then
   SSH_PORT_SUGGESTION="$(random_port)" || die 'Could not find a free high SSH port.'
-  read -rp "High SSH port (10000–65535) [$SSH_PORT_SUGGESTION]: " SSH_TARGET_PORT
-  SSH_TARGET_PORT="${SSH_TARGET_PORT:-$SSH_PORT_SUGGESTION}"
-  [[ "$SSH_TARGET_PORT" =~ ^[1-9][0-9]{4}$ ]] && (( SSH_TARGET_PORT <= 65535 )) &&
-    [[ "$SSH_TARGET_PORT" != "$SSH_PORT" ]] && ! port_busy "$SSH_TARGET_PORT" || die 'Choose a free high SSH port different from the current port.'
+  ask_setup_input "High SSH port (10000–65535) [$SSH_PORT_SUGGESTION]: " "$SSH_PORT_SUGGESTION" \
+    'Choose a free port from 10000 to 65535, different from the current SSH port.' valid_ssh_port
+  SSH_TARGET_PORT="$REPLY"
   printf 'Allow TCP/%s at your VPS provider before switching. Keep TCP/%s open until the new login is verified.\n' "$SSH_TARGET_PORT" "$SSH_PORT"
 fi
 
 cat <<'EOF'
-SSH access:
-  1) Keep current access
-     Existing root and login settings stay unchanged.
-  2) Root with SSH key only
-     Password login is disabled.
-  3) New sudo user with SSH key
-     Root and password login are disabled.
-  4) New sudo user with an SSH certificate (default)
-     A certificate login is tested before root and password login are disabled.
-  5) Root with password
-     Set a root password if necessary.
+SSH login
+  4) New sudo user + SSH certificate only. Root and password login blocked (default).
+  1) Keep current SSH settings.
+  2) Root + SSH key only. Password login blocked.
+  3) New sudo user + SSH key only. Root and password login blocked.
+  5) Root + password only.
 EOF
-read -rp "Select SSH policy [4]: " SSH_ACCESS_CHOICE
-SSH_ACCESS_CHOICE="${SSH_ACCESS_CHOICE:-4}"
+ask_setup_input 'Select SSH login [4]: ' 4 'Choose a number from 1 to 5.' input_matches '^[1-5]$'
+SSH_ACCESS_CHOICE="$REPLY"
 case "$SSH_ACCESS_CHOICE" in
   1)
     SSH_ACCESS_MODE=existing
@@ -553,11 +564,8 @@ case "$SSH_ACCESS_CHOICE" in
     SSH_ACCESS_MODE='admin'
     if [[ "$SSH_ACCESS_CHOICE" == 4 ]]; then SSH_ACCESS_MODE=admin-cert; fi
     SSH_HARDENING=1
-    read -rp "New administrative SSH user [vpnadmin]: " ADMIN_USER
-    ADMIN_USER="${ADMIN_USER:-vpnadmin}"
-    [[ "$ADMIN_USER" =~ ^[a-z_][a-z0-9_-]{0,30}$ && "$ADMIN_USER" != root ]] \
-      || die "Administrative user must be a non-root Linux name up to 31 characters."
-    getent passwd "$ADMIN_USER" >/dev/null && die "User ${ADMIN_USER} already exists; use a fresh name."
+    xhttp_read_admin_username || die 'Input ended while waiting for a new SSH username.'
+    ADMIN_USER="$REPLY"
     ;;
   5)
     SSH_ACCESS_MODE='root-password'
@@ -565,7 +573,6 @@ case "$SSH_ACCESS_CHOICE" in
     ADMIN_USER=root
     warn 'Root password login selected. Use a strong unique password and restrict the source IPv4 when possible.'
     ;;
-  *) die "Unknown SSH policy choice: ${SSH_ACCESS_CHOICE}" ;;
 esac
 ADMIN_KEYS_B64=""
 ADMIN_KEY_FINGERPRINTS=""
@@ -574,64 +581,55 @@ if [[ "$SSH_ACCESS_MODE" == admin-cert ]]; then
   printf '%s\n' 'Create an Ed25519 CA separately and keep its private key offline:'
   printf '%s\n' '  ssh-keygen -t ed25519 -f ~/.ssh/vps_ssh_ca'
   printf '  ssh-keygen -s ~/.ssh/vps_ssh_ca -I %s -n %s -V +30d ~/.ssh/id_ed25519.pub\n' "$ADMIN_USER" "$ADMIN_USER"
-  read -rp 'Paste the CA public key (vps_ssh_ca.pub): ' SSH_CA_KEY
-  [[ "$SSH_CA_KEY" != *$'\r'* && "$SSH_CA_KEY" != *$'\n'* ]] || die 'The CA public key must be one line.'
-  ADMIN_KEYS_B64="$(printf '%s' "$SSH_CA_KEY" | base64 -w0)"
-  xhttp_validate_ssh_ca_b64 "$ADMIN_KEYS_B64" || die 'An Ed25519 CA public key is required.'
+  ask_setup_input 'SSH CA public key (vps_ssh_ca.pub): ' '' \
+    'Paste one complete Ed25519 CA public key from the .pub file.' valid_setup_key xhttp_validate_ssh_ca_b64
+  ADMIN_KEYS_B64="$(printf '%s' "$REPLY" | base64 -w0)"
   ADMIN_KEY_FINGERPRINTS="$(xhttp_authorized_key_fingerprints "$ADMIN_KEYS_B64")"
 elif [[ "$SSH_ACCESS_MODE" == admin || "$SSH_ACCESS_MODE" == root-key ]]; then
   if [[ -s /root/.ssh/authorized_keys ]]; then
-    ask_yes_no "Reuse the current root authorized_keys for ${ADMIN_USER}?" yes
-    if [[ "$REPLY" == yes ]]; then ADMIN_KEYS_B64="$(base64 -w0 /root/.ssh/authorized_keys)"; fi
+    ask_yes_no "Reuse root SSH keys for ${ADMIN_USER}?" yes
+    if [[ "$REPLY" == yes ]]; then
+      ADMIN_KEYS_B64="$(base64 -w0 /root/.ssh/authorized_keys)"
+      if ! xhttp_validate_authorized_keys_b64 "$ADMIN_KEYS_B64"; then
+        warn 'The existing authorized_keys file cannot be reused. Paste a public key below.'
+        ADMIN_KEYS_B64=''
+      fi
+    fi
   fi
   if [[ -z "$ADMIN_KEYS_B64" ]]; then
-    read -rp "Paste one SSH public key for ${ADMIN_USER}: " ADMIN_PUBLIC_KEY
-    [[ "$ADMIN_PUBLIC_KEY" != *$'\r'* && "$ADMIN_PUBLIC_KEY" != *$'\n'* ]] \
-      || die "SSH public key must be one line without control characters."
-    ADMIN_KEYS_B64="$(printf '%s\n' "$ADMIN_PUBLIC_KEY" | base64 -w0)"
+    ask_setup_input "SSH public key for ${ADMIN_USER}: " '' \
+      'Paste one complete SSH public key from a .pub file.' valid_setup_key xhttp_validate_authorized_keys_b64
+    ADMIN_KEYS_B64="$(printf '%s\n' "$REPLY" | base64 -w0)"
   fi
-  xhttp_validate_authorized_keys_b64 "$ADMIN_KEYS_B64" \
-    || die "The selected authorized_keys data does not contain a valid SSH public key."
   ADMIN_KEY_FINGERPRINTS="$(xhttp_authorized_key_fingerprints "$ADMIN_KEYS_B64")"
 fi
 
-read -rp 'Restrict SSH to this trusted IPv4 (leave blank for unrestricted source IPs): ' SSH_ALLOWED_IP
-if [[ -n "$SSH_ALLOWED_IP" ]]; then
-  xhttp_valid_ipv4 "$SSH_ALLOWED_IP" || die 'Enter one valid IPv4 address or leave the field blank.'
-  if [[ -n "${SSH_CONNECTION:-}" && "${SSH_CONNECTION%% *}" != "$SSH_ALLOWED_IP" ]]; then
-    die "The current SSH connection is from ${SSH_CONNECTION%% *}. Use the provider console or reconnect from $SSH_ALLOWED_IP before selecting this restriction."
-  fi
-fi
+ask_setup_input 'Allow SSH from one IPv4 (blank = any): ' '' \
+  'Enter the IPv4 of this SSH connection, or leave blank. From the provider console you can enter any trusted IPv4.' valid_ssh_source
+SSH_ALLOWED_IP="$REPLY"
 
-ask_yes_no 'Disable IPv4 ping replies (keep other ICMP messages)?' no
+ask_yes_no 'Block IPv4 ping replies?' no
 if [[ "$REPLY" == yes ]]; then DISABLE_PING=1; else DISABLE_PING=0; fi
 
 cat <<'EOF'
-Automatic maintenance:
-  1) Scheduled updates and conditional reboot (default)
-     Security updates every day at 05:30. Full updates and cleanup on Sundays at 05:30.
-     Reboot after maintenance if required.
-  2) Security updates only
-     Installed daily at 05:30 without automatic reboot.
-  3) No automatic updates
-     Updates and reboot are performed manually.
+Automatic updates
+  1) Daily security, full updates Sunday, reboot if needed (default)
+  2) Daily security only, no automatic reboot
+  3) Manual updates
 EOF
-read -rp "Select maintenance [1]: " MAINTENANCE_CHOICE
-MAINTENANCE_CHOICE="${MAINTENANCE_CHOICE:-1}"
+ask_setup_input 'Select maintenance [1]: ' 1 'Choose 1, 2 or 3.' input_matches '^[1-3]$'
 MAINTENANCE_TIMEZONE=Europe/Moscow
-case "$MAINTENANCE_CHOICE" in
+case "$REPLY" in
   1) MAINTENANCE_MODE=weekly ;;
   2) MAINTENANCE_MODE=security ;;
   3) MAINTENANCE_MODE=none ;;
-  *) die "Unknown maintenance choice: ${MAINTENANCE_CHOICE}" ;;
 esac
 if [[ "$MAINTENANCE_MODE" != none ]]; then
-  read -rp "Timezone for scheduled maintenance at 05:30 [Europe/Moscow]: " MAINTENANCE_TIMEZONE
-  MAINTENANCE_TIMEZONE="${MAINTENANCE_TIMEZONE:-Europe/Moscow}"
-  [[ "$MAINTENANCE_TIMEZONE" =~ ^([A-Za-z0-9_+-]+/)*[A-Za-z0-9_+-]+$ && -f "/usr/share/zoneinfo/$MAINTENANCE_TIMEZONE" ]] \
-    || die "Unknown IANA timezone: ${MAINTENANCE_TIMEZONE}. Example: Europe/Moscow or Etc/UTC."
+  ask_setup_input 'Update timezone (05:30 local) [Europe/Moscow]: ' Europe/Moscow \
+    'Enter an IANA timezone such as Europe/Moscow or Etc/UTC.' valid_maintenance_timezone
+  MAINTENANCE_TIMEZONE="$REPLY"
 fi
-ask_yes_no 'Export an encrypted recovery backup after setup?' no
+ask_yes_no 'Export an encrypted backup after setup?' no
 if [[ "$REPLY" == yes ]]; then CREATE_RECOVERY_BACKUP=1; else CREATE_RECOVERY_BACKUP=0; fi
 
 
@@ -977,8 +975,8 @@ if [[ -n "$MIGRATION_DB" && ! -s "$MANAGED_BACKUP/migration.json" ]]; then
     else
       [[ "$?" == 2 && -t 0 ]] || die "Could not read clients from the SQLite backup."
     fi
-    read -rp "Source VLESS inbound ID: " MIGRATION_INBOUND
-    [[ "$MIGRATION_INBOUND" =~ ^[1-9][0-9]{0,9}$ ]] || die "Invalid source inbound ID."
+    ask_setup_input 'Source VLESS inbound ID: ' '' 'Enter a positive ID from the list.' input_matches '^[1-9][0-9]{0,9}$'
+    MIGRATION_INBOUND="$REPLY"
     write_state
   done
 fi

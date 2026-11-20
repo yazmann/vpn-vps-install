@@ -5,6 +5,7 @@
 xhttp_valid_ipv4() {
   local value="$1" octet
   local -a parts
+  [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
   IFS='.' read -r -a parts <<<"$value"
   [[ ${#parts[@]} -eq 4 ]] || return 1
   for octet in "${parts[@]}"; do
@@ -61,7 +62,7 @@ xhttp_check_install_dns() {
 xhttp_read_install_domain() {
   local expected_ip="$1" domain label LC_ALL=C
   local -a labels
-  while IFS= read -rp 'Domain already pointed to this VPS (example: vpn.example.com): ' domain; do
+  while IFS= read -rp 'VPN domain (example: vpn.example.com): ' domain; do
     xhttp_clean_prompt_input "$domain"
     domain="${REPLY,,}"
     if [[ ! "$domain" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]]; then
@@ -386,6 +387,9 @@ xhttp_enroll_panel_2fa() {
 
 xhttp_clean_prompt_input() {
   local answer="$1"
+  answer="${answer#$'\xef\xbb\xbf'}"
+  answer="${answer#"${answer%%[![:space:]]*}"}"
+  answer="${answer%"${answer##*[![:space:]]}"}"
   # Some terminals wrap pasted input in bracketed paste markers.
   if [[ "$answer" == $'\e[200~'*$'\e[201~' ]]; then
     answer="${answer#$'\e[200~'}"
@@ -397,16 +401,33 @@ xhttp_clean_prompt_input() {
 }
 
 xhttp_read_yes_no() {
-  local question="$1" default_answer="$2" answer options='y/N'
+  local question="$1" default_answer="$2" answer options='N/y' LC_ALL=C.UTF-8
   if [[ "$default_answer" == yes ]]; then options='Y/n'; fi
   while IFS= read -rp "$question [$options]: " answer; do
     xhttp_clean_prompt_input "$answer"
     case "$REPLY" in
       '') REPLY="$default_answer"; return ;;
-      [nN]|[nN][oO]) REPLY=no; return ;;
-      [yY]|[yY][eE][sS]) REPLY=yes; return ;;
-      *) printf 'Enter y or n, or press Enter for %s.\n' "$default_answer" >&2 ;;
+      [nN]|[nN][oO]|[нН][еЕ][тТ]) REPLY=no; return ;;
+      [yY]|[yY][eE][sS]|[уУ]|[дД][аА]) REPLY=yes; return ;;
+      *) printf 'Enter y/yes (да) or n/no (нет), or press Enter for %s.\n' "$default_answer" >&2 ;;
     esac
+  done
+  return 1
+}
+
+xhttp_read_admin_username() {
+  local username LC_ALL=C
+  while IFS= read -rp 'New sudo username [vpnadmin]: ' username; do
+    xhttp_clean_prompt_input "$username"
+    username="${REPLY:-vpnadmin}"
+    if [[ ! "$username" =~ ^[a-z_][a-z0-9_-]{0,30}$ || "$username" == root ]]; then
+      printf '%s\n' 'Use up to 31 characters: lowercase English letters, digits, _ or -. Start with a letter or _. Choose a name other than root.' >&2
+    elif getent passwd "$username" >/dev/null; then
+      printf 'User %s already exists. Choose another name.\n' "$username" >&2
+    else
+      REPLY="$username"
+      return
+    fi
   done
   return 1
 }
@@ -483,12 +504,15 @@ xhttp_write_recovery_backup() (
 xhttp_export_recovery_backup() {
   local RECOVERY_PASSPHRASE confirmation file
   [[ -t 0 ]] || { printf '%s\n' 'Open an interactive terminal to export a backup.' >&2; return 1; }
-  read -rsp 'Backup passphrase (leave empty to cancel): ' RECOVERY_PASSPHRASE || return 1
-  printf '\n'
-  [[ -n "$RECOVERY_PASSPHRASE" ]] || return 1
-  read -rsp 'Confirm backup passphrase: ' confirmation || return 1
-  printf '\n'
-  [[ "$RECOVERY_PASSPHRASE" == "$confirmation" ]] || { printf '%s\n' 'Passphrases did not match.' >&2; return 1; }
+  while :; do
+    IFS= read -rsp 'Backup passphrase (leave empty to cancel): ' RECOVERY_PASSPHRASE || return 1
+    printf '\n'
+    [[ -n "$RECOVERY_PASSPHRASE" ]] || return 1
+    IFS= read -rsp 'Confirm backup passphrase: ' confirmation || return 1
+    printf '\n'
+    [[ "$RECOVERY_PASSPHRASE" == "$confirmation" ]] && break
+    printf '%s\n' 'Passphrases did not match. Try again.' >&2
+  done
   if ! command -v gpg >/dev/null; then
     xhttp_apt_get -o APT::Update::Error-Mode=any update || return 1
     xhttp_apt_apply install -y --no-install-recommends gnupg || return 1
