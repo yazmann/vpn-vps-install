@@ -1459,7 +1459,11 @@ if [[ "$PANEL_ACCESS_MODE" == "private" ]]; then
   log "Keeping the panel on private localhost access"
   /usr/local/x-ui/x-ui setting -listenIP 127.0.0.1 >/dev/null
 else
-  log "Enabling restricted panel IPv4 access after private configuration"
+  if [[ "$PANEL_ACCESS_MODE" == "public" ]]; then
+    log "Enabling public panel access over IPv4"
+  else
+    log "Enabling panel access from the trusted IPv4"
+  fi
   /usr/local/x-ui/x-ui setting -listenIP 0.0.0.0 >/dev/null
 fi
 xhttp_restart_vpn_service x-ui
