@@ -40,8 +40,6 @@
 
 ## Установка
 
-Ниже указан предварительный выпуск `v1.1.0-rc.1`. Для установки стабильной версии замените значение `revision` на `v1.0.0`.
-
 Вставьте весь блок в SSH-терминал от `root`. Он подходит для минимальных образов Ubuntu. При необходимости блок установит `curl` и корневые сертификаты, скачает архив стабильной версии и запустит мастер. Git для этого не нужен. Для проверки конкретного коммита можно указать его полный SHA вместо тега.
 
 ```bash
@@ -58,7 +56,7 @@
       install -y --no-install-recommends curl ca-certificates
   fi
 
-  revision=v1.1.0-rc.1
+  revision=v1.1.0
   workdir=$(mktemp -d)
   trap 'rm -rf -- "$workdir"' EXIT
   curl -q --fail --silent --show-error --location --retry 3 --connect-timeout 10 \

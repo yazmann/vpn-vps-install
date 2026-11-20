@@ -46,6 +46,10 @@ unexpected_error() {
 }
 trap 'unexpected_error "$?" "$LINENO"' ERR
 
+ask_yes_no() {
+  xhttp_read_yes_no "$@" || die "Input ended while waiting for an answer to: $1"
+}
+
 [[ ${EUID} -eq 0 ]] || die "Run as root."
 COMMON_SCRIPT="$(dirname "$(readlink -f "$0")")/xhttp-vps-common.sh"
 [[ -r "$COMMON_SCRIPT" ]] || die "Place xhttp-vps-common.sh alongside this installer."
@@ -352,23 +356,26 @@ if command -v ufw >/dev/null && ufw show added | grep -q '^ufw '; then
   die "UFW has pre-existing rules, even though it is inactive. Use a VPS without a configured firewall policy."
 fi
 
-read -rp "Domain already pointed to this VPS (example: vpn.example.com): " DOMAIN
-# SSH/terminal paste can add a UTF-8 BOM, spaces or a carriage return. They are
-# not part of a domain, so remove only these accidental boundary characters.
-DOMAIN="${DOMAIN//$'\r'/}"
-DOMAIN="${DOMAIN#$'\ufeff'}"
-DOMAIN="${DOMAIN#"${DOMAIN%%[![:space:]]*}"}"
-DOMAIN="${DOMAIN%"${DOMAIN##*[![:space:]]}"}"
-DOMAIN="${DOMAIN,,}"
-if ! [[ "$DOMAIN" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]]; then
-  printf -v SHOWN_DOMAIN '%q' "$DOMAIN"
-  die "Invalid domain input: ${SHOWN_DOMAIN}. Enter a domain such as vpn.example.com (Latin letters, digits, hyphens and dots only)."
+PACKAGES_INSTALLED_BY_SCRIPT=""
+DOMAIN_CHECK_PACKAGES=()
+if ! command -v curl >/dev/null; then DOMAIN_CHECK_PACKAGES+=(ca-certificates curl); fi
+if ! command -v curl >/dev/null || ! command -v dig >/dev/null; then
+  export DEBIAN_FRONTEND=noninteractive
+  xhttp_apt_get -o APT::Update::Error-Mode=any update
+  if ! command -v dig >/dev/null; then
+    DNS_PACKAGE="$(xhttp_dns_package)" || die "DNS lookup packages are unavailable. Check the Ubuntu repositories."
+    DOMAIN_CHECK_PACKAGES+=("$DNS_PACKAGE")
+  fi
+  for package in "${DOMAIN_CHECK_PACKAGES[@]}"; do
+    dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'install ok installed' \
+      || PACKAGES_INSTALLED_BY_SCRIPT+=" ${package}"
+  done
+  xhttp_apt_apply install -y --no-install-recommends "${DOMAIN_CHECK_PACKAGES[@]}"
 fi
-[[ ${#DOMAIN} -le 253 ]] || die "Domain is longer than the DNS limit (253 characters)."
-IFS='.' read -r -a DOMAIN_LABELS <<<"$DOMAIN"
-for DOMAIN_LABEL in "${DOMAIN_LABELS[@]}"; do
-  [[ ${#DOMAIN_LABEL} -le 63 ]] || die "A DNS label in the domain is longer than 63 characters."
-done
+PUBLIC_IP="$(curl -q -4fsS --retry 2 --retry-all-errors --connect-timeout 5 --max-time 10 https://api4.ipify.org || true)"
+xhttp_valid_ipv4 "$PUBLIC_IP" || die "Could not detect a valid public IPv4."
+xhttp_read_install_domain "$PUBLIC_IP" || die 'Input ended while waiting for the domain.'
+DOMAIN="$REPLY"
 
 DEFAULT_INSTANCE="$(hostname -s | tr -cd 'A-Za-z0-9_-')"
 INSTANCE_NAME="${DEFAULT_INSTANCE:-$([[ "$INSTALL_MODE" == "standalone" ]] && echo VPN1 || echo NODE1)}"
@@ -440,50 +447,22 @@ case "$PANEL_ACCESS_CHOICE" in
   *) die "Unknown panel access choice: ${PANEL_ACCESS_CHOICE}" ;;
 esac
 
-read -rp 'Enable 3x-ui two-factor authentication during setup (requires an authenticator app)? [y/N]: ' TWO_FACTOR_CHOICE
-case "${TWO_FACTOR_CHOICE,,}" in
-  ''|n|no) PANEL_2FA_ENROLL=0 ;;
-  y|yes) PANEL_2FA_ENROLL=1 ;;
-  *) die 'Enter yes or no for 3x-ui two-factor authentication.' ;;
-esac
+ask_yes_no 'Enable 3x-ui two-factor authentication during setup (requires an authenticator app)?' no
+if [[ "$REPLY" == yes ]]; then PANEL_2FA_ENROLL=1; fi
 
 if [[ "$INSTALL_MODE" == standalone ]]; then
-  read -rp "Generate encrypted HAPP and INCY subscription links? [Y/n]: " ENCRYPT_LINKS_CHOICE
-  case "${ENCRYPT_LINKS_CHOICE,,}" in
-    ''|y|yes) SUB_ENCRYPT_LINKS=true ;;
-    n|no) SUB_ENCRYPT_LINKS=false ;;
-    *) die "Enter yes or no for encrypted subscription links." ;;
-  esac
+  ask_yes_no 'Generate encrypted HAPP and INCY subscription links?' yes
+  if [[ "$REPLY" == yes ]]; then SUB_ENCRYPT_LINKS=true; else SUB_ENCRYPT_LINKS=false; fi
 fi
 
 printf '%s\n' 'The built-in profile page can expose subscription URLs and server settings to its visitors.'
-read -rp 'Advertise the built-in subscription profile page? [y/N]: ' PROFILE_PAGE_CHOICE
-case "${PROFILE_PAGE_CHOICE,,}" in
-  ''|n|no) SUB_PROFILE_MODE=none ;;
-  y|yes) SUB_PROFILE_MODE=builtin ;;
-  *) die 'Enter yes or no for the subscription profile page.' ;;
-esac
-read -rp 'Disable caching and referrer sharing for subscription responses? [Y/n]: ' SUB_PRIVACY_CHOICE
-case "${SUB_PRIVACY_CHOICE,,}" in
-  ''|y|yes) SUB_PRIVACY_HEADERS=true ;;
-  n|no) SUB_PRIVACY_HEADERS=false ;;
-  *) die 'Enter yes or no for subscription privacy headers.' ;;
-esac
+ask_yes_no 'Advertise the built-in subscription profile page?' no
+if [[ "$REPLY" == yes ]]; then SUB_PROFILE_MODE=builtin; else SUB_PROFILE_MODE=none; fi
+ask_yes_no 'Disable caching and referrer sharing for subscription responses?' yes
+if [[ "$REPLY" == yes ]]; then SUB_PRIVACY_HEADERS=true; else SUB_PRIVACY_HEADERS=false; fi
 
-read -rp "Use Cloudflare WARP over MASQUE as an extra exit for Russian resources (domains and IPs)? [Y/n]: " WARP_ANSWER
-WARP_ANSWER="${WARP_ANSWER//$'\r'/}"
-WARP_ANSWER="${WARP_ANSWER#$'\ufeff'}"
-# Keep only an ASCII yes/no answer. This makes paste artefacts harmless.
-WARP_ANSWER="$(LC_ALL=C tr -cd '[:alpha:]' <<<"$WARP_ANSWER")"
-WARP_ANSWER="${WARP_ANSWER,,}"
-case "${WARP_ANSWER:-y}" in
-  y|yes) ENABLE_WARP=1 ;;
-  n|no) ENABLE_WARP=0 ;;
-  *)
-    printf -v SHOWN_WARP_ANSWER '%q' "$WARP_ANSWER"
-    die "Expected yes/y or no/n for Cloudflare WARP routing; received ${SHOWN_WARP_ANSWER}. Press Enter for yes."
-    ;;
-esac
+ask_yes_no 'Use Cloudflare WARP over MASQUE as an extra exit for Russian resources (domains and IPs)?' yes
+if [[ "$REPLY" == yes ]]; then ENABLE_WARP=1; fi
 else
   [[ -r "$UDP_SCRIPT" ]] || die "Place xhttp-vps-udp.sh alongside this installer."
   case "$TRANSPORT" in
@@ -525,37 +504,21 @@ case "$COVER_STYLE" in
   6) COVER_LABEL="Industrial service" ;;
 esac
 
-PACKAGES_INSTALLED_BY_SCRIPT=""
-if ! command -v curl >/dev/null; then
-  export DEBIAN_FRONTEND=noninteractive
-  xhttp_apt_get -o APT::Update::Error-Mode=any update
-  for package in ca-certificates curl; do
-    dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'install ok installed' \
-      || PACKAGES_INSTALLED_BY_SCRIPT+=" ${package}"
-  done
-  xhttp_apt_apply install -y --no-install-recommends ca-certificates curl
-fi
-PUBLIC_IP="$(curl -q -4fsS --retry 2 --retry-all-errors --connect-timeout 5 --max-time 10 https://api4.ipify.org || true)"
-xhttp_valid_ipv4 "$PUBLIC_IP" || die "Could not detect a valid public IPv4."
 SSH_PORT="$(awk '{print $4}' <<<"${SSH_CONNECTION:-}" 2>/dev/null || true)"
 if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || (( SSH_PORT < 1 || SSH_PORT > 65535 )); then
   SSH_PORT="$(sshd -T 2>/dev/null | awk '$1=="port" {print $2; exit}' || true)"
 fi
 [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || SSH_PORT=22
 SSH_TARGET_PORT=''
-read -rp "Move SSH from port $SSH_PORT to a high port? [y/N]: " SSH_PORT_CHOICE
-case "${SSH_PORT_CHOICE,,}" in
-  ''|n|no) ;;
-  y|yes)
-    SSH_PORT_SUGGESTION="$(random_port)" || die 'Could not find a free high SSH port.'
-    read -rp "High SSH port (10000–65535) [$SSH_PORT_SUGGESTION]: " SSH_TARGET_PORT
-    SSH_TARGET_PORT="${SSH_TARGET_PORT:-$SSH_PORT_SUGGESTION}"
-    [[ "$SSH_TARGET_PORT" =~ ^[1-9][0-9]{4}$ ]] && (( SSH_TARGET_PORT <= 65535 )) &&
-      [[ "$SSH_TARGET_PORT" != "$SSH_PORT" ]] && ! port_busy "$SSH_TARGET_PORT" || die 'Choose a free high SSH port different from the current port.'
-    printf 'Allow TCP/%s at your VPS provider before switching. Keep TCP/%s open until the new login is verified.\n' "$SSH_TARGET_PORT" "$SSH_PORT"
-    ;;
-  *) die 'Enter yes or no for the SSH port change.' ;;
-esac
+ask_yes_no "Move SSH from port $SSH_PORT to a high port?" no
+if [[ "$REPLY" == yes ]]; then
+  SSH_PORT_SUGGESTION="$(random_port)" || die 'Could not find a free high SSH port.'
+  read -rp "High SSH port (10000–65535) [$SSH_PORT_SUGGESTION]: " SSH_TARGET_PORT
+  SSH_TARGET_PORT="${SSH_TARGET_PORT:-$SSH_PORT_SUGGESTION}"
+  [[ "$SSH_TARGET_PORT" =~ ^[1-9][0-9]{4}$ ]] && (( SSH_TARGET_PORT <= 65535 )) &&
+    [[ "$SSH_TARGET_PORT" != "$SSH_PORT" ]] && ! port_busy "$SSH_TARGET_PORT" || die 'Choose a free high SSH port different from the current port.'
+  printf 'Allow TCP/%s at your VPS provider before switching. Keep TCP/%s open until the new login is verified.\n' "$SSH_TARGET_PORT" "$SSH_PORT"
+fi
 
 cat <<'EOF'
 SSH access:
@@ -618,14 +581,8 @@ if [[ "$SSH_ACCESS_MODE" == admin-cert ]]; then
   ADMIN_KEY_FINGERPRINTS="$(xhttp_authorized_key_fingerprints "$ADMIN_KEYS_B64")"
 elif [[ "$SSH_ACCESS_MODE" == admin || "$SSH_ACCESS_MODE" == root-key ]]; then
   if [[ -s /root/.ssh/authorized_keys ]]; then
-    read -rp "Reuse the current root authorized_keys for ${ADMIN_USER}? [Y/n]: " REUSE_KEYS
-    REUSE_KEYS="${REUSE_KEYS//$'\r'/}"
-    REUSE_KEYS="${REUSE_KEYS,,}"
-    case "${REUSE_KEYS:-y}" in
-      y|yes) ADMIN_KEYS_B64="$(base64 -w0 /root/.ssh/authorized_keys)" ;;
-      n|no) ;;
-      *) die "Expected yes/y or no/n when selecting the SSH key source." ;;
-    esac
+    ask_yes_no "Reuse the current root authorized_keys for ${ADMIN_USER}?" yes
+    if [[ "$REPLY" == yes ]]; then ADMIN_KEYS_B64="$(base64 -w0 /root/.ssh/authorized_keys)"; fi
   fi
   if [[ -z "$ADMIN_KEYS_B64" ]]; then
     read -rp "Paste one SSH public key for ${ADMIN_USER}: " ADMIN_PUBLIC_KEY
@@ -646,12 +603,8 @@ if [[ -n "$SSH_ALLOWED_IP" ]]; then
   fi
 fi
 
-read -rp 'Disable IPv4 ping replies (keep other ICMP messages)? [y/N]: ' PING_CHOICE
-case "${PING_CHOICE,,}" in
-  ''|n|no) DISABLE_PING=0 ;;
-  y|yes) DISABLE_PING=1 ;;
-  *) die 'Enter yes or no for ping replies.' ;;
-esac
+ask_yes_no 'Disable IPv4 ping replies (keep other ICMP messages)?' no
+if [[ "$REPLY" == yes ]]; then DISABLE_PING=1; else DISABLE_PING=0; fi
 
 cat <<'EOF'
 Automatic maintenance:
@@ -678,12 +631,8 @@ if [[ "$MAINTENANCE_MODE" != none ]]; then
   [[ "$MAINTENANCE_TIMEZONE" =~ ^([A-Za-z0-9_+-]+/)*[A-Za-z0-9_+-]+$ && -f "/usr/share/zoneinfo/$MAINTENANCE_TIMEZONE" ]] \
     || die "Unknown IANA timezone: ${MAINTENANCE_TIMEZONE}. Example: Europe/Moscow or Etc/UTC."
 fi
-read -rp 'Export an encrypted recovery backup after setup? [y/N]: ' BACKUP_CHOICE
-case "${BACKUP_CHOICE,,}" in
-  ''|n|no) CREATE_RECOVERY_BACKUP=0 ;;
-  y|yes) CREATE_RECOVERY_BACKUP=1 ;;
-  *) die 'Enter yes or no for the encrypted recovery backup.' ;;
-esac
+ask_yes_no 'Export an encrypted recovery backup after setup?' no
+if [[ "$REPLY" == yes ]]; then CREATE_RECOVERY_BACKUP=1; else CREATE_RECOVERY_BACKUP=0; fi
 
 
 PANEL_PORT=''
@@ -928,8 +877,8 @@ fi
 if [[ "${CREATE_RECOVERY_BACKUP:-0}" == 1 ]]; then printf '  Encrypted recovery backup: yes\n'; fi
 if [[ -n "$MIGRATION_DB" ]]; then printf '  User backup:   %s\n' "$MIGRATION_DB"; fi
 if [[ -n "$SUB_ENCRYPT_LINKS" ]]; then printf '  Encrypted links: %s\n' "$SUB_ENCRYPT_LINKS"; fi
-read -rp "Start installation? [y/N]: " CONFIRM
-[[ "$CONFIRM" =~ ^[Yy]$ ]] || die "Cancelled."
+ask_yes_no 'Start installation?' no
+[[ "$REPLY" == yes ]] || die "Cancelled."
 MANAGED_BACKUP="$(mktemp -d /root/xhttp-managed.XXXXXXXX)"
 [[ ! -e "/root/.acme.sh/$DOMAIN" && ! -e "/root/.acme.sh/${DOMAIN}_ecc" ]] \
   || die "An ACME certificate already exists for this domain. Use a dedicated domain."
@@ -996,15 +945,11 @@ for package in "${REQUIRED_PACKAGES[@]}"; do
   fi
 done
 
-DNS_PACKAGE=""
-for candidate in dnsutils bind9-dnsutils; do
-  if apt-cache show "$candidate" >/dev/null 2>&1; then
-    DNS_PACKAGE="$candidate"
-    INSTALL_PACKAGES+=("$candidate")
-    break
-  fi
-done
-[[ -n "$DNS_PACKAGE" ]] || MISSING_PACKAGES+=("dnsutils-or-bind9-dnsutils")
+if DNS_PACKAGE="$(xhttp_dns_package)"; then
+  INSTALL_PACKAGES+=("$DNS_PACKAGE")
+else
+  MISSING_PACKAGES+=("dnsutils-or-bind9-dnsutils")
+fi
 
 if ((${#MISSING_PACKAGES[@]} > 0)); then
   die "Required packages are unavailable on Ubuntu ${UBUNTU_VERSION}: ${MISSING_PACKAGES[*]}. Check that main, universe and security repositories are enabled."
@@ -1075,12 +1020,8 @@ xhttp_apply_ping_policy || die 'Could not apply the selected IPv4 ping policy.'
 log "Network tuning active: BBR + fq, IPv6 disabled"
 
 log "Checking DNS"
-DNS_A_OUTPUT="$(dig +short A "$DOMAIN")"
-xhttp_validate_single_dns_ipv4 "$PUBLIC_IP" <<<"$DNS_A_OUTPUT" \
-  || die "${DOMAIN} must have exactly one A record, ${PUBLIC_IP}. Remove stale/proxy addresses; Cloudflare must be DNS only (grey cloud)."
-if dig +short AAAA "$DOMAIN" | grep -q .; then
-  die "Remove the AAAA record for ${DOMAIN}, then run the script again."
-fi
+xhttp_check_install_dns "$DOMAIN" "$PUBLIC_IP" \
+  || die "DNS validation failed. Fix the records for ${DOMAIN}, then resume the installation."
 
 log "Configuring UFW"
 if [[ -L /etc/nginx/sites-enabled/default ]]; then
