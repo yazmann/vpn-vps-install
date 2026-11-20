@@ -64,7 +64,7 @@ grep -Fxq 'AuthenticationMethods password' <<<"$password_sshd"
   [[ "$SSH_PORT" == 48215 ]]
 )
 (
-  xhttp_memory_api() {
+  xhttp_panel_api() {
     [[ "$*" == '/panel/api/setting/all -X POST' ]] || return 1
     printf '{"obj":{"twoFactorEnable":%s,"hasTwoFactorToken":%s}}\n' "${ENROLLED:-true}" "${HAS_TOKEN:-true}"
   }
@@ -75,9 +75,9 @@ grep -Fxq 'AuthenticationMethods password' <<<"$password_sshd"
 vision_stream="$(xhttp_build_stream_settings vision example.com 127.0.0.1:9443 private public abcd)"
 jq -e '.network=="tcp" and .security=="reality" and .tcpSettings.header.type=="none" and .realitySettings.target=="127.0.0.1:9443" and .realitySettings.serverNames==["example.com"]' <<<"$vision_stream" >/dev/null
 xhttp_stream="$(xhttp_build_stream_settings xhttp example.com 127.0.0.1:9443 private public abcd)"
-jq -e '.network=="xhttp" and .security=="reality" and .xhttpSettings.mode=="auto" and .xhttpSettings.host=="example.com"' <<<"$xhttp_stream" >/dev/null
+jq -e '.network=="xhttp" and .security=="reality" and .xhttpSettings.mode=="auto" and .xhttpSettings.host=="example.com" and .xhttpSettings.xPaddingBytes=="100-1000" and (.xhttpSettings | has("xmux") | not)' <<<"$xhttp_stream" >/dev/null
 damaged_inbound="$(jq -nc --arg settings '{"clients":[{"id":"preserved-client","enable":false}],"encryption":"none"}' \
-  --arg stream '{"network":"xhttp","security":"reality","xhttpSettings":{"host":"wrong.example","path":"/broken"},"realitySettings":{"target":"192.0.2.1:1","privateKey":"private","serverNames":["wrong.example"],"shortIds":["aa","bb"],"settings":{"publicKey":"public","fingerprint":"chrome"}}}' \
+  --arg stream '{"network":"xhttp","security":"reality","xhttpSettings":{"host":"wrong.example","path":"/broken","xmux":{"maxConnections":"1","hMaxReusableSecs":"600-900"}},"realitySettings":{"target":"192.0.2.1:1","privateKey":"private","serverNames":["wrong.example"],"shortIds":["aa","bb"],"settings":{"publicKey":"public","fingerprint":"chrome"}}}' \
   '{id:9,up:12,down:34,total:56,remark:"preserve me",enable:false,expiryTime:78,listen:"127.0.0.2",port:8443,protocol:"vless",settings:$settings,streamSettings:$stream,tag:"in-443-xhttp-reality",sniffing:"{\"enabled\":false}"}')"
 rebuilt_inbound="$(xhttp_rebuild_managed_inbound xhttp example.com 127.0.0.1:9443 in-443-xhttp-reality <<<"$damaged_inbound")"
 jq -e '
@@ -85,7 +85,7 @@ jq -e '
   and .listen=="" and .port==443 and .protocol=="vless" and .tag=="in-443-xhttp-reality"
   and ((.settings|fromjson).clients[0].id=="preserved-client")
   and ((.streamSettings|fromjson) as $s | $s.network=="xhttp" and $s.xhttpSettings.host=="example.com"
-    and $s.xhttpSettings.path=="/" and $s.realitySettings.target=="127.0.0.1:9443"
+    and $s.xhttpSettings.path=="/" and ($s.xhttpSettings | has("xmux") | not) and $s.realitySettings.target=="127.0.0.1:9443"
     and $s.realitySettings.privateKey=="private" and $s.realitySettings.settings.publicKey=="public"
     and $s.realitySettings.shortIds==["aa","bb"])
   and ((.sniffing|fromjson).enabled==true)

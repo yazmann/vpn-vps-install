@@ -7,7 +7,8 @@ source ./xhttp-vps-migrate.sh
 test_dir="$(mktemp -d)"
 trap 'rm -rf "$test_dir"' EXIT
 db="$test_dir/source backup.db"
-sqlite3 "$db" <<'SQL'
+sqlite_binary="$(command -v sqlite3)"
+"$sqlite_binary" "$db" <<'SQL'
 CREATE TABLE inbounds (id INTEGER PRIMARY KEY, protocol TEXT, port INTEGER, settings TEXT);
 CREATE TABLE client_traffics (email TEXT PRIMARY KEY, enable INTEGER, expiry_time INTEGER, total INTEGER, up INTEGER, down INTEGER, reset_count INTEGER);
 INSERT INTO inbounds VALUES (4, 'vless', 443, '{"clients":[{"id":"d58f9000-aff9-4f17-8d34-6defafa12000","email":"alice","subId":"keep-this","enable":true,"tgId":"92","limitIp":2,"resetDay":5},{"id":"0eddb904-56ac-41c0-8da0-85b6add79cb3","email":"bob","enable":false}]}');
@@ -24,7 +25,7 @@ jq -e '
   (.[1] | .client.email=="bob" and .client.enable==false)
 ' "$test_dir/legacy.json" >/dev/null
 if xhttp_migration_snapshot "$db" 9 '' "$test_dir/wrong.json" 2>/dev/null; then exit 1; fi
-sqlite3 "$db" <<'SQL'
+"$sqlite_binary" "$db" <<'SQL'
 CREATE TABLE clients (id INTEGER PRIMARY KEY, uuid TEXT, email TEXT, sub_id TEXT, enable INTEGER, total_gb INTEGER, expiry_time INTEGER, limit_ip INTEGER, limit_hwid INTEGER);
 CREATE TABLE client_inbounds (client_id INTEGER, inbound_id INTEGER);
 INSERT INTO inbounds VALUES (11, 'vless', 9443, '{"clients":[]}');
@@ -54,7 +55,7 @@ sqlite3() {
     *) return 1 ;;
   esac
 }
-xhttp_memory_api() {
+xhttp_panel_api() {
   case "$1" in
     /panel/api/inbounds/list)
       printf '%s\n' '{"obj":[{"id":53,"tag":"in-443-xhttp-reality","protocol":"vless"}]}'

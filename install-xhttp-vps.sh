@@ -47,10 +47,6 @@ unexpected_error() {
 trap 'unexpected_error "$?" "$LINENO"' ERR
 
 [[ ${EUID} -eq 0 ]] || die "Run as root."
-MEMORY_SCRIPT="$(dirname "$(readlink -f "$0")")/optimize-xhttp-memory.sh"
-[[ -r "$MEMORY_SCRIPT" ]] || die "Place optimize-xhttp-memory.sh alongside this installer."
-# shellcheck source=optimize-xhttp-memory.sh
-source "$MEMORY_SCRIPT"
 COMMON_SCRIPT="$(dirname "$(readlink -f "$0")")/xhttp-vps-common.sh"
 [[ -r "$COMMON_SCRIPT" ]] || die "Place xhttp-vps-common.sh alongside this installer."
 # shellcheck source=xhttp-vps-common.sh
@@ -151,6 +147,33 @@ show_current_settings() {
   exit 0
 }
 
+install_recovery_script() {
+  local temporary_file source_file
+  if [[ "$COMMON_SCRIPT" != /root/xhttp-vps-common.sh ]]; then
+    install -m 700 "$COMMON_SCRIPT" /root/xhttp-vps-common.sh
+  fi
+  if [[ "$UDP_SCRIPT" != /root/xhttp-vps-udp.sh && -r "$UDP_SCRIPT" ]]; then
+    install -m 700 "$UDP_SCRIPT" /root/xhttp-vps-udp.sh
+  fi
+  if [[ "$MIGRATION_SCRIPT" != /root/xhttp-vps-migrate.sh && -r "$MIGRATION_SCRIPT" ]]; then
+    install -m 700 "$MIGRATION_SCRIPT" /root/xhttp-vps-migrate.sh
+  fi
+  local installer
+  installer="$(readlink -f "$0")"
+  if [[ "$installer" != /root/install-xhttp-vps.sh ]]; then
+    install -m 700 "$installer" /root/install-xhttp-vps.sh
+  fi
+  temporary_file="${RECOVERY_SCRIPT}.new"
+  source_file="$(dirname "$(readlink -f "$0")")/finish-xhttp-vps.sh"
+  if [[ -r "$source_file" ]]; then
+    install -m 700 "$source_file" "$temporary_file"
+    mv -f "$temporary_file" "$RECOVERY_SCRIPT"
+  else
+    rm -f "$temporary_file"
+    warn "Recovery script was not installed: upload finish-xhttp-vps.sh alongside this installer before starting."
+  fi
+}
+
 RESUMING=0
 REPAIRING_UDP=0
 if [[ "${1:-}" == --resume ]]; then
@@ -213,7 +236,14 @@ if [[ ${#MENU_STATE_FILES[@]} -eq 1 ]]; then
     ACTION="${ACTION:-1}"
     case "$ACTION" in
       1) show_current_settings ;;
-      2) [[ -x "$RECOVERY_SCRIPT" ]] || die "Recovery script is missing: ${RECOVERY_SCRIPT}"; exec "$RECOVERY_SCRIPT" ;;
+      2)
+        if [[ "$COMMON_SCRIPT" != /root/xhttp-vps-common.sh ]]; then
+          [[ -r "$(dirname "$COMMON_SCRIPT")/finish-xhttp-vps.sh" ]] || die "Use the full installer archive to update recovery."
+          install_recovery_script
+        fi
+        [[ -x "$RECOVERY_SCRIPT" ]] || die "Recovery script is missing: ${RECOVERY_SCRIPT}"
+        exec "$RECOVERY_SCRIPT"
+        ;;
       3) remove_installation; exit 0 ;;
       4)
         : "${TRANSPORT:=xhttp}" "${MAINTENANCE_MODE:=weekly}" "${MAINTENANCE_TIMEZONE:=Europe/Moscow}"
@@ -730,36 +760,6 @@ if command -v ufw >/dev/null; then
 fi
 
 fi
-
-install_recovery_script() {
-  local temporary_file source_file
-  if [[ "$COMMON_SCRIPT" != /root/xhttp-vps-common.sh ]]; then
-    install -m 700 "$COMMON_SCRIPT" /root/xhttp-vps-common.sh
-  fi
-  if [[ "$UDP_SCRIPT" != /root/xhttp-vps-udp.sh && -r "$UDP_SCRIPT" ]]; then
-    install -m 700 "$UDP_SCRIPT" /root/xhttp-vps-udp.sh
-  fi
-  if [[ "$MIGRATION_SCRIPT" != /root/xhttp-vps-migrate.sh && -r "$MIGRATION_SCRIPT" ]]; then
-    install -m 700 "$MIGRATION_SCRIPT" /root/xhttp-vps-migrate.sh
-  fi
-  local installer
-  installer="$(readlink -f "$0")"
-  if [[ "$installer" != /root/install-xhttp-vps.sh ]]; then
-    install -m 700 "$installer" /root/install-xhttp-vps.sh
-  fi
-  temporary_file="${RECOVERY_SCRIPT}.new"
-  source_file="$(dirname "$(readlink -f "$0")")/finish-xhttp-vps.sh"
-  if [[ -r "$source_file" ]]; then
-    if [[ "$MEMORY_SCRIPT" != /root/optimize-xhttp-memory.sh ]]; then
-      install -m 700 "$MEMORY_SCRIPT" /root/optimize-xhttp-memory.sh
-    fi
-    install -m 700 "$source_file" "$temporary_file"
-    mv -f "$temporary_file" "$RECOVERY_SCRIPT"
-  else
-    rm -f "$temporary_file"
-    warn "Recovery script was not installed: upload finish-xhttp-vps.sh alongside this installer before starting."
-  fi
-}
 
 configure_warp_swap() {
   local memory_kib free_kib
@@ -1407,8 +1407,6 @@ jq -e '.success == true' <<<"$RESPONSE" >/dev/null || die "Xray restart after in
 INBOUND_CONFIGURED=1
 write_state
 
-log "Applying the low-memory Xray profile"
-xhttp_memory_apply "$INBOUND_TAG" "$TRANSPORT"
 if [[ -n "$MIGRATION_DB" ]]; then
   log "Importing VLESS users and usage"
   xhttp_import_migrated_clients

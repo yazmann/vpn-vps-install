@@ -56,6 +56,58 @@ xhttp_service_name() {
   esac
 }
 
+xhttp_panel_api() {
+  local path="$1"
+  shift
+  # Only the loopback panel is used. Do not put credentials in diagnostics.
+  curl -q -fsS --connect-timeout 3 --max-time 30 "${API_AUTH[@]}" \
+    "$API_BASE$path" "$@" | jq -ce '
+      if .success == true then . else error("Panel API rejected the operation") end
+    '
+}
+
+xhttp_restore_policy_defaults() (
+  umask 077
+  local response template updated test_url backup_dir
+  response="$(xhttp_panel_api /panel/api/xray/ -X POST)" || return 1
+  template="$(jq -ce '
+    def decode: if type == "string" then fromjson else . end;
+    .obj | decode | .xraySetting | decode | select(type == "object")
+  ' <<<"$response")" || return 1
+  # Only remove the exact pair the former installer applied at level zero.
+  updated="$(jq -ce '
+    if (.policy.levels["0"] | .bufferSize == 64 and .connIdle == 180)
+    then del(.policy.levels["0"].bufferSize, .policy.levels["0"].connIdle)
+    else . end
+  ' <<<"$template")" || return 1
+  [[ "$updated" != "$template" ]] || return 0
+  test_url="$(jq -r '
+    .obj | if type == "string" then fromjson else . end
+    | .outboundTestUrl // "https://www.cloudflare.com/cdn-cgi/trace"
+  ' <<<"$response")" || return 1
+
+  backup_dir="$(mktemp -d /root/xhttp-policy-backup.XXXXXXXX)" || return 1
+  printf '%s\n' "$template" > "$backup_dir/xray.json" || return 1
+  sqlite3 -batch -bail /etc/x-ui/x-ui.db ".timeout 5000" ".backup '$backup_dir/x-ui.db'" || return 1
+  printf 'Saved the previous Xray policy and panel database in %s.\n' "$backup_dir"
+
+  if xhttp_panel_api /panel/api/xray/update -X POST \
+      --data-urlencode "xraySetting=$updated" --data-urlencode "outboundTestUrl=$test_url" >/dev/null &&
+     response="$(xhttp_panel_api /panel/api/xray/ -X POST)" &&
+     jq -e --argjson expected "$updated" '
+       def decode: if type == "string" then fromjson else . end;
+       (.obj | decode | .xraySetting | decode) == $expected
+     ' <<<"$response" >/dev/null; then
+    return 0
+  fi
+
+  if ! xhttp_panel_api /panel/api/xray/update -X POST \
+      --data-urlencode "xraySetting=$template" --data-urlencode "outboundTestUrl=$test_url" >/dev/null; then
+    printf 'Xray policy rollback could not be confirmed. Use the backup in %s.\n' "$backup_dir" >&2
+  fi
+  return 1
+)
+
 xhttp_incy_subscription() {
   # Public crypt1 interoperability key from the official INCY link encoder.
   node -e '
@@ -79,9 +131,9 @@ xhttp_subscription_links() {
     return 0
   fi
   email_path="$(jq -rn --arg email "$email" '$email|@uri')" || return 1
-  response="$(xhttp_memory_api "/panel/api/clients/get/$email_path")" || return 1
+  response="$(xhttp_panel_api "/panel/api/clients/get/$email_path")" || return 1
   client_id="$(jq -er '.obj.client.id | select(type=="number" and .>0 and floor==.)' <<<"$response")" || return 1
-  response="$(xhttp_memory_api "/panel/api/clients/happLink/$client_id" -X POST)" || return 1
+  response="$(xhttp_panel_api "/panel/api/clients/happLink/$client_id" -X POST)" || return 1
   happ="$(jq -er '.obj.encryptedLink | select(test("^happ://crypt[0-9]*/[a-zA-Z0-9_+=/-]+$"))' <<<"$response")" || return 1
   incy="$(printf '%s\n' "$url" | xhttp_incy_subscription)" || return 1
   printf 'HAPP subscription: %s\nINCY subscription: %s\n' "$happ" "$incy"
@@ -250,7 +302,7 @@ xhttp_apply_ping_policy() {
 
 xhttp_panel_2fa_enabled() {
   local response
-  response="$(xhttp_memory_api /panel/api/setting/all -X POST)" || return 1
+  response="$(xhttp_panel_api /panel/api/setting/all -X POST)" || return 1
   jq -e '.obj | if type == "string" then fromjson else . end | .twoFactorEnable == true and .hasTwoFactorToken != false' <<<"$response" >/dev/null
 }
 
@@ -453,7 +505,7 @@ xhttp_rebuild_managed_inbound() {
 xhttp_rotate_node_sync_token() {
   local token_name="${1:-xhttp-node-sync}" response ids id payload token
   [[ "$token_name" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || return 1
-  response="$(xhttp_memory_api /panel/api/setting/apiTokens)" || return 1
+  response="$(xhttp_panel_api /panel/api/setting/apiTokens)" || return 1
   ids="$(jq -ce --arg name "$token_name" '
     .obj | if type=="string" then fromjson else . end
     | select(type=="array")
@@ -463,11 +515,11 @@ xhttp_rotate_node_sync_token() {
   while IFS= read -r id; do
     [[ "$id" =~ ^[0-9]+$ ]] || return 1
     payload='{"expectedScope":"node-sync"}'
-    xhttp_memory_api "/panel/api/setting/apiTokens/delete/$id" -X POST \
+    xhttp_panel_api "/panel/api/setting/apiTokens/delete/$id" -X POST \
       -H 'Content-Type: application/json' --data-binary "$payload" >/dev/null || return 1
   done < <(jq -r '.[]' <<<"$ids")
   payload="$(jq -nc --arg name "$token_name" '{name:$name,scope:"node-sync",expiresAt:0}')"
-  response="$(xhttp_memory_api /panel/api/setting/apiTokens/create -X POST \
+  response="$(xhttp_panel_api /panel/api/setting/apiTokens/create -X POST \
     -H 'Content-Type: application/json' --data-binary "$payload")" || return 1
   token="$(jq -er '
     .obj | if type=="string" then fromjson else . end
@@ -1865,14 +1917,14 @@ xhttp_verify_traffic() {
   export XRAY_BINARY
   export -f xhttp_run_probe port_busy
   if [[ "$test_mode" != warp ]]; then
-  response="$(xhttp_memory_api /panel/api/inbounds/list)" || return 1
+  response="$(xhttp_panel_api /panel/api/inbounds/list)" || return 1
   inbound="$(jq -ce --arg tag "${INBOUND_TAG:-in-443-xhttp-reality}" '.obj | if type=="string" then fromjson else . end | map(select(.tag==$tag)) | if length==1 then .[0] else error("Missing managed inbound") end' <<<"$response")" || return 1
   config="$(xhttp_probe_config "$port" <<<"$inbound")" || return 1
   # Invoke in a new Bash so callers may test failure without suppressing errexit.
   bash -c 'xhttp_run_probe "$(cat)" direct' <<<"$config" || return 1
   fi
   if [[ "${ENABLE_WARP:-0}" == 1 ]]; then
-    response="$(xhttp_memory_api /panel/api/xray/ -X POST)" || return 1
+    response="$(xhttp_panel_api /panel/api/xray/ -X POST)" || return 1
     config="$(jq -ce --argjson p "$port" '
       def decode: if type=="string" then fromjson else . end;
       .obj|decode|.xraySetting|decode

@@ -257,7 +257,12 @@ acl:
     - reject(198.18.0.0/15)
     - reject(224.0.0.0/3)
     - reject($PUBLIC_IP/32)
-    - reject(::/0)
+# Restrict egress without rejecting dual-stack domains in the ACL.
+outbounds:
+  - name: direct-ipv4
+    type: direct
+    direct:
+      mode: "4"
 masquerade:
   type: file
   file:

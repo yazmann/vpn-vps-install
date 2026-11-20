@@ -21,10 +21,6 @@ unexpected_error() {
 }
 trap 'unexpected_error "$?" "$LINENO"' ERR
 [[ ${EUID} -eq 0 ]] || die "Run as root."
-MEMORY_SCRIPT="$(dirname "$(readlink -f "$0")")/optimize-xhttp-memory.sh"
-[[ -r "$MEMORY_SCRIPT" ]] || die "Place optimize-xhttp-memory.sh alongside this repair script."
-# shellcheck source=optimize-xhttp-memory.sh
-source "$MEMORY_SCRIPT"
 COMMON_SCRIPT="$(dirname "$(readlink -f "$0")")/xhttp-vps-common.sh"
 [[ -r "$COMMON_SCRIPT" ]] || die "Place xhttp-vps-common.sh alongside this repair script."
 # shellcheck source=xhttp-vps-common.sh
@@ -245,6 +241,9 @@ if [[ "$INSTALL_MODE" == "standalone" ]]; then
   fi
 fi
 
+CURRENT_STEP='restoring Xray policy defaults if the old memory profile is present'
+xhttp_restore_policy_defaults || die "Could not restore Xray policy defaults."
+
 CURRENT_STEP="creating or repairing $(xhttp_transport_label "$TRANSPORT") inbound"
 printf '\n%b[STEP]%b %s\n' "$cyan" "$plain" "$CURRENT_STEP"
 R="$(curl -q -fsS "${API_AUTH[@]}" "$API_BASE/panel/api/inbounds/list")"
@@ -293,8 +292,6 @@ else
   } >> "${STATE_FILES[0]}"
 fi
 
-CURRENT_STEP='applying the low-memory Xray profile'
-xhttp_memory_apply "$INBOUND_TAG" "$TRANSPORT"
 if [[ -n "${MIGRATION_DB:-}" ]]; then
   CURRENT_STEP='importing VLESS users and usage'
   [[ -r "$MIGRATION_SCRIPT" ]] || die "SQLite migration helpers are missing."
@@ -620,6 +617,7 @@ mv -f "$RESULT_TEMP" "$RESULT_FILE"
   printf 'SSH_ACCESS_MODE=%q\n' "$SSH_ACCESS_MODE"
   printf 'INSTALL_PHASE=complete\n'
 } >> "${STATE_FILES[0]}"
+rm -f -- /root/optimize-xhttp-memory.sh
 printf '%s\n' 'From another network, open the website, refresh subscriptions in your VPN apps, and test that the panel follows the chosen access policy.'
 if [[ "$INITIAL_INSTALL_PHASE" != complete && "${CREATE_RECOVERY_BACKUP:-0}" == 1 ]]; then
   xhttp_export_recovery_backup "${STATE_FILES[0]}" || printf '%s\n' 'Backup skipped. You can retry using menu item 5.' >&2
