@@ -26,7 +26,7 @@
       install -y --no-install-recommends curl ca-certificates
   fi
 
-  revision=v1.1.2
+  revision=v1.1.3
   workdir=$(mktemp -d)
   trap 'rm -rf -- "$workdir"' EXIT
   curl -q --fail --silent --show-error --location --retry 3 --connect-timeout 10 \

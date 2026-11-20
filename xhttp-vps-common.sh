@@ -274,8 +274,25 @@ xhttp_wait_ssh_ports() {
   return 1
 }
 
+xhttp_confirm_ssh_port_change() {
+  local verified="$1" answer
+  printf '%s\n' '  1) Check login on the new port (default)' '  2) Keep the original port and continue setup'
+  while IFS= read -rp 'Select [1]: ' answer; do
+    xhttp_clean_prompt_input "$answer"
+    case "${REPLY:-1}" in
+      1)
+        if [[ -f "$verified" ]]; then return 0; fi
+        printf '%s\n' 'Run the command above in the second SSH session, then select 1.'
+        ;;
+      2) return 2 ;;
+      *) printf '%s\n' 'Choose 1 or 2.' >&2 ;;
+    esac
+  done
+  return 1
+}
+
 xhttp_move_ssh_port() (
-  local old="$SSH_PORT" new="$SSH_TARGET_PORT" kind=daemon directory reply sudo_command='sudo -n'
+  local old="$SSH_PORT" new="$SSH_TARGET_PORT" kind=daemon directory sudo_command='sudo -n'
   local daemon_file=/etc/ssh/sshd_config.d/00-xhttp-vps-port.conf
   local socket_file=/etc/systemd/system/ssh.socket.d/99-xhttp-vps-port.conf
   local changed=0 committed=0
@@ -297,6 +314,7 @@ xhttp_move_ssh_port() (
   directory="$(mktemp -d /run/xhttp-vps-ssh-port.XXXXXXXX)" || exit 1
   cleanup_ssh_port_change() {
     local status="$?"
+    trap - ERR
     if [[ "$committed" == 0 ]]; then
       if [[ "$changed" == 1 ]]; then
         if ! rm -f -- "$daemon_file" "$socket_file" || ! xhttp_reload_ssh_listeners "$kind" || ! xhttp_wait_ssh_ports "$old"; then
@@ -320,7 +338,8 @@ xhttp_move_ssh_port() (
     sshd -t && xhttp_reload_ssh_listeners "$kind"
   }
   trap cleanup_ssh_port_change EXIT
-  trap 'exit 1' INT TERM HUP
+  trap 'exit 2' INT
+  trap 'exit 1' TERM HUP
   SSH_PORT="$new" xhttp_configure_ssh_source keep-legacy || exit 1
   changed=1
   apply_ssh_ports "$old" "$new" && xhttp_wait_ssh_ports "$old" "$new" up || exit 1
@@ -328,10 +347,7 @@ xhttp_move_ssh_port() (
   printf '\nAllow TCP/%s in the provider firewall. Connect in a separate SSH session on the new port and run:\n' "$new"
   if [[ "$SSH_ACCESS_MODE" == existing ]]; then sudo_command=sudo; fi
   printf '  test "${SSH_CONNECTION##* }" = %s && test "$(id -un)" = %s && %s touch %s/verified\n' "$new" "$ADMIN_USER" "$sudo_command" "$directory"
-  until [[ -f "$directory/verified" ]]; do
-    read -rp 'Press Enter once the new login succeeds, or type cancel to keep the original port: ' reply || exit 1
-    [[ "$reply" != cancel ]] || exit 2
-  done
+  xhttp_confirm_ssh_port_change "$directory/verified" || exit "$?"
   apply_ssh_ports "$new" && xhttp_wait_ssh_ports "$new" "$old" down || exit 1
   committed=1
   xhttp_delete_firewall_rules "xhttp-vps-ssh:${SAFE_INSTANCE} $old" ||

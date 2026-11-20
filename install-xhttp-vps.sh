@@ -71,7 +71,7 @@ valid_ssh_port() {
   [[ "$1" =~ ^[1-9][0-9]{4}$ ]] && (( $1 <= 65535 )) && [[ "$1" != "$SSH_PORT" ]] && ! port_busy "$1"
 }
 valid_ssh_source() {
-  [[ -z "$1" ]] || { xhttp_valid_ipv4 "$1" && [[ -z "${SSH_CONNECTION:-}" || "${SSH_CONNECTION%% *}" == "$1" ]]; }
+  xhttp_valid_ipv4 "$1" && [[ -z "${SSH_CONNECTION:-}" || "${SSH_CONNECTION%% *}" == "$1" ]]
 }
 valid_maintenance_timezone() {
   [[ "$1" =~ ^([A-Za-z0-9_+-]+/)*[A-Za-z0-9_+-]+$ && -f "/usr/share/zoneinfo/$1" ]]
@@ -609,9 +609,13 @@ elif [[ "$SSH_ACCESS_MODE" == admin || "$SSH_ACCESS_MODE" == root-key ]]; then
   ADMIN_KEY_FINGERPRINTS="$(xhttp_authorized_key_fingerprints "$ADMIN_KEYS_B64")"
 fi
 
-ask_setup_input 'Allow SSH from one IPv4 (blank = any): ' '' \
-  'Enter the IPv4 of this SSH connection, or leave blank. From the provider console you can enter any trusted IPv4.' valid_ssh_source
-SSH_ALLOWED_IP="$REPLY"
+SSH_ALLOWED_IP=''
+ask_yes_no 'Restrict SSH to one IPv4?' no
+if [[ "$REPLY" == yes ]]; then
+  ask_setup_input 'Trusted SSH IPv4: ' '' \
+    'Enter the IPv4 of this SSH session. From the provider console, enter any trusted IPv4.' valid_ssh_source
+  SSH_ALLOWED_IP="$REPLY"
+fi
 
 ask_yes_no 'Block IPv4 ping replies?' no
 if [[ "$REPLY" == yes ]]; then DISABLE_PING=1; else DISABLE_PING=0; fi
@@ -630,9 +634,15 @@ case "$REPLY" in
   3) MAINTENANCE_MODE=none ;;
 esac
 if [[ "$MAINTENANCE_MODE" != none ]]; then
-  ask_setup_input 'Update timezone (05:30 local) [Europe/Moscow]: ' Europe/Moscow \
-    'Enter an IANA timezone such as Europe/Moscow or Etc/UTC.' valid_maintenance_timezone
-  MAINTENANCE_TIMEZONE="$REPLY"
+  printf '%s\n' 'Update timezone (05:30 local)' '  1) Europe/Moscow (default)' '  2) UTC' '  3) Other timezone'
+  ask_setup_input 'Select timezone [1]: ' 1 'Choose 1, 2 or 3.' input_matches '^[1-3]$'
+  case "$REPLY" in
+    2) MAINTENANCE_TIMEZONE=Etc/UTC ;;
+    3)
+      ask_setup_input 'IANA timezone: ' '' 'Enter a timezone such as Europe/Berlin or Asia/Yekaterinburg.' valid_maintenance_timezone
+      MAINTENANCE_TIMEZONE="$REPLY"
+      ;;
+  esac
 fi
 ask_yes_no 'Export an encrypted backup after setup?' no
 if [[ "$REPLY" == yes ]]; then CREATE_RECOVERY_BACKUP=1; else CREATE_RECOVERY_BACKUP=0; fi
