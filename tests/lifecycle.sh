@@ -8,6 +8,7 @@ xhttp_valid_ipv4 203.0.113.7
 xhttp_valid_ipv4 0.0.0.0
 if xhttp_valid_ipv4 256.1.1.1; then exit 1; fi
 if xhttp_valid_ipv4 1.2.3; then exit 1; fi
+if xhttp_valid_ipv4 1.2.3.4.; then exit 1; fi
 if xhttp_valid_ipv4 '203.0.113.7 extra'; then exit 1; fi
 xhttp_validate_single_dns_ipv4 203.0.113.7 <<<'203.0.113.7'
 xhttp_validate_single_dns_ipv4 203.0.113.7 <<<$'203.0.113.7\n203.0.113.7'
@@ -366,11 +367,11 @@ grep -Fq "proxy_ssl_trusted_certificate $CERT_DIR/staging-ca.pem;" <<<"$staging_
 grep -Fq 'proxy_ssl_verify on;' <<<"$staging_nginx"
 grep -Fq "add_header Cache-Control 'private, no-store' always;" <<<"$protected_nginx"
 grep -Fq "add_header Referrer-Policy 'no-referrer' always;" <<<"$protected_nginx"
-for answer in n N No $'\tN\r ' $'\xef\xbb\xbfN' $'\e[200~N\e[201~'; do
+for answer in n N No нет НЕТ $'\tN\r ' $'\xef\xbb\xbfN' $'\e[200~N\e[201~'; do
   xhttp_read_yes_no 'Test question?' yes <<<"$answer"
   [[ "$REPLY" == no ]]
 done
-for answer in y Y YES $' yes\r'; do
+for answer in y Y YES у У да ДА $' yes\r' $' \e[200~у\e[201~\r'; do
   xhttp_read_yes_no 'Test question?' no <<<"$answer"
   [[ "$REPLY" == yes ]]
 done
@@ -380,7 +381,19 @@ for default_answer in yes no; do
 done
 xhttp_read_yes_no 'Test question?' yes 2>/dev/null <<<$'???\nN Y\nN'
 [[ "$REPLY" == no ]]
+LC_ALL=C xhttp_read_yes_no 'Test question?' no <<<'Да'
+[[ "$REPLY" == yes ]]
 if xhttp_read_yes_no 'Test question?' no </dev/null; then exit 1; fi
+(
+  getent() { [[ "$1 $2" == 'passwd occupied' ]]; }
+  xhttp_read_admin_username <<<'ops-user'
+  [[ "$REPLY" == ops-user ]]
+  xhttp_read_admin_username 2>/dev/null <<<$'root\nBad User\nаdmin\noccupied\n \e[200~\xef\xbb\xbfops-user\e[201~\r'
+  [[ "$REPLY" == ops-user ]]
+  xhttp_read_admin_username <<<''
+  [[ "$REPLY" == vpnadmin ]]
+  if xhttp_read_admin_username </dev/null; then exit 1; fi
+)
 
 profile='{"subProfileMode":"custom","subProfileUrl":"https://old.example/"}'
 [[ "$(xhttp_subscription_profile_settings <<<"$profile")" == "$profile" ]]
