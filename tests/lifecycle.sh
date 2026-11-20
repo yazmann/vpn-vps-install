@@ -385,9 +385,35 @@ LC_ALL=C xhttp_read_yes_no 'Test question?' no <<<'Да'
 [[ "$REPLY" == yes ]]
 if xhttp_read_yes_no 'Test question?' no </dev/null; then exit 1; fi
 (
+  installer=./install-xhttp-vps.sh
+  warn() { :; }
+  die() { printf '%s\n' "$*" >&2; exit 1; }
+  # shellcheck source=/dev/null
+  source <(sed -n '/^ask_yes_no() {/,/^\[\[ .*EUID/{ /^\[\[/!p; }' "$installer")
+  panel_choice() (
+    PANEL_ACCESS_MODE='' PANEL_ALLOWED_IP=''
+    # shellcheck source=/dev/null
+    source <(sed -n '/^while \[\[ -z "\$PANEL_ACCESS_MODE" \]\]; do$/,/^done$/p' "$installer") >/dev/null
+    printf '%s:%s\n' "$PANEL_ACCESS_MODE" "$PANEL_ALLOWED_IP"
+  )
+  [[ "$(awk '/^Panel access$/ { getline; print; exit }' "$installer")" == '  1) Localhost only.'* ]]
+  [[ "$(awk '/^SSH login$/ { getline; print; exit }' "$installer")" == '  1) New sudo user + SSH certificate only.'* ]]
+  [[ "$(panel_choice <<<'')" == private: ]]
+  [[ "$(panel_choice <<<'1')" == private: ]]
+  [[ "$(panel_choice <<<$'2\n203.0.113.7')" == allowlist:203.0.113.7 ]]
+  [[ "$(panel_choice <<<$'3\n\n1')" == private: ]]
+  [[ "$(panel_choice <<<$'3\ny')" == public: ]]
+)
+(
   getent() { [[ "$1 $2" == 'passwd occupied' ]]; }
   xhttp_read_admin_username <<<'ops-user'
   [[ "$REPLY" == ops-user ]]
+  xhttp_read_admin_username <<<$'\u00a0ops-user\u200b'
+  [[ "$REPLY" == ops-user ]]
+  feedback="$(xhttp_read_admin_username 2>&1 <<<$'ops-\u0430dmin\nops-\u200badmin\nops-admin')"
+  [[ "$feedback" == *'U+0430 at position 5'* && "$feedback" == *'U+200B at position 5'* ]]
+  xhttp_read_admin_username 2>/dev/null <<<$'ops-\xffadmin\nops-admin'
+  [[ "$REPLY" == ops-admin ]]
   xhttp_read_admin_username 2>/dev/null <<<$'root\nBad User\nаdmin\noccupied\n \e[200~\xef\xbb\xbfops-user\e[201~\r'
   [[ "$REPLY" == ops-user ]]
   xhttp_read_admin_username <<<''

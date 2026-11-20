@@ -444,26 +444,31 @@ SUB_PROFILE_MODE=''
 SUB_PRIVACY_HEADERS=''
 if xhttp_uses_panel; then
 INBOUND_TAG="$(xhttp_inbound_tag_for "$TRANSPORT")"
-cat <<'EOF'
-Panel access
-  3) Localhost only. Use an SSH tunnel (default).
-  1) Public Internet
-  2) One trusted IPv4
-EOF
-ask_setup_input 'Select panel access [3]: ' 3 'Choose 1, 2 or 3.' input_matches '^[1-3]$'
 PANEL_ALLOWED_IP=""
-case "$REPLY" in
-  1)
-    PANEL_ACCESS_MODE="public"
-    warn "Public access selected. Keep the full panel URL private; 2FA is recommended for public access."
-    ;;
-  2)
-    PANEL_ACCESS_MODE="allowlist"
-    ask_setup_input 'Trusted IPv4 for panel access: ' '' 'Enter one valid IPv4 address.' xhttp_valid_ipv4
-    PANEL_ALLOWED_IP="$REPLY"
-    ;;
-  3) PANEL_ACCESS_MODE="private" ;;
-esac
+while [[ -z "$PANEL_ACCESS_MODE" ]]; do
+  cat <<'EOF'
+Panel access
+  1) Localhost only. Use an SSH tunnel (default).
+  2) One trusted IPv4
+  3) Public Internet
+EOF
+  ask_setup_input 'Select panel access [1]: ' 1 'Choose 1, 2 or 3.' input_matches '^[1-3]$'
+  case "$REPLY" in
+    1) PANEL_ACCESS_MODE="private" ;;
+    2)
+      ask_setup_input 'Trusted IPv4 for panel access: ' '' 'Enter one valid IPv4 address.' xhttp_valid_ipv4
+      PANEL_ALLOWED_IP="$REPLY"
+      PANEL_ACCESS_MODE="allowlist"
+      ;;
+    3)
+      ask_yes_no 'Make the 3x-ui panel public on the Internet?' no
+      if [[ "$REPLY" == yes ]]; then
+        PANEL_ACCESS_MODE="public"
+        warn 'Public panel selected. Enable 2FA and keep the panel URL private.'
+      fi
+      ;;
+  esac
+done
 
 ask_yes_no 'Enable panel 2FA (authenticator app)?' no
 if [[ "$REPLY" == yes ]]; then PANEL_2FA_ENROLL=1; fi
@@ -538,21 +543,21 @@ fi
 
 cat <<'EOF'
 SSH login
-  4) New sudo user + SSH certificate only. Root and password login blocked (default).
-  1) Keep current SSH settings.
+  1) New sudo user + SSH certificate only. Root and password login blocked (default).
   2) Root + SSH key only. Password login blocked.
   3) New sudo user + SSH key only. Root and password login blocked.
+  4) Keep current SSH settings.
   5) Root + password only.
 EOF
-ask_setup_input 'Select SSH login [4]: ' 4 'Choose a number from 1 to 5.' input_matches '^[1-5]$'
+ask_setup_input 'Select SSH login [1]: ' 1 'Choose a number from 1 to 5.' input_matches '^[1-5]$'
 SSH_ACCESS_CHOICE="$REPLY"
 case "$SSH_ACCESS_CHOICE" in
-  1)
-    SSH_ACCESS_MODE=existing
-    SSH_HARDENING=0
-    ADMIN_USER="${SUDO_USER:-root}"
-    [[ "$ADMIN_USER" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || die 'Could not determine the current SSH administrator.'
-    warn "The installer will preserve the current root and SSH authentication policy. Fail2ban reduces brute-force attempts but does not make weak credentials safe."
+  1|3)
+    SSH_ACCESS_MODE='admin'
+    if [[ "$SSH_ACCESS_CHOICE" == 1 ]]; then SSH_ACCESS_MODE=admin-cert; fi
+    SSH_HARDENING=1
+    xhttp_read_admin_username || die 'Input ended while waiting for a new SSH username.'
+    ADMIN_USER="$REPLY"
     ;;
   2)
     SSH_ACCESS_MODE='root-key'
@@ -560,12 +565,12 @@ case "$SSH_ACCESS_CHOICE" in
     ADMIN_USER=root
     warn "Root will remain reachable by its SSH key. Password login is disabled, but this is less safe than a separate administrator."
     ;;
-  3|4)
-    SSH_ACCESS_MODE='admin'
-    if [[ "$SSH_ACCESS_CHOICE" == 4 ]]; then SSH_ACCESS_MODE=admin-cert; fi
-    SSH_HARDENING=1
-    xhttp_read_admin_username || die 'Input ended while waiting for a new SSH username.'
-    ADMIN_USER="$REPLY"
+  4)
+    SSH_ACCESS_MODE=existing
+    SSH_HARDENING=0
+    ADMIN_USER="${SUDO_USER:-root}"
+    [[ "$ADMIN_USER" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || die 'Could not determine the current SSH administrator.'
+    warn "The installer will preserve the current root and SSH authentication policy. Fail2ban reduces brute-force attempts but does not make weak credentials safe."
     ;;
   5)
     SSH_ACCESS_MODE='root-password'
@@ -1454,7 +1459,11 @@ if [[ "$PANEL_ACCESS_MODE" == "private" ]]; then
   log "Keeping the panel on private localhost access"
   /usr/local/x-ui/x-ui setting -listenIP 127.0.0.1 >/dev/null
 else
-  log "Enabling restricted panel IPv4 access after private configuration"
+  if [[ "$PANEL_ACCESS_MODE" == "public" ]]; then
+    log "Enabling public panel access over IPv4"
+  else
+    log "Enabling panel access from the trusted IPv4"
+  fi
   /usr/local/x-ui/x-ui setting -listenIP 0.0.0.0 >/dev/null
 fi
 xhttp_restart_vpn_service x-ui

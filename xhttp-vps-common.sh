@@ -416,12 +416,26 @@ xhttp_read_yes_no() {
 }
 
 xhttp_read_admin_username() {
-  local username LC_ALL=C
+  local username padding LC_ALL=C.UTF-8
+  padding=$'\u00a0\u200b\ufeff'
   while IFS= read -rp 'New sudo username [vpnadmin]: ' username; do
     xhttp_clean_prompt_input "$username"
-    username="${REPLY:-vpnadmin}"
-    if [[ ! "$username" =~ ^[a-z_][a-z0-9_-]{0,30}$ || "$username" == root ]]; then
-      printf '%s\n' 'Use up to 31 characters: lowercase English letters, digits, _ or -. Start with a letter or _. Choose a name other than root.' >&2
+    username="${REPLY#"${REPLY%%[![:space:]$padding]*}"}"
+    username="${username%"${username##*[![:space:]$padding]}"}"
+    username="${username:-vpnadmin}"
+    if [[ ! "$username" =~ ^[a-z0-9_-]+$ ]]; then
+      if [[ "$username" =~ ^[a-z0-9_-]*([^a-z0-9_-]) ]]; then
+        printf 'Invalid character U+%04X at position %d. Use lowercase English letters, digits, _ or -.\n' \
+          "'${BASH_REMATCH[1]}" "${#BASH_REMATCH[0]}" >&2
+      else
+        printf '%s\n' 'Invalid username. Use lowercase English letters, digits, _ or -.' >&2
+      fi
+    elif [[ ! "$username" =~ ^[a-z_] ]]; then
+      printf '%s\n' 'Start the username with a lowercase English letter or _.' >&2
+    elif (( ${#username} > 31 )); then
+      printf '%s\n' 'Use a username with up to 31 characters.' >&2
+    elif [[ "$username" == root ]]; then
+      printf '%s\n' 'Choose a new username other than root.' >&2
     elif getent passwd "$username" >/dev/null; then
       printf 'User %s already exists. Choose another name.\n' "$username" >&2
     else
