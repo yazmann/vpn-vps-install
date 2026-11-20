@@ -62,7 +62,7 @@ xhttp_check_install_dns() {
 xhttp_read_install_domain() {
   local expected_ip="$1" domain label LC_ALL=C
   local -a labels
-  while IFS= read -rp 'Domain already pointed to this VPS (example: vpn.example.com): ' domain; do
+  while IFS= read -rp 'VPN domain (example: vpn.example.com): ' domain; do
     xhttp_clean_prompt_input "$domain"
     domain="${REPLY,,}"
     if [[ ! "$domain" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]]; then
@@ -401,7 +401,7 @@ xhttp_clean_prompt_input() {
 }
 
 xhttp_read_yes_no() {
-  local question="$1" default_answer="$2" answer options='y/N' LC_ALL=C.UTF-8
+  local question="$1" default_answer="$2" answer options='N/y' LC_ALL=C.UTF-8
   if [[ "$default_answer" == yes ]]; then options='Y/n'; fi
   while IFS= read -rp "$question [$options]: " answer; do
     xhttp_clean_prompt_input "$answer"
@@ -417,7 +417,7 @@ xhttp_read_yes_no() {
 
 xhttp_read_admin_username() {
   local username LC_ALL=C
-  while IFS= read -rp 'New administrative SSH user [vpnadmin]: ' username; do
+  while IFS= read -rp 'New sudo username [vpnadmin]: ' username; do
     xhttp_clean_prompt_input "$username"
     username="${REPLY:-vpnadmin}"
     if [[ ! "$username" =~ ^[a-z_][a-z0-9_-]{0,30}$ || "$username" == root ]]; then

@@ -266,7 +266,7 @@ fi
 printf '\nVPN VPS Install\n\n'
 if [[ ${#MENU_STATE_FILES[@]} -eq 1 ]]; then
   if [[ "$HAS_CURRENT_SETTINGS" -eq 1 ]]; then
-    printf 'Existing installation:\n1) Show current settings (default)\n2) Verify and repair\n3) Permanently remove VPN (no archive)\n4) Refresh automatic maintenance\n5) Export an encrypted recovery backup\n0) Exit\n'
+    printf 'Existing installation\n1) Show settings (default)\n2) Check and repair\n3) Remove VPN without a backup\n4) Refresh automatic updates\n5) Export encrypted backup\n0) Exit\n'
     ask_setup_input 'Select [1]: ' 1 'Choose a number from 0 to 5.' input_matches '^[0-5]$'
     ACTION="$REPLY"
     case "$ACTION" in
@@ -299,7 +299,7 @@ if [[ ${#MENU_STATE_FILES[@]} -eq 1 ]]; then
       0) exit 0 ;;
     esac
   else
-    printf 'Interrupted installation:\n1) Continue and repair (default)\n2) Permanently remove VPN (no archive)\n0) Exit\n'
+    printf 'Interrupted installation\n1) Resume setup (default)\n2) Remove VPN without a backup\n0) Exit\n'
     ask_setup_input 'Select [1]: ' 1 'Choose 0, 1 or 2.' input_matches '^[0-2]$'
     ACTION="$REPLY"
     case "$ACTION" in
@@ -311,7 +311,7 @@ if [[ ${#MENU_STATE_FILES[@]} -eq 1 ]]; then
 elif [[ ${#MENU_STATE_FILES[@]} -gt 1 ]]; then
   die "Multiple installer state files were found in /root. Resolve them manually before continuing."
 else
-  printf 'New VPS:\n1) Install standalone VPN (default)\n2) Install remote node\n3) Install standalone VPN and import VLESS users from a 3x-ui SQLite backup\n0) Exit\n'
+  printf 'New VPS\n1) Install VPN server (default)\n2) Install 3x-ui node\n3) Install VPN server and import VLESS users\n0) Exit\n'
   ask_setup_input 'Select [1]: ' 1 'Choose a number from 0 to 3.' input_matches '^[0-3]$'
   ACTION="$REPLY"
   MIGRATION_DB=''
@@ -322,7 +322,7 @@ else
     3)
       INSTALL_MODE=standalone
       [[ -r "$MIGRATION_SCRIPT" ]] || die "Place xhttp-vps-migrate.sh alongside this installer."
-      ask_setup_input 'Path to the source 3x-ui SQLite backup: ' '' 'Enter the path to a readable 3x-ui SQLite backup.' valid_backup_file
+      ask_setup_input '3x-ui SQLite backup path: ' '' 'Enter the path to a readable 3x-ui SQLite backup.' valid_backup_file
       MIGRATION_DB="$(realpath -e -- "$REPLY")" || die "Could not resolve the backup path."
       ;;
     0) exit 0 ;;
@@ -409,11 +409,11 @@ INSTANCE_NAME="${DEFAULT_INSTANCE:-$([[ "$INSTALL_MODE" == "standalone" ]] && ec
 if [[ "$INSTALL_MODE" == "standalone" ]]; then
   DEFAULT_VPN_NAME="${DOMAIN%%.*} VPN"
   NAME_LABEL="VPN name"
-  VPN_NAME_PROMPT="VPN name shown in subscriptions [${DEFAULT_VPN_NAME}]: "
+  VPN_NAME_PROMPT="Subscription name [${DEFAULT_VPN_NAME}]: "
 else
   DEFAULT_VPN_NAME="${DOMAIN%%.*} Node"
   NAME_LABEL="Node name"
-  VPN_NAME_PROMPT="Node name shown in the local 3x-ui panel [${DEFAULT_VPN_NAME}]: "
+  VPN_NAME_PROMPT="Node name [${DEFAULT_VPN_NAME}]: "
 fi
 ask_setup_input "$VPN_NAME_PROMPT" "$DEFAULT_VPN_NAME" "${NAME_LABEL} must contain 1–64 characters and no control characters." valid_vpn_name
 VPN_NAME="$REPLY"
@@ -445,13 +445,10 @@ SUB_PRIVACY_HEADERS=''
 if xhttp_uses_panel; then
 INBOUND_TAG="$(xhttp_inbound_tag_for "$TRANSPORT")"
 cat <<'EOF'
-Panel access:
+Panel access
+  3) Localhost only. Use an SSH tunnel (default).
   1) Public Internet
-     Open the panel from any device.
-  2) Trusted IPv4 only
-     For a fixed administrator or main-panel IP.
-  3) Localhost only (default)
-     Connect through an SSH tunnel or Tailscale.
+  2) One trusted IPv4
 EOF
 ask_setup_input 'Select panel access [3]: ' 3 'Choose 1, 2 or 3.' input_matches '^[1-3]$'
 PANEL_ALLOWED_IP=""
@@ -462,27 +459,27 @@ case "$REPLY" in
     ;;
   2)
     PANEL_ACCESS_MODE="allowlist"
-    ask_setup_input 'Trusted public IPv4 allowed to reach the panel: ' '' 'Enter one valid IPv4 address.' xhttp_valid_ipv4
+    ask_setup_input 'Trusted IPv4 for panel access: ' '' 'Enter one valid IPv4 address.' xhttp_valid_ipv4
     PANEL_ALLOWED_IP="$REPLY"
     ;;
   3) PANEL_ACCESS_MODE="private" ;;
 esac
 
-ask_yes_no 'Enable 3x-ui two-factor authentication during setup (requires an authenticator app)?' no
+ask_yes_no 'Enable panel 2FA (authenticator app)?' no
 if [[ "$REPLY" == yes ]]; then PANEL_2FA_ENROLL=1; fi
 
 if [[ "$INSTALL_MODE" == standalone ]]; then
-  ask_yes_no 'Generate encrypted HAPP and INCY subscription links?' yes
+  ask_yes_no 'Encrypt Happ and INCY subscription links?' yes
   if [[ "$REPLY" == yes ]]; then SUB_ENCRYPT_LINKS=true; else SUB_ENCRYPT_LINKS=false; fi
 fi
 
-printf '%s\n' 'The built-in profile page can expose subscription URLs and server settings to its visitors.'
-ask_yes_no 'Advertise the built-in subscription profile page?' no
+printf '%s\n' 'The profile page may show subscription links and server settings.'
+ask_yes_no 'Add a profile page link to subscriptions?' no
 if [[ "$REPLY" == yes ]]; then SUB_PROFILE_MODE=builtin; else SUB_PROFILE_MODE=none; fi
-ask_yes_no 'Disable caching and referrer sharing for subscription responses?' yes
+ask_yes_no 'Block subscription caching and referrer sharing?' yes
 if [[ "$REPLY" == yes ]]; then SUB_PRIVACY_HEADERS=true; else SUB_PRIVACY_HEADERS=false; fi
 
-ask_yes_no 'Use Cloudflare WARP over MASQUE as an extra exit for Russian resources (domains and IPs)?' yes
+ask_yes_no 'Route Russian sites and IPs via Cloudflare WARP?' yes
 if [[ "$REPLY" == yes ]]; then ENABLE_WARP=1; fi
 else
   [[ -r "$UDP_SCRIPT" ]] || die "Place xhttp-vps-udp.sh alongside this installer."
@@ -501,8 +498,8 @@ else
 fi
 
 cat <<'EOF'
-Cover-site design:
-  1) Automatic (stable selection based on domain)
+Cover-site design
+  1) Automatic (default)
   2) Engineering consultancy
   3) Digital infrastructure
   4) Logistics and operations
@@ -530,7 +527,7 @@ if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || (( SSH_PORT < 1 || SSH_PORT > 65535 )); th
 fi
 [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || SSH_PORT=22
 SSH_TARGET_PORT=''
-ask_yes_no "Move SSH from port $SSH_PORT to a high port?" no
+ask_yes_no "Change SSH port (current: $SSH_PORT)?" no
 if [[ "$REPLY" == yes ]]; then
   SSH_PORT_SUGGESTION="$(random_port)" || die 'Could not find a free high SSH port.'
   ask_setup_input "High SSH port (10000–65535) [$SSH_PORT_SUGGESTION]: " "$SSH_PORT_SUGGESTION" \
@@ -540,19 +537,14 @@ if [[ "$REPLY" == yes ]]; then
 fi
 
 cat <<'EOF'
-SSH access:
-  1) Keep current access
-     Existing root and login settings stay unchanged.
-  2) Root with SSH key only
-     Password login is disabled.
-  3) New sudo user with SSH key
-     Root and password login are disabled.
-  4) New sudo user with an SSH certificate (default)
-     A certificate login is tested before root and password login are disabled.
-  5) Root with password
-     Set a root password if necessary.
+SSH login
+  4) New sudo user + SSH certificate only. Root and password login blocked (default).
+  1) Keep current SSH settings.
+  2) Root + SSH key only. Password login blocked.
+  3) New sudo user + SSH key only. Root and password login blocked.
+  5) Root + password only.
 EOF
-ask_setup_input 'Select SSH policy [4]: ' 4 'Choose a number from 1 to 5.' input_matches '^[1-5]$'
+ask_setup_input 'Select SSH login [4]: ' 4 'Choose a number from 1 to 5.' input_matches '^[1-5]$'
 SSH_ACCESS_CHOICE="$REPLY"
 case "$SSH_ACCESS_CHOICE" in
   1)
@@ -589,13 +581,13 @@ if [[ "$SSH_ACCESS_MODE" == admin-cert ]]; then
   printf '%s\n' 'Create an Ed25519 CA separately and keep its private key offline:'
   printf '%s\n' '  ssh-keygen -t ed25519 -f ~/.ssh/vps_ssh_ca'
   printf '  ssh-keygen -s ~/.ssh/vps_ssh_ca -I %s -n %s -V +30d ~/.ssh/id_ed25519.pub\n' "$ADMIN_USER" "$ADMIN_USER"
-  ask_setup_input 'Paste the CA public key (vps_ssh_ca.pub): ' '' \
+  ask_setup_input 'SSH CA public key (vps_ssh_ca.pub): ' '' \
     'Paste one complete Ed25519 CA public key from the .pub file.' valid_setup_key xhttp_validate_ssh_ca_b64
   ADMIN_KEYS_B64="$(printf '%s' "$REPLY" | base64 -w0)"
   ADMIN_KEY_FINGERPRINTS="$(xhttp_authorized_key_fingerprints "$ADMIN_KEYS_B64")"
 elif [[ "$SSH_ACCESS_MODE" == admin || "$SSH_ACCESS_MODE" == root-key ]]; then
   if [[ -s /root/.ssh/authorized_keys ]]; then
-    ask_yes_no "Reuse the current root authorized_keys for ${ADMIN_USER}?" yes
+    ask_yes_no "Reuse root SSH keys for ${ADMIN_USER}?" yes
     if [[ "$REPLY" == yes ]]; then
       ADMIN_KEYS_B64="$(base64 -w0 /root/.ssh/authorized_keys)"
       if ! xhttp_validate_authorized_keys_b64 "$ADMIN_KEYS_B64"; then
@@ -605,29 +597,25 @@ elif [[ "$SSH_ACCESS_MODE" == admin || "$SSH_ACCESS_MODE" == root-key ]]; then
     fi
   fi
   if [[ -z "$ADMIN_KEYS_B64" ]]; then
-    ask_setup_input "Paste one SSH public key for ${ADMIN_USER}: " '' \
+    ask_setup_input "SSH public key for ${ADMIN_USER}: " '' \
       'Paste one complete SSH public key from a .pub file.' valid_setup_key xhttp_validate_authorized_keys_b64
     ADMIN_KEYS_B64="$(printf '%s\n' "$REPLY" | base64 -w0)"
   fi
   ADMIN_KEY_FINGERPRINTS="$(xhttp_authorized_key_fingerprints "$ADMIN_KEYS_B64")"
 fi
 
-ask_setup_input 'Restrict SSH to this trusted IPv4 (leave blank for unrestricted source IPs): ' '' \
+ask_setup_input 'Allow SSH from one IPv4 (blank = any): ' '' \
   'Enter the IPv4 of this SSH connection, or leave blank. From the provider console you can enter any trusted IPv4.' valid_ssh_source
 SSH_ALLOWED_IP="$REPLY"
 
-ask_yes_no 'Disable IPv4 ping replies (keep other ICMP messages)?' no
+ask_yes_no 'Block IPv4 ping replies?' no
 if [[ "$REPLY" == yes ]]; then DISABLE_PING=1; else DISABLE_PING=0; fi
 
 cat <<'EOF'
-Automatic maintenance:
-  1) Scheduled updates and conditional reboot (default)
-     Security updates every day at 05:30. Full updates and cleanup on Sundays at 05:30.
-     Reboot after maintenance if required.
-  2) Security updates only
-     Installed daily at 05:30 without automatic reboot.
-  3) No automatic updates
-     Updates and reboot are performed manually.
+Automatic updates
+  1) Daily security, full updates Sunday, reboot if needed (default)
+  2) Daily security only, no automatic reboot
+  3) Manual updates
 EOF
 ask_setup_input 'Select maintenance [1]: ' 1 'Choose 1, 2 or 3.' input_matches '^[1-3]$'
 MAINTENANCE_TIMEZONE=Europe/Moscow
@@ -637,11 +625,11 @@ case "$REPLY" in
   3) MAINTENANCE_MODE=none ;;
 esac
 if [[ "$MAINTENANCE_MODE" != none ]]; then
-  ask_setup_input 'Timezone for scheduled maintenance at 05:30 [Europe/Moscow]: ' Europe/Moscow \
+  ask_setup_input 'Update timezone (05:30 local) [Europe/Moscow]: ' Europe/Moscow \
     'Enter an IANA timezone such as Europe/Moscow or Etc/UTC.' valid_maintenance_timezone
   MAINTENANCE_TIMEZONE="$REPLY"
 fi
-ask_yes_no 'Export an encrypted recovery backup after setup?' no
+ask_yes_no 'Export an encrypted backup after setup?' no
 if [[ "$REPLY" == yes ]]; then CREATE_RECOVERY_BACKUP=1; else CREATE_RECOVERY_BACKUP=0; fi
 
 
