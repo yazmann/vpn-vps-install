@@ -21,10 +21,6 @@ unexpected_error() {
 }
 trap 'unexpected_error "$?" "$LINENO"' ERR
 [[ ${EUID} -eq 0 ]] || die "Run as root."
-MEMORY_SCRIPT="$(dirname "$(readlink -f "$0")")/optimize-xhttp-memory.sh"
-[[ -r "$MEMORY_SCRIPT" ]] || die "Place optimize-xhttp-memory.sh alongside this repair script."
-# shellcheck source=optimize-xhttp-memory.sh
-source "$MEMORY_SCRIPT"
 COMMON_SCRIPT="$(dirname "$(readlink -f "$0")")/xhttp-vps-common.sh"
 [[ -r "$COMMON_SCRIPT" ]] || die "Place xhttp-vps-common.sh alongside this repair script."
 # shellcheck source=xhttp-vps-common.sh
@@ -95,7 +91,7 @@ if [[ -r /etc/x-ui/install-result.env ]]; then
   PANEL_API_TOKEN="${STATE_PANEL_API_TOKEN:-${XUI_API_TOKEN:-${PANEL_API_TOKEN:-}}}"
   PANEL_PATH="${PANEL_PATH#/}"; PANEL_PATH="${PANEL_PATH%/}"
 fi
-for cmd in curl jq wg sqlite3; do command -v "$cmd" >/dev/null || die "Missing command: $cmd"; done
+for cmd in curl jq sqlite3; do command -v "$cmd" >/dev/null || die "Missing command: $cmd"; done
 if [[ "$SSH_HARDENING" == 1 ]]; then
   : "${ADMIN_USER:?State file does not contain ADMIN_USER}"
   : "${ADMIN_KEYS_B64:?State file does not contain ADMIN_KEYS_B64}"
@@ -245,6 +241,18 @@ if [[ "$INSTALL_MODE" == "standalone" ]]; then
   fi
 fi
 
+CURRENT_STEP='restoring Xray policy defaults if the old memory profile is present'
+xhttp_restore_policy_defaults || die "Could not restore Xray policy defaults."
+
+WARP_CONFIGURED=0
+if [[ "${ENABLE_WARP:-0}" -eq 1 ]]; then
+  CURRENT_STEP='configuring Cloudflare WARP over MASQUE for Russian traffic'
+  printf '\n%b[STEP]%b %s\n' "$cyan" "$plain" "$CURRENT_STEP"
+  xhttp_configure_warp_masque || die "Could not configure a verified MASQUE exit for Russian traffic."
+  WARP_CONFIGURED=1
+  configure_warp_swap
+fi
+
 CURRENT_STEP="creating or repairing $(xhttp_transport_label "$TRANSPORT") inbound"
 printf '\n%b[STEP]%b %s\n' "$cyan" "$plain" "$CURRENT_STEP"
 R="$(curl -q -fsS "${API_AUTH[@]}" "$API_BASE/panel/api/inbounds/list")"
@@ -293,53 +301,12 @@ else
   } >> "${STATE_FILES[0]}"
 fi
 
-CURRENT_STEP='applying the low-memory Xray profile'
-xhttp_memory_apply "$INBOUND_TAG" "$TRANSPORT"
 if [[ -n "${MIGRATION_DB:-}" ]]; then
   CURRENT_STEP='importing VLESS users and usage'
   [[ -r "$MIGRATION_SCRIPT" ]] || die "SQLite migration helpers are missing."
   xhttp_import_migrated_clients
 fi
 
-WARP_CONFIGURED=0
-if [[ "${ENABLE_WARP:-0}" -eq 1 ]]; then
-  CURRENT_STEP='configuring built-in WARP and RU routing'
-  printf '\n%b[STEP]%b %s\n' "$cyan" "$plain" "$CURRENT_STEP"
-  R="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/data")"
-  if ! jq -e '.success==true and .obj!=null and .obj!=""' <<<"$R" >/dev/null; then
-    PRIV="$(wg genkey)"; PUB="$(printf '%s' "$PRIV"|wg pubkey)"
-    R="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/reg" \
-      --data-urlencode "privateKey=$PRIV" --data-urlencode "publicKey=$PUB")"
-    if ! jq -e '.success==true' <<<"$R" >/dev/null; then
-      die "WARP registration failed. WARP was requested, so repair cannot continue. Panel response: ${R}"
-    fi
-  fi
-  if [[ "$ENABLE_WARP" -eq 1 ]]; then
-    WARP_DATA_RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/data")"
-    WARP_CONFIG_RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/config")"
-    WARP_DATA="$(jq -c '.obj|if type=="string" then fromjson else . end' <<<"$WARP_DATA_RESPONSE")"
-    WARP_CONFIG="$(jq -c '.obj|if type=="string" then fromjson else . end' <<<"$WARP_CONFIG_RESPONSE")"
-    if ! WARP_OUT="$(xhttp_build_warp_outbound "$WARP_DATA" "$WARP_CONFIG")"; then
-      die "WARP account data is incomplete. WARP was requested, so repair cannot continue."
-    else
-      R="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/")"
-      jq -e '.success==true and .obj!=null' <<<"$R" >/dev/null || die "Could not read Xray configuration: $R"
-      X="$(jq -c '.obj|if type=="string" then fromjson else . end|.xraySetting|if type=="string" then fromjson else . end' <<<"$R")"
-      jq -e 'type=="object" and (.outbounds|type=="array")' <<<"$X" >/dev/null || die "Xray configuration has an unexpected format."
-      WARP_BACKUP="$(mktemp -d /root/xhttp-warp-backup.XXXXXXXX)"
-      sqlite3 /etc/x-ui/x-ui.db ".timeout 5000" ".backup '$WARP_BACKUP/x-ui.db'"
-      X="$(xhttp_warp_config "$WARP_OUT" <<<"$X")"
-      xhttp_validate_warp_routes <<<"$X" || die "Required Russian routing datasets are unavailable."
-      R="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/update" \
-        --data-urlencode "xraySetting=$X" --data-urlencode 'outboundTestUrl=https://www.cloudflare.com/cdn-cgi/trace')"
-      if ! jq -e '.success==true' <<<"$R" >/dev/null; then
-        die "WARP routing could not be saved. WARP was requested, so repair cannot continue. Panel response: ${R}"
-      fi
-      WARP_CONFIGURED=1
-      configure_warp_swap
-    fi
-  fi
-fi
 
 xhttp_restart_vpn_service x-ui
 sleep 2
@@ -529,9 +496,9 @@ else
   report "Fail2ban panel jail" SKIP
 fi
 if [[ "${ENABLE_WARP:-0}" -eq 1 ]]; then
-  if [[ "$WARP_CONFIGURED" -eq 1 ]]; then report "WARP RU routing" OK; else report "WARP RU routing" ERROR; fi
+  if [[ "$WARP_CONFIGURED" -eq 1 ]]; then report "WARP MASQUE RU routing" OK; else report "WARP MASQUE RU routing" ERROR; fi
 else
-  report "WARP RU routing" SKIP
+  report "WARP MASQUE RU routing" SKIP
 fi
 MEMORY_KIB_FINAL="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo)"
 if [[ "${ENABLE_WARP:-0}" -eq 1 && "$MEMORY_KIB_FINAL" =~ ^[0-9]+$ ]] && (( MEMORY_KIB_FINAL <= 1100000 )); then
@@ -620,6 +587,7 @@ mv -f "$RESULT_TEMP" "$RESULT_FILE"
   printf 'SSH_ACCESS_MODE=%q\n' "$SSH_ACCESS_MODE"
   printf 'INSTALL_PHASE=complete\n'
 } >> "${STATE_FILES[0]}"
+rm -f -- /root/optimize-xhttp-memory.sh
 printf '%s\n' 'From another network, open the website, refresh subscriptions in your VPN apps, and test that the panel follows the chosen access policy.'
 if [[ "$INITIAL_INSTALL_PHASE" != complete && "${CREATE_RECOVERY_BACKUP:-0}" == 1 ]]; then
   xhttp_export_recovery_backup "${STATE_FILES[0]}" || printf '%s\n' 'Backup skipped. You can retry using menu item 5.' >&2

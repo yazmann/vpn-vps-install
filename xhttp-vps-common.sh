@@ -56,6 +56,58 @@ xhttp_service_name() {
   esac
 }
 
+xhttp_panel_api() {
+  local path="$1"
+  shift
+  # Only the loopback panel is used. Do not put credentials in diagnostics.
+  curl -q -fsS --connect-timeout 3 --max-time 30 "${API_AUTH[@]}" \
+    "$API_BASE$path" "$@" | jq -ce '
+      if .success == true then . else error("Panel API rejected the operation") end
+    '
+}
+
+xhttp_restore_policy_defaults() (
+  umask 077
+  local response template updated test_url backup_dir
+  response="$(xhttp_panel_api /panel/api/xray/ -X POST)" || return 1
+  template="$(jq -ce '
+    def decode: if type == "string" then fromjson else . end;
+    .obj | decode | .xraySetting | decode | select(type == "object")
+  ' <<<"$response")" || return 1
+  # Only remove the exact pair the former installer applied at level zero.
+  updated="$(jq -ce '
+    if (.policy.levels["0"] | .bufferSize == 64 and .connIdle == 180)
+    then del(.policy.levels["0"].bufferSize, .policy.levels["0"].connIdle)
+    else . end
+  ' <<<"$template")" || return 1
+  [[ "$updated" != "$template" ]] || return 0
+  test_url="$(jq -r '
+    .obj | if type == "string" then fromjson else . end
+    | .outboundTestUrl // "https://www.cloudflare.com/cdn-cgi/trace"
+  ' <<<"$response")" || return 1
+
+  backup_dir="$(mktemp -d /root/xhttp-policy-backup.XXXXXXXX)" || return 1
+  printf '%s\n' "$template" > "$backup_dir/xray.json" || return 1
+  sqlite3 -batch -bail /etc/x-ui/x-ui.db ".timeout 5000" ".backup '$backup_dir/x-ui.db'" || return 1
+  printf 'Saved the previous Xray policy and panel database in %s.\n' "$backup_dir"
+
+  if xhttp_panel_api /panel/api/xray/update -X POST \
+      --data-urlencode "xraySetting=$updated" --data-urlencode "outboundTestUrl=$test_url" >/dev/null &&
+     response="$(xhttp_panel_api /panel/api/xray/ -X POST)" &&
+     jq -e --argjson expected "$updated" '
+       def decode: if type == "string" then fromjson else . end;
+       (.obj | decode | .xraySetting | decode) == $expected
+     ' <<<"$response" >/dev/null; then
+    return 0
+  fi
+
+  if ! xhttp_panel_api /panel/api/xray/update -X POST \
+      --data-urlencode "xraySetting=$template" --data-urlencode "outboundTestUrl=$test_url" >/dev/null; then
+    printf 'Xray policy rollback could not be confirmed. Use the backup in %s.\n' "$backup_dir" >&2
+  fi
+  return 1
+)
+
 xhttp_incy_subscription() {
   # Public crypt1 interoperability key from the official INCY link encoder.
   node -e '
@@ -79,9 +131,9 @@ xhttp_subscription_links() {
     return 0
   fi
   email_path="$(jq -rn --arg email "$email" '$email|@uri')" || return 1
-  response="$(xhttp_memory_api "/panel/api/clients/get/$email_path")" || return 1
+  response="$(xhttp_panel_api "/panel/api/clients/get/$email_path")" || return 1
   client_id="$(jq -er '.obj.client.id | select(type=="number" and .>0 and floor==.)' <<<"$response")" || return 1
-  response="$(xhttp_memory_api "/panel/api/clients/happLink/$client_id" -X POST)" || return 1
+  response="$(xhttp_panel_api "/panel/api/clients/happLink/$client_id" -X POST)" || return 1
   happ="$(jq -er '.obj.encryptedLink | select(test("^happ://crypt[0-9]*/[a-zA-Z0-9_+=/-]+$"))' <<<"$response")" || return 1
   incy="$(printf '%s\n' "$url" | xhttp_incy_subscription)" || return 1
   printf 'HAPP subscription: %s\nINCY subscription: %s\n' "$happ" "$incy"
@@ -250,7 +302,7 @@ xhttp_apply_ping_policy() {
 
 xhttp_panel_2fa_enabled() {
   local response
-  response="$(xhttp_memory_api /panel/api/setting/all -X POST)" || return 1
+  response="$(xhttp_panel_api /panel/api/setting/all -X POST)" || return 1
   jq -e '.obj | if type == "string" then fromjson else . end | .twoFactorEnable == true and .hasTwoFactorToken != false' <<<"$response" >/dev/null
 }
 
@@ -453,7 +505,7 @@ xhttp_rebuild_managed_inbound() {
 xhttp_rotate_node_sync_token() {
   local token_name="${1:-xhttp-node-sync}" response ids id payload token
   [[ "$token_name" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || return 1
-  response="$(xhttp_memory_api /panel/api/setting/apiTokens)" || return 1
+  response="$(xhttp_panel_api /panel/api/setting/apiTokens)" || return 1
   ids="$(jq -ce --arg name "$token_name" '
     .obj | if type=="string" then fromjson else . end
     | select(type=="array")
@@ -463,11 +515,11 @@ xhttp_rotate_node_sync_token() {
   while IFS= read -r id; do
     [[ "$id" =~ ^[0-9]+$ ]] || return 1
     payload='{"expectedScope":"node-sync"}'
-    xhttp_memory_api "/panel/api/setting/apiTokens/delete/$id" -X POST \
+    xhttp_panel_api "/panel/api/setting/apiTokens/delete/$id" -X POST \
       -H 'Content-Type: application/json' --data-binary "$payload" >/dev/null || return 1
   done < <(jq -r '.[]' <<<"$ids")
   payload="$(jq -nc --arg name "$token_name" '{name:$name,scope:"node-sync",expiresAt:0}')"
-  response="$(xhttp_memory_api /panel/api/setting/apiTokens/create -X POST \
+  response="$(xhttp_panel_api /panel/api/setting/apiTokens/create -X POST \
     -H 'Content-Type: application/json' --data-binary "$payload")" || return 1
   token="$(jq -er '
     .obj | if type=="string" then fromjson else . end
@@ -1572,42 +1624,44 @@ random_port() {
   return 1
 }
 
-xhttp_build_warp_outbound() {
-  local data_json="$1" config_json="$2" private_key client_id peer_key endpoint addresses reserved
-  local ipv4_endpoint ipv4 port
-  private_key="$(jq -r '.private_key // empty' <<<"$data_json")"
-  client_id="$(jq -r '.client_id // empty' <<<"$data_json")"
-  peer_key="$(jq -r '.config.peers[0].public_key // empty' <<<"$config_json")"
-  endpoint="$(jq -r '.config.peers[0].endpoint.host // empty' <<<"$config_json")"
-  ipv4_endpoint="$(jq -r '.config.peers[0].endpoint.v4 // empty' <<<"$config_json")"
-  # The VPS uses IPv4 and the account response can use port 0 as a placeholder.
-  ipv4="${ipv4_endpoint%%:*}"
-  port="${ipv4_endpoint#*:}"
-  if [[ "$ipv4_endpoint" != *:* || "$port" == 0 ]]; then port="${endpoint##*:}"; fi
-  if xhttp_valid_ipv4 "$ipv4" && [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 )); then
-    endpoint="$ipv4:$port"
-  fi
-  addresses="$(jq -nc --arg v4 "$(jq -r '.config.interface.addresses.v4 // empty' <<<"$config_json")" \
-    --arg v6 "$(jq -r '.config.interface.addresses.v6 // empty' <<<"$config_json")" \
-    '[$v4, $v6 | select(length > 0) | if contains(":") then . + "/128" else . + "/32" end]')"
-  [[ -n "$private_key" && -n "$client_id" && -n "$peer_key" && -n "$endpoint" && "$addresses" != "[]" ]] || return 1
-  reserved="$(printf '%s' "$client_id" | base64 -d 2>/dev/null | od -An -tu1 | awk 'BEGIN { printf "[" } { for (i=1; i<=NF; i++) { if (n++) printf ","; printf $i } } END { print "]" }')" || return 1
-  [[ "$reserved" != "[]" ]] || return 1
-  jq -nc --arg private "$private_key" --arg public "$peer_key" --arg endpoint "$endpoint" \
-    --argjson addresses "$addresses" --argjson reserved "$reserved" \
-    '{tag:"warp",protocol:"wireguard",settings:{mtu:1420,secretKey:$private,address:$addresses,reserved:$reserved,domainStrategy:"ForceIPv4v6",peers:[{publicKey:$public,endpoint:$endpoint}],noKernelTun:true}}'
+xhttp_build_warp_masque_outbound() {
+  local registration endpoint
+  registration="$(jq -ce 'if type == "string" then fromjson else . end')" || return 1
+  endpoint="$(jq -er '.endpoint | strings' <<<"$registration")" || return 1
+  xhttp_valid_ipv4 "$endpoint" || return 1
+  jq -ce '
+    if (.privateKey | type != "string" or (startswith("-----BEGIN PRIVATE KEY-----") | not)) or
+       (.publicKey | type != "string" or length == 0) or
+       (.address | type != "array" or length == 0 or any(.[]; type != "string" or length == 0))
+    then error("Incomplete MASQUE enrollment") else . end
+    | {tag:"warp-masque",protocol:"masque",settings:{address:.endpoint,port:443},
+       streamSettings:{network:"masque",security:"tls",
+         tlsSettings:{serverName:"consumer-masque.cloudflareclient.com",alpn:["h3"]},
+         masqueSettings:{warp:{privateKey,publicKey,address}}}}
+  ' <<<"$registration"
 }
 
 xhttp_warp_config() {
-  jq -ce --argjson w "$1" '
-    def catchall:
+  jq -cse '
+    .[0] as $w | .[1]
+    | if ($w.tag!="warp-masque" or $w.protocol!="masque") or
+         type!="object" or (.outbounds|type)!="array" or (.outbounds|length)==0
+      then error("Invalid Xray template or MASQUE outbound") else . end
+    | def catchall:
       del(.type,.ruleTag,.outboundTag,.balancerTag)
       | if .network=="tcp,udp" or .network=="udp,tcp" then del(.network) else . end
       | length==0;
-    .outbounds=((.outbounds//[])|map(select(.tag!="warp")))+[$w]
-    | .routing.domainStrategy="IPOnDemand"
-    | ((.routing.rules//[]) | map(select(
+    (.routing.rules//[]) as $previous
+    | ($previous | map(select(
         .ruleTag!="xhttp-vps-warp-ru-domain" and .ruleTag!="xhttp-vps-warp-ru-ip"))) as $rules
+    | (any($previous[]; .outboundTag=="warp" and
+        (.ruleTag=="xhttp-vps-warp-ru-domain" or .ruleTag=="xhttp-vps-warp-ru-ip")) and
+       .outbounds[0].tag!="warp" and (.routing.balancers//[]|length)==0 and
+       (del(.outbounds[] | select(.tag=="warp" and .protocol=="wireguard"))
+        | .routing.rules=$rules | all(.. | strings; .!="warp"))) as $remove_legacy
+    | .outbounds |= (map(select(($remove_legacy and .tag=="warp" and .protocol=="wireguard") | not))
+        | if any(.[]; .tag==$w.tag) then map(if .tag==$w.tag then $w else . end) else . + [$w] end)
+    | .routing.domainStrategy="IPOnDemand"
     | [$rules | to_entries[] | select(.value|catchall) | .key] as $defaults
     | if ($defaults|length)>1 or (($defaults|length)==1 and $defaults[0]!=($rules|length)-1)
       then error("Catch-all must be the final rule; review routing before adding WARP") else . end
@@ -1621,25 +1675,97 @@ xhttp_warp_config() {
         .outboundTag as $tag
         | ($tag==$api or ($blocked|index($tag))!=null);
       .routing.rules = ($rules | map(select(protected_rule))) + [
-        {type:"field",domain:["domain:ru","domain:su","domain:xn--p1ai","geosite:category-ru"],outboundTag:"warp",network:"tcp,udp",ruleTag:"xhttp-vps-warp-ru-domain"},
-        {type:"field",ip:["geoip:ru"],outboundTag:"warp",network:"tcp,udp",ruleTag:"xhttp-vps-warp-ru-ip"}
+        {type:"field",domain:["domain:ru","domain:su","domain:xn--p1ai","geosite:category-ru"],outboundTag:$w.tag,network:"tcp,udp",ruleTag:"xhttp-vps-warp-ru-domain"},
+        {type:"field",ip:["geoip:ru"],outboundTag:$w.tag,network:"tcp,udp",ruleTag:"xhttp-vps-warp-ru-ip"}
       ] + ($rules | map(select(protected_rule|not)))
   '
 }
 
-# Validate regional datasets with the installed core before changing panel state.
-xhttp_validate_warp_routes() (
-  set -Eeuo pipefail
+xhttp_configure_warp_masque() (
+  umask 077
+  local response envelope template outbound updated test_url backup_dir registration was_listening=0
+  response="$(xhttp_panel_api /panel/api/xray/ -X POST)" || return 1
+  envelope="$(jq -ce '.obj | if type=="string" then fromjson else . end' <<<"$response")" || return 1
+  template="$(jq -ce '.xraySetting | if type=="string" then fromjson else . end | select(type=="object")' <<<"$envelope")" || return 1
+  test_url="$(jq -r '.outboundTestUrl // "https://www.cloudflare.com/cdn-cgi/trace"' <<<"$envelope")" || return 1
+  registration="$(jq -c '
+    [.outbounds[] | select(.tag=="warp-masque")]
+    | if length==0 then null
+      elif length==1 and .[0].protocol=="masque" then
+        .[0] | .streamSettings.masqueSettings.warp + {endpoint:.settings.address}
+      else error("Conflicting warp-masque outbound") end
+  ' <<<"$template")" || return 1
+  if [[ "$registration" == null ]]; then
+    response="$(xhttp_panel_api /panel/api/xray/warp/regMasque -X POST --max-time 70)" || {
+      printf '%s\n' 'MASQUE enrollment failed. Check that 3x-ui supports regMasque and the VPS can reach Cloudflare.' >&2
+      return 1
+    }
+    registration="$(jq -c '.obj' <<<"$response")" || return 1
+  fi
+  outbound="$(xhttp_build_warp_masque_outbound <<<"$registration")" || return 1
+  updated="$(printf '%s\n' "$outbound" "$template" | xhttp_warp_config)" || return 1
+  xhttp_validate_warp_config <<<"$updated" || return 1
+  xhttp_probe_warp_masque <<<"$outbound" || {
+    printf '%s\n' 'The MASQUE tunnel did not pass the Cloudflare egress check. The previous routing was kept.' >&2
+    return 1
+  }
+  if printf '%s\n' "$updated" "$template" | jq -es '.[0] == .[1]' >/dev/null; then
+    return 0
+  fi
+
+  backup_dir="$(mktemp -d /root/xhttp-warp-backup.XXXXXXXX)" || return 1
+  sqlite3 -batch -bail /etc/x-ui/x-ui.db ".timeout 5000" ".backup '$backup_dir/x-ui.db'" || return 1
+  # The panel can remove old outbounds before replacing their live routing rules.
+  # Stop active ingress during the switch so no request can fall through to direct.
+  if port_busy 443; then
+    xhttp_panel_api /panel/api/server/stopXrayService -X POST >/dev/null || return 1
+    was_listening=1
+    if port_busy 443; then
+      printf '%s\n' 'TCP/443 is still listening after stopping Xray. Previous routing was kept.' >&2
+      return 1
+    fi
+  fi
+  if xhttp_save_warp_template "$updated" "$test_url" &&
+     response="$(xhttp_panel_api /panel/api/xray/ -X POST)" &&
+     printf '%s\n' "$response" "$updated" | jq -es '
+       def decode: if type=="string" then fromjson else . end;
+       (.[0].obj | decode | .xraySetting | decode) == .[1]
+     ' >/dev/null &&
+     { [[ "$was_listening" == 0 ]] ||
+       xhttp_panel_api /panel/api/server/restartXrayService -X POST >/dev/null; }; then
+    return 0
+  fi
+  # A start request can succeed even if its HTTP response is interrupted.
+  if port_busy 443 && ! xhttp_panel_api /panel/api/server/stopXrayService -X POST >/dev/null; then
+    printf 'Could not stop Xray to restore the previous routing. Use the database backup in %s.\n' "$backup_dir" >&2
+    return 1
+  fi
+  if ! xhttp_save_warp_template "$template" "$test_url"; then
+    printf 'WARP routing could not be restored via the panel. Use the database backup in %s.\n' "$backup_dir" >&2
+  elif [[ "$was_listening" == 1 ]]; then
+    xhttp_panel_api /panel/api/server/restartXrayService -X POST >/dev/null ||
+      printf '%s\n' 'Previous routing was restored, but Xray could not restart.' >&2
+  fi
+  return 1
+)
+
+xhttp_save_warp_template() {
+  printf '%s' "$1" | xhttp_panel_api /panel/api/xray/update -X POST \
+    --data-urlencode 'xraySetting@-' --data-urlencode "outboundTestUrl=$2" >/dev/null
+}
+
+# Validate both MASQUE support and the required regional datasets before saving.
+xhttp_validate_warp_config() (
   umask 077
   local check_dir
   local -a binaries=(/usr/local/x-ui/bin/xray-linux-*)
   [[ -x "${binaries[0]}" ]] || return 1
-  check_dir="$(mktemp -d /root/xhttp-route-check.XXXXXXXX)"
-  trap 'rm -f "$check_dir/config.json" "$check_dir/log"; rmdir "$check_dir"' EXIT
-  jq -ce '{outbounds:[{tag:"direct",protocol:"freedom"}],routing:{domainStrategy:.routing.domainStrategy,rules:[.routing.rules[]|select(.ruleTag=="xhttp-vps-warp-ru-domain" or .ruleTag=="xhttp-vps-warp-ru-ip")|.outboundTag="direct"]}}' > "$check_dir/config.json"
-  if ! XRAY_LOCATION_ASSET=/usr/local/x-ui/bin "${binaries[0]}" run -test -config "$check_dir/config.json" > "$check_dir/log" 2>&1; then
-    printf '%s\n' 'Russian routing validation failed; check geosite:category-ru and geoip:ru. No panel settings changed.' >&2
-    cat "$check_dir/log" >&2
+  check_dir="$(mktemp -d /root/xhttp-route-check.XXXXXXXX)" || return 1
+  trap 'rm -rf -- "$check_dir"' EXIT
+  cat > "$check_dir/config.json" || return 1
+  if ! XRAY_LOCATION_ASSET=/usr/local/x-ui/bin "${binaries[0]}" run -test -config "$check_dir/config.json" \
+      > "$check_dir/log" 2>&1; then
+    printf '%s\n' 'Xray rejected the candidate configuration. Check MASQUE support and geoip:ru/geosite:category-ru assets.' >&2
     return 1
   fi
 )
@@ -1852,34 +1978,50 @@ xhttp_run_probe() (
     --connect-timeout 10 --max-time 30 https://www.cloudflare.com/cdn-cgi/trace)"
   kill -0 "$probe_pid" 2>/dev/null
   grep -Eq '^ip=.+' <<<"$result"
-  if [[ "$expected" == warp ]]; then grep -Eq '^warp=(on|plus)$' <<<"$result"; fi
+  if [[ "$expected" == warp ]]; then
+    grep -Eq '^warp=(on|plus)$' <<<"$result"
+    if [[ -n "${VPS_PUBLIC_IP:-}" ]]; then ! grep -Fxq "ip=$VPS_PUBLIC_IP" <<<"$result"; fi
+  fi
 )
 
-xhttp_verify_traffic() {
-  local response inbound config port test_mode="${1:-all}"
+xhttp_probe_warp_masque() {
+  local config port
+  port="$(random_port)" || return 1
+  config="$(jq -ce --argjson p "$port" '
+    select(.tag=="warp-masque" and .protocol=="masque")
+    | {log:{loglevel:"warning"},inbounds:[{listen:"127.0.0.1",port:$p,protocol:"socks",settings:{auth:"noauth"}}],outbounds:[.]}
+  ')" || return 1
+  xhttp_probe_with_core "$config" warp
+}
+
+xhttp_probe_with_core() {
   local -a binaries
   mapfile -t binaries < <(find /usr/local/x-ui/bin -maxdepth 1 -type f -name 'xray*' -executable)
   [[ ${#binaries[@]} == 1 ]] || return 1
-  XRAY_BINARY="${binaries[0]}"
-  port="$(random_port)" || return 1
-  export XRAY_BINARY
   export -f xhttp_run_probe port_busy
+  # Run in a new shell so failures remain fatal even when the caller tests the exit status.
+  XRAY_BINARY="${binaries[0]}" VPS_PUBLIC_IP="${PUBLIC_IP:-}" bash -c 'xhttp_run_probe "$(cat)" "$1"' bash "$2" <<<"$1"
+}
+
+xhttp_verify_traffic() {
+  local response inbound config port outbound test_mode="${1:-all}"
   if [[ "$test_mode" != warp ]]; then
-  response="$(xhttp_memory_api /panel/api/inbounds/list)" || return 1
-  inbound="$(jq -ce --arg tag "${INBOUND_TAG:-in-443-xhttp-reality}" '.obj | if type=="string" then fromjson else . end | map(select(.tag==$tag)) | if length==1 then .[0] else error("Missing managed inbound") end' <<<"$response")" || return 1
-  config="$(xhttp_probe_config "$port" <<<"$inbound")" || return 1
-  # Invoke in a new Bash so callers may test failure without suppressing errexit.
-  bash -c 'xhttp_run_probe "$(cat)" direct' <<<"$config" || return 1
+    port="$(random_port)" || return 1
+    response="$(xhttp_panel_api /panel/api/inbounds/list)" || return 1
+    inbound="$(jq -ce --arg tag "${INBOUND_TAG:-in-443-xhttp-reality}" '
+      .obj | if type=="string" then fromjson else . end
+      | map(select(.tag==$tag)) | if length==1 then .[0] else error("Missing managed inbound") end
+    ' <<<"$response")" || return 1
+    config="$(xhttp_probe_config "$port" <<<"$inbound")" || return 1
+    xhttp_probe_with_core "$config" direct || return 1
   fi
   if [[ "${ENABLE_WARP:-0}" == 1 ]]; then
-    response="$(xhttp_memory_api /panel/api/xray/ -X POST)" || return 1
-    config="$(jq -ce --argjson p "$port" '
+    response="$(xhttp_panel_api /panel/api/xray/ -X POST)" || return 1
+    outbound="$(jq -ce '
       def decode: if type=="string" then fromjson else . end;
       .obj|decode|.xraySetting|decode
-      | [.outbounds[]|select(.tag=="warp")] as $w
-      | if ($w|length)!=1 then error("Missing WARP outbound") else . end
-      | {log:{loglevel:"warning"},inbounds:[{listen:"127.0.0.1",port:$p,protocol:"socks",settings:{auth:"noauth"}}],outbounds:$w}
+      | [.outbounds[]|select(.tag=="warp-masque")] | select(length==1) | .[0]
     ' <<<"$response")" || return 1
-    bash -c 'xhttp_run_probe "$(cat)" warp' <<<"$config" || return 1
+    xhttp_probe_warp_masque <<<"$outbound" || return 1
   fi
 }

@@ -6,7 +6,7 @@ source ./xhttp-vps-common.sh
 
 test_dir="$(mktemp -d)"
 trap 'rm -rf "$test_dir"' EXIT
-xhttp_memory_api() {
+xhttp_panel_api() {
   local path="$1"
   shift
   printf '%s\n' "$path" >> "$test_dir/calls"
@@ -36,7 +36,7 @@ token="$(xhttp_rotate_node_sync_token xhttp-node-sync)"
 grep -Fxq '/panel/api/setting/apiTokens/delete/5' "$test_dir/calls"
 grep -Fxq '/panel/api/setting/apiTokens/create' "$test_dir/calls"
 
-xhttp_memory_api() {
+xhttp_panel_api() {
   case "$1" in
     /panel/api/setting/apiTokens) printf '%s\n' '{"success":true,"obj":[]}' ;;
     /panel/api/setting/apiTokens/create) printf '%s\n' '{"success":true,"obj":{"scope":"admin","enabled":true,"token":"0123456789abcdef0123456789abcdef"}}' ;;

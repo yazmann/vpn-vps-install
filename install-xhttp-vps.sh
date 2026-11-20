@@ -47,10 +47,6 @@ unexpected_error() {
 trap 'unexpected_error "$?" "$LINENO"' ERR
 
 [[ ${EUID} -eq 0 ]] || die "Run as root."
-MEMORY_SCRIPT="$(dirname "$(readlink -f "$0")")/optimize-xhttp-memory.sh"
-[[ -r "$MEMORY_SCRIPT" ]] || die "Place optimize-xhttp-memory.sh alongside this installer."
-# shellcheck source=optimize-xhttp-memory.sh
-source "$MEMORY_SCRIPT"
 COMMON_SCRIPT="$(dirname "$(readlink -f "$0")")/xhttp-vps-common.sh"
 [[ -r "$COMMON_SCRIPT" ]] || die "Place xhttp-vps-common.sh alongside this installer."
 # shellcheck source=xhttp-vps-common.sh
@@ -151,6 +147,33 @@ show_current_settings() {
   exit 0
 }
 
+install_recovery_script() {
+  local temporary_file source_file
+  if [[ "$COMMON_SCRIPT" != /root/xhttp-vps-common.sh ]]; then
+    install -m 700 "$COMMON_SCRIPT" /root/xhttp-vps-common.sh
+  fi
+  if [[ "$UDP_SCRIPT" != /root/xhttp-vps-udp.sh && -r "$UDP_SCRIPT" ]]; then
+    install -m 700 "$UDP_SCRIPT" /root/xhttp-vps-udp.sh
+  fi
+  if [[ "$MIGRATION_SCRIPT" != /root/xhttp-vps-migrate.sh && -r "$MIGRATION_SCRIPT" ]]; then
+    install -m 700 "$MIGRATION_SCRIPT" /root/xhttp-vps-migrate.sh
+  fi
+  local installer
+  installer="$(readlink -f "$0")"
+  if [[ "$installer" != /root/install-xhttp-vps.sh ]]; then
+    install -m 700 "$installer" /root/install-xhttp-vps.sh
+  fi
+  temporary_file="${RECOVERY_SCRIPT}.new"
+  source_file="$(dirname "$(readlink -f "$0")")/finish-xhttp-vps.sh"
+  if [[ -r "$source_file" ]]; then
+    install -m 700 "$source_file" "$temporary_file"
+    mv -f "$temporary_file" "$RECOVERY_SCRIPT"
+  else
+    rm -f "$temporary_file"
+    warn "Recovery script was not installed: upload finish-xhttp-vps.sh alongside this installer before starting."
+  fi
+}
+
 RESUMING=0
 REPAIRING_UDP=0
 if [[ "${1:-}" == --resume ]]; then
@@ -213,14 +236,22 @@ if [[ ${#MENU_STATE_FILES[@]} -eq 1 ]]; then
     ACTION="${ACTION:-1}"
     case "$ACTION" in
       1) show_current_settings ;;
-      2) [[ -x "$RECOVERY_SCRIPT" ]] || die "Recovery script is missing: ${RECOVERY_SCRIPT}"; exec "$RECOVERY_SCRIPT" ;;
+      2)
+        if [[ "$COMMON_SCRIPT" != /root/xhttp-vps-common.sh ]]; then
+          [[ -r "$(dirname "$COMMON_SCRIPT")/finish-xhttp-vps.sh" ]] || die "Use the full installer archive to update recovery."
+          install_recovery_script
+        fi
+        [[ -x "$RECOVERY_SCRIPT" ]] || die "Recovery script is missing: ${RECOVERY_SCRIPT}"
+        exec "$RECOVERY_SCRIPT"
+        ;;
       3) remove_installation; exit 0 ;;
       4)
         : "${TRANSPORT:=xhttp}" "${MAINTENANCE_MODE:=weekly}" "${MAINTENANCE_TIMEZONE:=Europe/Moscow}"
         log 'Refreshing the saved automatic-update policy'
         xhttp_configure_automatic_updates && xhttp_verify_automatic_updates || die 'Could not refresh automatic maintenance.'
         if [[ "$COMMON_SCRIPT" != /root/xhttp-vps-common.sh ]]; then
-          install -m 700 "$COMMON_SCRIPT" /root/xhttp-vps-common.sh
+          [[ -r "$(dirname "$COMMON_SCRIPT")/finish-xhttp-vps.sh" ]] || die "Use the full installer archive to update recovery."
+          install_recovery_script
         fi
         printf 'Automatic maintenance: %s\n' "$(xhttp_maintenance_label "$MAINTENANCE_MODE")"
         exit 0
@@ -439,7 +470,7 @@ case "${SUB_PRIVACY_CHOICE,,}" in
   *) die 'Enter yes or no for subscription privacy headers.' ;;
 esac
 
-read -rp "Use Cloudflare WARP as an extra exit for Russian resources (domains and IPs)? [Y/n]: " WARP_ANSWER
+read -rp "Use Cloudflare WARP over MASQUE as an extra exit for Russian resources (domains and IPs)? [Y/n]: " WARP_ANSWER
 WARP_ANSWER="${WARP_ANSWER//$'\r'/}"
 WARP_ANSWER="${WARP_ANSWER#$'\ufeff'}"
 # Keep only an ASCII yes/no answer. This makes paste artefacts harmless.
@@ -731,36 +762,6 @@ fi
 
 fi
 
-install_recovery_script() {
-  local temporary_file source_file
-  if [[ "$COMMON_SCRIPT" != /root/xhttp-vps-common.sh ]]; then
-    install -m 700 "$COMMON_SCRIPT" /root/xhttp-vps-common.sh
-  fi
-  if [[ "$UDP_SCRIPT" != /root/xhttp-vps-udp.sh && -r "$UDP_SCRIPT" ]]; then
-    install -m 700 "$UDP_SCRIPT" /root/xhttp-vps-udp.sh
-  fi
-  if [[ "$MIGRATION_SCRIPT" != /root/xhttp-vps-migrate.sh && -r "$MIGRATION_SCRIPT" ]]; then
-    install -m 700 "$MIGRATION_SCRIPT" /root/xhttp-vps-migrate.sh
-  fi
-  local installer
-  installer="$(readlink -f "$0")"
-  if [[ "$installer" != /root/install-xhttp-vps.sh ]]; then
-    install -m 700 "$installer" /root/install-xhttp-vps.sh
-  fi
-  temporary_file="${RECOVERY_SCRIPT}.new"
-  source_file="$(dirname "$(readlink -f "$0")")/finish-xhttp-vps.sh"
-  if [[ -r "$source_file" ]]; then
-    if [[ "$MEMORY_SCRIPT" != /root/optimize-xhttp-memory.sh ]]; then
-      install -m 700 "$MEMORY_SCRIPT" /root/optimize-xhttp-memory.sh
-    fi
-    install -m 700 "$source_file" "$temporary_file"
-    mv -f "$temporary_file" "$RECOVERY_SCRIPT"
-  else
-    rm -f "$temporary_file"
-    warn "Recovery script was not installed: upload finish-xhttp-vps.sh alongside this installer before starting."
-  fi
-}
-
 configure_warp_swap() {
   local memory_kib free_kib
   memory_kib="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo)"
@@ -908,7 +909,7 @@ cat <<EOF
   Panel access:  ${PANEL_ACCESS_MODE}$([[ -n "$PANEL_ALLOWED_IP" ]] && printf ' (%s only)' "$PANEL_ALLOWED_IP")
   Subscription:  ${SUB_PORT} (local only)
   Self-steal:    127.0.0.1:${FALLBACK_PORT}
-  WARP for RU:   $([[ "$ENABLE_WARP" -eq 1 ]] && echo yes || echo no)
+  MASQUE for RU:   $([[ "$ENABLE_WARP" -eq 1 ]] && echo yes || echo no)
 EOF
 else
   printf '  VPN port:      %s/UDP\n' "$UDP_PORT"
@@ -980,7 +981,7 @@ UBUNTU_UPGRADE_OK=1
 log "Checking availability and installing required packages"
 
 REQUIRED_PACKAGES=(ca-certificates cron curl fail2ban iproute2 jq nginx openssh-server openssl procps sudo tar ufw unattended-upgrades util-linux)
-if xhttp_uses_panel; then REQUIRED_PACKAGES+=(socat sqlite3 unzip wget wireguard-tools); fi
+if xhttp_uses_panel; then REQUIRED_PACKAGES+=(socat sqlite3 unzip wget); fi
 if [[ "$SUB_ENCRYPT_LINKS" == true ]]; then REQUIRED_PACKAGES+=(nodejs); fi
 if [[ "$ACME_CLIENT" == certbot ]]; then REQUIRED_PACKAGES+=(certbot); fi
 if [[ "$TRANSPORT" == amneziawg ]]; then REQUIRED_PACKAGES+=(gnupg iptables); fi
@@ -1376,6 +1377,14 @@ if [[ "$INSTALL_MODE" == "standalone" ]]; then
   fi
 fi
 
+WARP_CONFIGURED=0
+if [[ "${ENABLE_WARP:-0}" -eq 1 ]]; then
+  log "Configuring Cloudflare WARP over MASQUE for Russian traffic"
+  xhttp_configure_warp_masque || die "Could not configure a verified MASQUE exit for Russian traffic."
+  WARP_CONFIGURED=1
+  configure_warp_swap
+fi
+
 log "Creating $(xhttp_transport_label "$TRANSPORT") inbound on TCP/443"
 RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" "$API_BASE/panel/api/server/getNewX25519Cert")"
 jq -e '.success == true' <<<"$RESPONSE" >/dev/null || die "Reality key generation failed: ${RESPONSE}"
@@ -1407,52 +1416,11 @@ jq -e '.success == true' <<<"$RESPONSE" >/dev/null || die "Xray restart after in
 INBOUND_CONFIGURED=1
 write_state
 
-log "Applying the low-memory Xray profile"
-xhttp_memory_apply "$INBOUND_TAG" "$TRANSPORT"
 if [[ -n "$MIGRATION_DB" ]]; then
   log "Importing VLESS users and usage"
   xhttp_import_migrated_clients
 fi
 
-if [[ "$ENABLE_WARP" -eq 1 ]]; then
-  log "Creating built-in WARP and RU routing"
-  RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/data")"
-  if ! jq -e '.success == true and .obj != null and .obj != ""' <<<"$RESPONSE" >/dev/null; then
-    PRIVATE_KEY="$(wg genkey)"; PUBLIC_KEY="$(printf '%s' "$PRIVATE_KEY" | wg pubkey)"
-    RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/reg" --data-urlencode "privateKey=$PRIVATE_KEY" --data-urlencode "publicKey=$PUBLIC_KEY")"
-    if ! jq -e '.success == true' <<<"$RESPONSE" >/dev/null; then
-      die "WARP registration failed. WARP was requested, so installation cannot continue. Panel response: ${RESPONSE}"
-    fi
-  fi
-  if [[ "$ENABLE_WARP" -eq 1 ]]; then
-    WARP_DATA_RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/data")"
-    WARP_CONFIG_RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/warp/config")"
-    WARP_DATA="$(jq -c '.obj | if type=="string" then fromjson else . end' <<<"$WARP_DATA_RESPONSE")"
-    WARP_CONFIG="$(jq -c '.obj | if type=="string" then fromjson else . end' <<<"$WARP_CONFIG_RESPONSE")"
-    if ! WARP_OUT="$(xhttp_build_warp_outbound "$WARP_DATA" "$WARP_CONFIG")"; then
-      die "WARP account data is incomplete. WARP was requested, so installation cannot continue."
-    else
-      RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/")"
-      jq -e '.success == true and .obj != null' <<<"$RESPONSE" >/dev/null || die "Could not read Xray configuration: $RESPONSE"
-      XRAY="$(jq -c '.obj | if type=="string" then fromjson else . end | .xraySetting | if type=="string" then fromjson else . end' <<<"$RESPONSE")"
-      jq -e 'type=="object" and (.outbounds|type=="array")' <<<"$XRAY" >/dev/null || die "Xray configuration has an unexpected format."
-      WARP_BACKUP="$(mktemp -d /root/xhttp-warp-backup.XXXXXXXX)"
-      sqlite3 /etc/x-ui/x-ui.db ".timeout 5000" ".backup '$WARP_BACKUP/x-ui.db'"
-      XRAY="$(xhttp_warp_config "$WARP_OUT" <<<"$XRAY")"
-      xhttp_validate_warp_routes <<<"$XRAY" || die "Required Russian routing datasets are unavailable."
-      RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/update" --data-urlencode "xraySetting=$XRAY" --data-urlencode 'outboundTestUrl=https://www.cloudflare.com/cdn-cgi/trace')"
-      if jq -e '.success == true' <<<"$RESPONSE" >/dev/null; then
-        VERIFY_WARP_RESPONSE="$(curl -q -fsS "${API_AUTH[@]}" -X POST "$API_BASE/panel/api/xray/")"
-        VERIFY_WARP="$(jq -c '.obj | if type=="string" then fromjson else . end | .xraySetting | if type=="string" then fromjson else . end' <<<"$VERIFY_WARP_RESPONSE")"
-        jq -e 'type=="object" and any(.outbounds[]?; .tag=="warp") and any(.routing.rules[]?; .ruleTag=="xhttp-vps-warp-ru-domain" and .domain==["domain:ru","domain:su","domain:xn--p1ai","geosite:category-ru"] and .outboundTag=="warp") and any(.routing.rules[]?; .ruleTag=="xhttp-vps-warp-ru-ip" and .ip==["geoip:ru"] and .outboundTag=="warp") and .routing.domainStrategy=="IPOnDemand"' <<<"$VERIFY_WARP" >/dev/null || die "WARP configuration could not be verified after saving."
-        WARP_CONFIGURED=1
-        configure_warp_swap
-      else
-        die "WARP routing could not be saved. WARP was requested, so installation cannot continue. Panel response: ${RESPONSE}"
-      fi
-    fi
-  fi
-fi
 write_state
 
 xhttp_restart_vpn_service x-ui
@@ -1681,9 +1649,9 @@ else
   status_line "Fail2ban panel jail" SKIP "panel is not public"
 fi
 if [[ "$ENABLE_WARP" -eq 1 ]]; then
-  if [[ "${WARP_CONFIGURED:-0}" -eq 1 ]]; then status_line "WARP RU routing" OK; else status_line "WARP RU routing" ERROR; fi
+  if [[ "${WARP_CONFIGURED:-0}" -eq 1 ]]; then status_line "WARP MASQUE RU routing" OK; else status_line "WARP MASQUE RU routing" ERROR; fi
 else
-  status_line "WARP RU routing" SKIP "disabled by user"
+  status_line "WARP MASQUE RU routing" SKIP "disabled by user"
 fi
 MEMORY_KIB_FINAL="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo)"
 if [[ "$ENABLE_WARP" -eq 1 && "$MEMORY_KIB_FINAL" =~ ^[0-9]+$ ]] && (( MEMORY_KIB_FINAL <= 1100000 )); then

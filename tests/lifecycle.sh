@@ -64,7 +64,7 @@ grep -Fxq 'AuthenticationMethods password' <<<"$password_sshd"
   [[ "$SSH_PORT" == 48215 ]]
 )
 (
-  xhttp_memory_api() {
+  xhttp_panel_api() {
     [[ "$*" == '/panel/api/setting/all -X POST' ]] || return 1
     printf '{"obj":{"twoFactorEnable":%s,"hasTwoFactorToken":%s}}\n' "${ENROLLED:-true}" "${HAS_TOKEN:-true}"
   }
@@ -75,9 +75,9 @@ grep -Fxq 'AuthenticationMethods password' <<<"$password_sshd"
 vision_stream="$(xhttp_build_stream_settings vision example.com 127.0.0.1:9443 private public abcd)"
 jq -e '.network=="tcp" and .security=="reality" and .tcpSettings.header.type=="none" and .realitySettings.target=="127.0.0.1:9443" and .realitySettings.serverNames==["example.com"]' <<<"$vision_stream" >/dev/null
 xhttp_stream="$(xhttp_build_stream_settings xhttp example.com 127.0.0.1:9443 private public abcd)"
-jq -e '.network=="xhttp" and .security=="reality" and .xhttpSettings.mode=="auto" and .xhttpSettings.host=="example.com"' <<<"$xhttp_stream" >/dev/null
+jq -e '.network=="xhttp" and .security=="reality" and .xhttpSettings.mode=="auto" and .xhttpSettings.host=="example.com" and .xhttpSettings.xPaddingBytes=="100-1000" and (.xhttpSettings | has("xmux") | not)' <<<"$xhttp_stream" >/dev/null
 damaged_inbound="$(jq -nc --arg settings '{"clients":[{"id":"preserved-client","enable":false}],"encryption":"none"}' \
-  --arg stream '{"network":"xhttp","security":"reality","xhttpSettings":{"host":"wrong.example","path":"/broken"},"realitySettings":{"target":"192.0.2.1:1","privateKey":"private","serverNames":["wrong.example"],"shortIds":["aa","bb"],"settings":{"publicKey":"public","fingerprint":"chrome"}}}' \
+  --arg stream '{"network":"xhttp","security":"reality","xhttpSettings":{"host":"wrong.example","path":"/broken","xmux":{"maxConnections":"1","hMaxReusableSecs":"600-900"}},"realitySettings":{"target":"192.0.2.1:1","privateKey":"private","serverNames":["wrong.example"],"shortIds":["aa","bb"],"settings":{"publicKey":"public","fingerprint":"chrome"}}}' \
   '{id:9,up:12,down:34,total:56,remark:"preserve me",enable:false,expiryTime:78,listen:"127.0.0.2",port:8443,protocol:"vless",settings:$settings,streamSettings:$stream,tag:"in-443-xhttp-reality",sniffing:"{\"enabled\":false}"}')"
 rebuilt_inbound="$(xhttp_rebuild_managed_inbound xhttp example.com 127.0.0.1:9443 in-443-xhttp-reality <<<"$damaged_inbound")"
 jq -e '
@@ -85,7 +85,7 @@ jq -e '
   and .listen=="" and .port==443 and .protocol=="vless" and .tag=="in-443-xhttp-reality"
   and ((.settings|fromjson).clients[0].id=="preserved-client")
   and ((.streamSettings|fromjson) as $s | $s.network=="xhttp" and $s.xhttpSettings.host=="example.com"
-    and $s.xhttpSettings.path=="/" and $s.realitySettings.target=="127.0.0.1:9443"
+    and $s.xhttpSettings.path=="/" and ($s.xhttpSettings | has("xmux") | not) and $s.realitySettings.target=="127.0.0.1:9443"
     and $s.realitySettings.privateKey=="private" and $s.realitySettings.settings.publicKey=="public"
     and $s.realitySettings.shortIds==["aa","bb"])
   and ((.sniffing|fromjson).enabled==true)
@@ -109,23 +109,99 @@ grep -Fq 'port = 54321' <<<"$panel_jail"
 grep -Fq '_SYSTEMD_UNIT=x-ui.service' <<<"$panel_jail"
 grep -Fq 'failed login: username=.*IP="<HOST>"' <<<"$(xhttp_render_panel_fail2ban_filter)"
 
-warp='{"tag":"warp","protocol":"wireguard","settings":{}}'
+registration='{"privateKey":"-----BEGIN PRIVATE KEY-----\nfixture","publicKey":"fixture","address":["172.16.0.2","2606:4700:110:1234::1"],"endpoint":"192.0.2.10"}'
+warp="$(xhttp_build_warp_masque_outbound <<<"$registration")"
+jq -e '
+  .tag=="warp-masque" and .protocol=="masque" and .settings=={address:"192.0.2.10",port:443}
+  and .streamSettings.network=="masque" and .streamSettings.security=="tls"
+  and .streamSettings.tlsSettings=={serverName:"consumer-masque.cloudflareclient.com",alpn:["h3"]}
+  and .streamSettings.masqueSettings.warp.address==["172.16.0.2","2606:4700:110:1234::1"]
+' <<<"$warp" >/dev/null
+[[ "$warp" == "$(jq -c tojson <<<"$registration" | xhttp_build_warp_masque_outbound)" ]]
+if jq -c 'del(.privateKey)' <<<"$registration" | xhttp_build_warp_masque_outbound 2>/dev/null; then exit 1; fi
 base='{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"blocked","protocol":"blackhole"}],"routing":{"rules":[{"inboundTag":["api"],"outboundTag":"api"},{"protocol":["bittorrent"],"outboundTag":"blocked"},{"ip":["geoip:private"],"outboundTag":"blocked"},{"outboundTag":"direct","network":"tcp,udp"}]}}'
-warp_account='{"private_key":"fixture","client_id":"AQID"}'
-warp_profile='{"config":{"peers":[{"public_key":"fixture","endpoint":{"host":"warp.example:2408","v4":"192.0.2.10:0"}}],"interface":{"addresses":{"v4":"198.51.100.2"}}}}'
-xhttp_build_warp_outbound "$warp_account" "$warp_profile" |
-  jq -e '.settings.peers[0].endpoint=="192.0.2.10:2408" and .settings.reserved==[1,2,3]' >/dev/null
-warp_profile="$(jq -c 'del(.config.peers[0].endpoint.v4)' <<<"$warp_profile")"
-xhttp_build_warp_outbound "$warp_account" "$warp_profile" |
-  jq -e '.settings.peers[0].endpoint=="warp.example:2408"' >/dev/null
-result="$(xhttp_warp_config "$warp" <<<"$base")"
-jq -e '.routing.rules[0].outboundTag=="api" and .routing.rules[1].protocol==["bittorrent"] and .routing.rules[2].ip==["geoip:private"] and .routing.rules[3].ruleTag=="xhttp-vps-warp-ru-domain" and .routing.rules[4].ip==["geoip:ru"] and .routing.rules[5].outboundTag=="direct" and ([.routing.rules[]|select(.outboundTag=="warp")]|length)==2 and .routing.rules[3].domain==["domain:ru","domain:su","domain:xn--p1ai","geosite:category-ru"] and .routing.domainStrategy=="IPOnDemand"' <<<"$result" >/dev/null
-[[ "$result" == "$(xhttp_warp_config "$warp" <<<"$result")" ]]
-legacy="$(jq '.routing.rules=[{ruleTag:"xhttp-vps-warp-ru-ip",ip:["geoip:ru"],outboundTag:"warp"}]+.routing.rules' <<<"$base")"
-[[ "$result" == "$(xhttp_warp_config "$warp" <<<"$legacy")" ]]
-if xhttp_warp_config "$warp" <<<'{"routing":{"rules":[{"outboundTag":"blocked"}]}}' >/dev/null 2>&1; then exit 1; fi
-if xhttp_warp_config "$warp" <<<'{"routing":{"rules":[{"outboundTag":"direct"},{"protocol":["bittorrent"],"outboundTag":"blocked"}]}}' >/dev/null 2>&1; then exit 1; fi
-xhttp_warp_config "$warp" <<<'{}' | jq -e '.routing.rules|length==2' >/dev/null
+result="$(printf '%s\n' "$warp" "$base" | xhttp_warp_config)"
+jq -e '
+  .outbounds[0].tag=="direct" and .routing.domainStrategy=="IPOnDemand"
+  and .routing.rules[0].outboundTag=="api" and .routing.rules[1].protocol==["bittorrent"]
+  and .routing.rules[2].ip==["geoip:private"] and .routing.rules[3].ruleTag=="xhttp-vps-warp-ru-domain"
+  and .routing.rules[3].domain==["domain:ru","domain:su","domain:xn--p1ai","geosite:category-ru"]
+  and .routing.rules[4].ip==["geoip:ru"] and .routing.rules[5].outboundTag=="direct"
+  and (.routing.rules|map(select(.outboundTag=="warp-masque" and .network=="tcp,udp"))|length)==2
+' <<<"$result" >/dev/null
+[[ "$result" == "$(printf '%s\n' "$warp" "$result" | xhttp_warp_config)" ]]
+legacy="$(jq -c '
+  .outbounds += [{tag:"warp",protocol:"wireguard"}]
+  | .routing.rules=[{ruleTag:"xhttp-vps-warp-ru-ip",ip:["geoip:ru"],outboundTag:"warp"}]+.routing.rules
+' <<<"$base")"
+[[ "$result" == "$(printf '%s\n' "$warp" "$legacy" | xhttp_warp_config)" ]]
+custom="$(jq -c '.routing.rules |= [{domain:["full:example.com"],outboundTag:"warp"}]+.' <<<"$legacy")"
+printf '%s\n' "$warp" "$custom" | xhttp_warp_config | jq -e 'any(.outbounds[]; .tag=="warp")' >/dev/null
+ambiguous="$(jq -c '.routing.rules |= [{outboundTag:"direct"}]+.' <<<"$base")"
+if printf '%s\n' "$warp" "$ambiguous" | xhttp_warp_config >/dev/null 2>&1; then exit 1; fi
+
+# Exercise migration from WireGuard, idempotence and rollback through the panel API.
+(
+  warp_fixture="$(mktemp -d)"
+  fixture_enrollment="$registration"
+  trap 'rm -rf -- "$warp_fixture"' EXIT
+  printf '%s\n' "$legacy" > "$warp_fixture/template"
+  touch "$warp_fixture/listening"
+
+  mktemp() { command mktemp -d "$warp_fixture/backup.XXXXXXXX"; }
+  sqlite3() { printf '%s\n' backup >> "$warp_fixture/calls"; }
+  port_busy() { [[ "$1" == 443 && -e "$warp_fixture/listening" ]]; }
+  xhttp_validate_warp_config() { jq -e 'any(.outbounds[]; .tag=="warp-masque")' >/dev/null; }
+  xhttp_probe_warp_masque() { jq -e '.protocol=="masque"' >/dev/null && [[ "${FAIL_WARP_PROBE:-0}" == 0 ]]; }
+  xhttp_panel_api() {
+    local path="$1"
+    case "$path" in
+      /panel/api/xray/)
+        jq -nc --argjson template "$(cat "$warp_fixture/template")" '
+          {success:true,obj:{xraySetting:($template|tojson),outboundTestUrl:"https://example.com/probe"}}'
+        ;;
+      /panel/api/xray/warp/regMasque)
+        printf '%s\n' enroll >> "$warp_fixture/calls"
+        jq -nc --arg registration "$fixture_enrollment" '{success:true,obj:$registration}'
+        ;;
+      /panel/api/server/stopXrayService)
+        printf '%s\n' stop >> "$warp_fixture/calls"
+        rm -f -- "$warp_fixture/listening"
+        ;;
+      /panel/api/server/restartXrayService)
+        printf '%s\n' restart >> "$warp_fixture/calls"
+        touch "$warp_fixture/listening"
+        ;;
+      /panel/api/xray/update)
+        [[ ! -e "$warp_fixture/listening" && "${*: -1}" == 'outboundTestUrl=https://example.com/probe' ]] || return 1
+        printf '%s\n' update >> "$warp_fixture/calls"
+        cat > "$warp_fixture/template"
+        if [[ "${REJECT_WARP_UPDATE:-0}" == 1 && ! -e "$warp_fixture/rejected" ]]; then
+          touch "$warp_fixture/rejected"
+          return 1
+        fi
+        ;;
+      *) return 1 ;;
+    esac
+  }
+
+  if FAIL_WARP_PROBE=1 xhttp_configure_warp_masque 2>/dev/null; then exit 1; fi
+  [[ "$(cat "$warp_fixture/calls")" == enroll && -e "$warp_fixture/listening" ]]
+  [[ "$(cat "$warp_fixture/template")" == "$legacy" ]]
+
+  : > "$warp_fixture/calls"
+  if REJECT_WARP_UPDATE=1 xhttp_configure_warp_masque; then exit 1; fi
+  [[ "$(cat "$warp_fixture/calls")" == $'enroll\nbackup\nstop\nupdate\nupdate\nrestart' ]]
+  [[ "$(cat "$warp_fixture/template")" == "$legacy" && -e "$warp_fixture/listening" ]]
+
+  : > "$warp_fixture/calls"
+  xhttp_configure_warp_masque
+  [[ "$(cat "$warp_fixture/calls")" == $'enroll\nbackup\nstop\nupdate\nrestart' ]]
+  [[ "$(cat "$warp_fixture/template")" == "$result" && -e "$warp_fixture/listening" ]]
+  : > "$warp_fixture/calls"
+  xhttp_configure_warp_masque
+  [[ ! -s "$warp_fixture/calls" ]]
+)
 
 fixture='{"enable":true,"port":443,"settings":{"encryption":"none","clients":[{"id":"test-only","enable":true,"expiryTime":0}]},"streamSettings":{"network":"xhttp","security":"reality","xhttpSettings":{"path":"/custom","mode":"auto"},"realitySettings":{"privateKey":"must-not-leak","serverNames":["example.com"],"shortIds":["abcd"],"settings":{"publicKey":"test-public","fingerprint":"chrome"}}}}'
 probe="$(xhttp_probe_config 23456 <<<"$fixture")"
@@ -305,9 +381,10 @@ export -f xhttp_run_probe mktemp port_busy curl
 bash -c 'xhttp_run_probe "$(cat)" direct' <<<"$probe"
 if bash -c 'xhttp_run_probe "$(cat)" warp' <<<"$probe"; then exit 1; fi
 PROBE_WARP=on bash -c 'xhttp_run_probe "$(cat)" warp' <<<"$probe"
+if VPS_PUBLIC_IP=192.0.2.1 PROBE_WARP=on bash -c 'xhttp_run_probe "$(cat)" warp' <<<"$probe"; then exit 1; fi
 if PROBE_VALIDATE_EXIT=1 bash -c 'xhttp_run_probe "$(cat)" direct' <<<"$probe"; then exit 1; fi
 [[ "$(find "$test_dir" -maxdepth 1 -name 'probe.*' | wc -l)" == 0 ]]
 printf 'Lifecycle tests passed.\n'
 # An explicit direct domain/IP route must not bypass regional protection.
 early_direct="$(jq '.routing.domainStrategy="AsIs" | .routing.rules=[{domain:["domain:ru"],outboundTag:"direct"},{ip:["geoip:ru"],outboundTag:"direct"}]+.routing.rules' <<<"$base")"
-xhttp_warp_config "$warp" <<<"$early_direct" | jq -e '.routing.domainStrategy=="IPOnDemand" and .routing.rules[3].ruleTag=="xhttp-vps-warp-ru-domain" and .routing.rules[4].ruleTag=="xhttp-vps-warp-ru-ip" and .routing.rules[5].outboundTag=="direct" and .routing.rules[6].outboundTag=="direct"' >/dev/null
+printf '%s\n' "$warp" "$early_direct" | xhttp_warp_config | jq -e '.routing.domainStrategy=="IPOnDemand" and .routing.rules[3].ruleTag=="xhttp-vps-warp-ru-domain" and .routing.rules[4].ruleTag=="xhttp-vps-warp-ru-ip" and .routing.rules[5].outboundTag=="direct" and .routing.rules[6].outboundTag=="direct"' >/dev/null

@@ -79,7 +79,7 @@ xhttp_restore_migration_backup() {
   sqlite3 -batch -bail /etc/x-ui/x-ui.db ".restore '$backup'" || return 1
   systemctl start x-ui || return 1
   for _ in {1..15}; do
-    if xhttp_memory_api /panel/api/inbounds/list >/dev/null 2>&1; then return 0; fi
+    if xhttp_panel_api /panel/api/inbounds/list >/dev/null 2>&1; then return 0; fi
     sleep 1
   done
   return 1
@@ -99,7 +99,7 @@ xhttp_import_migrated_clients() (
     sqlite3 -batch -bail /etc/x-ui/x-ui.db ".timeout 5000" ".backup '$backup.new'" || exit 1
     mv -T "$backup.new" "$backup" || exit 1
   fi
-  response="$(xhttp_memory_api /panel/api/inbounds/list)" || exit 1
+  response="$(xhttp_panel_api /panel/api/inbounds/list)" || exit 1
   inbound_id="$(jq -er --arg tag "$INBOUND_TAG" '
     .obj | if type=="string" then fromjson else . end |
     map(select(.tag==$tag and .protocol=="vless")) | select(length==1) | .[0].id
@@ -107,7 +107,7 @@ xhttp_import_migrated_clients() (
   count="$(jq -er 'length | select(.>0)' "$snapshot")" || exit 1
   if ! response="$(
     jq -c --argjson inbound "$inbound_id" 'map(.inboundIds=[$inbound]) | {data:tojson}' "$snapshot" |
-      xhttp_memory_api /panel/api/clients/import -X POST -H 'Content-Type: application/json' --data-binary @-
+      xhttp_panel_api /panel/api/clients/import -X POST -H 'Content-Type: application/json' --data-binary @-
   )" || ! jq -e --argjson count "$count" '
     .success==true and .obj.created==$count and ((.obj.skipped // [])|length)==0
   ' <<<"$response" >/dev/null; then

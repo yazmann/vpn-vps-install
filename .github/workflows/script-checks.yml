@@ -17,8 +17,7 @@ jobs:
         run: |
           bash -n install-xhttp-vps.sh
           bash -n finish-xhttp-vps.sh
-          bash -n optimize-xhttp-memory.sh
-          bash -n tests/memory-profile.sh
+          bash -n tests/policy-defaults.sh
           bash -n xhttp-vps-common.sh
           bash -n tests/lifecycle.sh
           bash -n tests/api-tokens.sh
@@ -28,8 +27,8 @@ jobs:
           bash -n xhttp-vps-migrate.sh
           bash -n tests/migration.sh
           bash -n tests/maintenance.sh
-      - name: Test memory profile preservation and idempotence
-        run: bash tests/memory-profile.sh
+      - name: Test legacy Xray policy migration
+        run: bash tests/policy-defaults.sh
       - name: Test routing, ownership and traffic probe configs
         run: bash tests/lifecycle.sh
       - name: Test least-privilege node token lifecycle
@@ -62,7 +61,7 @@ jobs:
             echo 'Use verified release archives for 3x-ui and APT for Certbot.'
             exit 1
           fi
-          if grep -Fq 'API_AUTH=(-H "Authorization: Bearer' install-xhttp-vps.sh finish-xhttp-vps.sh optimize-xhttp-memory.sh; then
+          if grep -Fq 'API_AUTH=(-H "Authorization: Bearer' install-xhttp-vps.sh finish-xhttp-vps.sh xhttp-vps-common.sh; then
             echo 'Do not expose the panel API token in curl process arguments.'
             exit 1
           fi
@@ -112,7 +111,7 @@ jobs:
         shell: bash
         run: |
           for script in *.sh tests/*.sh; do bash -n "$script"; done
-          bash tests/memory-profile.sh
+          bash tests/policy-defaults.sh
           XHTTP_TEST_SSHD=1 bash tests/lifecycle.sh
           bash tests/api-tokens.sh
           bash tests/transports.sh

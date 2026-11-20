@@ -31,6 +31,8 @@ grep -Fq 'sniGuard: strict' <<<"$hysteria"
 grep -Fq 'reject(169.254.0.0/16)' <<<"$hysteria"
 grep -Fq 'reject(192.0.2.3/32)' <<<"$hysteria"
 grep -Fq 'dir: /var/www/3xui-cover' <<<"$hysteria"
+grep -Fq 'mode: "4"' <<<"$hysteria"
+if grep -Fq 'reject(::/0)' <<<"$hysteria"; then exit 1; fi
 
 export TRANSPORT=amneziawg
 [[ "$(xhttp_service_name)" == awg-quick@awg-vps ]]
@@ -110,7 +112,7 @@ ref=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 if BLOB_SHA="$ref" xhttp_fetch_routing "$ref" HAPP/DEFAULT.DEEPLINK; then exit 1; fi
 
 subscription_url=https://vpn.example.com/sub/test-subscription
-xhttp_memory_api() {
+xhttp_panel_api() {
   case "$1" in
     /panel/api/clients/get/test%40example.com) printf '%s\n' '{"obj":{"client":{"id":123}}}' ;;
     /panel/api/clients/happLink/123) printf '%s\n' '{"obj":{"encryptedLink":"happ://crypt5/test-envelope"}}' ;;
